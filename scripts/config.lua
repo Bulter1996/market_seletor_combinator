@@ -31,6 +31,7 @@ function Config.default()
     remember_order = true,                       -- 参数：是否记住已启动但从绿线消失的订单。
     production_timeout = 0,                     -- 参数：生产订单库存无变化时的轮换秒数；0 表示禁用。
     output_mode = "all",                         -- 参数：生产订单输出产品、原料或两者。
+    cache_grid_number = 0,                      -- 参数：分离模式可占用的固体原料格数；0 表示不限制。
     recurise_depth = 0,                          -- 参数：订单递归最大深度；0 表示不限制。
     recursion_output_mode = "single",            -- 参数：订单递归输出单项或全部结果。
     recursion_timeout = 0                        -- 参数：single 无变化轮换秒数；0 表示禁用。
@@ -66,8 +67,12 @@ function Config.normalize(source)
   if type(source.production_timeout) == "number" then
     config.production_timeout = math.max(0, source.production_timeout)
   end
-  if source.output_mode == "only_item" or source.output_mode == "only_material" or source.output_mode == "all" then
+  if source.output_mode == "only_item" or source.output_mode == "only_material" or source.output_mode == "all"
+    or source.output_mode == "all_separate_signal" then
     config.output_mode = source.output_mode
+  end
+  if type(source.cache_grid_number) == "number" then
+    config.cache_grid_number = math.max(0, math.floor(source.cache_grid_number))
   end
   if type(source.recurise_depth) == "number" then
     config.recurise_depth = math.max(0, math.floor(source.recurise_depth))

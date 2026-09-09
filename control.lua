@@ -3,7 +3,9 @@
 
 local ENTITY = "b-market-selector-combinator"          -- 参数：玩家可放置的主实体原型名。
 local PROXY = "b-market-selector-output-proxy"         -- 参数：向线路发送计算结果的隐藏实体原型名。
-local TICK_INTERVAL = 10                                -- 参数：每 10 tick 重算，平衡实时性和性能。
+local DETAIL_PROXY = "b-market-selector-detail-proxy" -- 参数：只在 Alt 模式显示当前订单产品的隐藏实体。
+local TICK_INTERVAL = settings.startup["bmsc-update-interval"].value
+                                                          -- 参数：玩家配置的刷新间隔，默认 30 tick。
 local Gui = require("scripts.gui")                     -- GUI 模块：只负责界面，不参与生产计算。
 local Config = require("scripts.config")               -- 配置模块：默认值、模式常量和外部数据校验。
 local Util = require("scripts.common_util")            -- 通用工具：输出排序等无状态功能。
@@ -49,38 +51,52 @@ local function restore_mode_states(record, states)
   for name, mode in pairs(MODES) do mode.restore_state(record, states[name]) end
 end
 
----销毁某条记录的隐藏输出代理。
+---销毁某条记录的全部隐藏输出代理。
+---record.proxy 是 v0.1.0 的单代理字段，保留清理逻辑以兼容旧存档升级。
 ---@param record table|nil 组合器运行记录。
 ---@return nil
-local function destroy_proxy(record)
-  if record and record.proxy and record.proxy.valid then record.proxy.destroy() end
+local function destroy_proxies(record)
+  if not record then return end
+  for _, proxy in pairs({record.proxy, record.red_proxy, record.green_proxy, record.detail_proxy}) do
+    if proxy and proxy.valid then proxy.destroy() end
+  end
 end
 
----把隐藏代理的红/绿线分别接到主实体的红/绿输出端。
+---把隐藏代理接到主实体指定颜色的输出端。
 ---为什么需要：选择运算器原生模式不能发送脚本任意生成的一组信号，因此使用隐藏常量运算器发射。
 ---@param entity LuaEntity 主选择运算器。
 ---@param proxy LuaEntity 隐藏常量运算器。
+---@param wire_color string 输出线路颜色，只接受 `red` 或 `green`。
 ---@return nil
-local function connect_proxy(entity, proxy)
-  local proxy_red = proxy.get_wire_connector(defines.wire_connector_id.circuit_red, true)
-  local proxy_green = proxy.get_wire_connector(defines.wire_connector_id.circuit_green, true)
-  local output_red = entity.get_wire_connector(defines.wire_connector_id.combinator_output_red, true)
-  local output_green = entity.get_wire_connector(defines.wire_connector_id.combinator_output_green, true)
-  if proxy_red and output_red then proxy_red.connect_to(output_red, false, defines.wire_origin.script) end
-  if proxy_green and output_green then proxy_green.connect_to(output_green, false, defines.wire_origin.script) end
+local function connect_proxy(entity, proxy, wire_color)
+  local proxy_connector_id = wire_color == "red" and defines.wire_connector_id.circuit_red
+    or defines.wire_connector_id.circuit_green
+  local output_connector_id = wire_color == "red" and defines.wire_connector_id.combinator_output_red
+    or defines.wire_connector_id.combinator_output_green
+  local proxy_connector = proxy.get_wire_connector(proxy_connector_id, true)
+  local output_connector = entity.get_wire_connector(output_connector_id, true)
+  if proxy_connector and output_connector then
+    proxy_connector.connect_to(output_connector, false, defines.wire_origin.script)
+  end
 end
 
----在主实体位置创建不可见、不可操作的输出代理。
+---在主实体位置创建只连接一种线路颜色的不可见输出代理。
 ---@param entity LuaEntity 主选择运算器。
+---@param wire_color string|nil 输出线路颜色；nil 表示展示代理不连接线路。
+---@param proxy_name string|nil 代理原型名；nil 使用线路输出代理。
 ---@return LuaEntity|nil proxy 创建失败时返回 nil。
-local function create_proxy(entity)
+local function create_proxy(entity, wire_color, proxy_name)
+  local entity_name = proxy_name or PROXY
+  -- `/c game.reload_mods()` 只重载运行脚本时，新数据阶段原型可能尚未注册；此时跳过
+  -- 可选展示代理，等待完整重启游戏，不能让真实红绿输出也随之中断。
+  if not prototypes.entity[entity_name] then return nil end
   local proxy = entity.surface.create_entity{
-    name = PROXY, position = entity.position, force = entity.force, create_build_effect_smoke = false
+    name = entity_name, position = entity.position, force = entity.force, create_build_effect_smoke = false
   }
   if proxy then
     proxy.destructible = false
     proxy.operable = false
-    connect_proxy(entity, proxy)
+    if wire_color then connect_proxy(entity, proxy, wire_color) end
   end
   return proxy
 end
@@ -100,7 +116,9 @@ local function sync_mode_visual(record)
   -- 完整参数表由模式自行声明，能避免把“素材字段名”误当成运行时操作名。
   local visual_parameters = mode and mode.visual_parameters
   behavior.parameters = visual_parameters or {operation = mode and mode.visual_operation or "select"}
-  -- 禁止用于动画的原生操作向线路发送信号，真实输出仍由隐藏常量运算器代理提供。
+  -- 主实体的原生操作仅用于屏幕动画：同时关闭输入读取和输出发送，避免 count 等视觉
+  -- 操作保留旧 count_signal 后产生“某物品 ×1”。脚本仍会直接从实体连接器读取网络。
+  behavior.input_networks = {red = false, green = false}
   behavior.output_networks = {red = false, green = false}
 end
 
@@ -110,11 +128,13 @@ end
 ---@return nil
 local function register(entity, tags)
   if not (entity and entity.valid and entity.name == ENTITY) then return end
-  destroy_proxy(state().combinators[entity.unit_number])
+  destroy_proxies(state().combinators[entity.unit_number])
   local source = tags and tags.bmsc or tags
   local record = {
     entity = entity,
-    proxy = create_proxy(entity),
+    red_proxy = create_proxy(entity, "red"),
+    green_proxy = create_proxy(entity, "green"),
+    detail_proxy = create_proxy(entity, nil, DETAIL_PROXY),
     config = normalize_config(source)
   }
   reset_all_modes(record)
@@ -127,7 +147,7 @@ end
 ---@return nil
 local function remove(entity)
   if not (entity and entity.valid and entity.unit_number) then return end
-  destroy_proxy(state().combinators[entity.unit_number])
+  destroy_proxies(state().combinators[entity.unit_number])
   state().combinators[entity.unit_number] = nil
 end
 
@@ -148,9 +168,7 @@ local function calculate(record)
 end
 
 ---更新鼠标悬浮信息卡中的输出信号字段。
----为什么需要：真实信号由隐藏代理产生，主实体的原生输出区不会自动识别这些脚本信号。
----Factorio 2.1 的 `set_tooltip_field` 会把字段加入原生信息卡，名称、数值字号与输入信号一致。
----@param record table 组合器运行记录；其中保存 tooltip 字段编号，避免每次刷新都新增一行。
+---@param record table 组合器运行记录；保存 tooltip 字段编号，避免每次刷新都新增一行。
 ---@param outputs table 当前输出集合。
 ---@return nil
 local function update_hover_tooltip(record, outputs)
@@ -158,47 +176,39 @@ local function update_hover_tooltip(record, outputs)
   for _, value in ipairs(Util.sorted_outputs(outputs)) do
     local entry = value.entry
     local signal_type = entry.signal.type or "item"
-    -- `[img=...]` 只会生成较小的行内图片；item/fluid/virtual-signal 专用标签会按照
-    -- Factorio 的原生信号富文本规则渲染。外层 default-large 字体同时放大图标占用的行高，
-    -- 使脚本添加的输出信号与引擎生成的输入信号在信息卡中尺寸更接近。
     local tag_type = signal_type == "virtual" and "virtual-signal" or signal_type
     local quality = signal_type == "item" and Util.quality_name(entry.signal.quality) or nil
     local quality_part = quality and quality ~= "normal" and ",quality=" .. quality or ""
-    -- tooltip 富文本图标使用引擎固定的“小型行内图标”尺寸；字体标签只改变数字文字，
-    -- 不会缩放图标。保留语义化信号标签，但不再套用无效且会放大数字的字体标签。
     parts[#parts + 1] = "[" .. tag_type .. "=" .. entry.signal.name
       .. quality_part .. "] " .. entry.count
   end
   local content = #parts > 0 and table.concat(parts, "  ") or {"bmsc.no-output"}
-  -- 原版输入信号字段使用同一排序区间。旧值 30 与原生字段发生并列时，
-  -- 自定义字段会被排在输入信号之前；改为紧随其后的 31，得到“输入信号 → 输出信号”。
-  -- 该值仍小于操作者、阵营和生命值字段，因此输出不会落到通用实体信息之后。
   record.output_tooltip_id = record.entity.set_tooltip_field{
-    id = record.output_tooltip_id,
-    name = {"bmsc.output-signals"},
-    value = content,
-    order = 31
+    id = record.output_tooltip_id, name = {"bmsc.output-signals"}, value = content, order = 31
   }
-  -- 清除旧版本借用的状态行，避免输出信号仍显示在输入信号上方。
   record.entity.custom_status = nil
 end
 
----把结果写入隐藏代理的常量运算器槽位，并同步悬浮状态。
----@param record table 组合器运行记录。
----@param outputs table 当前输出集合。
+---把一组结果写入指定隐藏代理的常量运算器槽位。
+---@param proxy LuaEntity 隐藏常量运算器。
+---@param outputs table 当前线路的输出集合。
 ---@return nil
-local function write_outputs(record, outputs)
-  if not (record.proxy and record.proxy.valid) then record.proxy = create_proxy(record.entity) end
-  if not record.proxy then return end
-  local behavior = record.proxy.get_or_create_control_behavior()
+local function write_proxy_outputs(proxy, outputs)
+  local behavior = proxy.get_or_create_control_behavior()
+  -- 代理只使用第一节。若旧版本或异常状态留下额外 section，必须先移除，否则其中的
+  -- 信号仍会与第一节一起发送到线路，形成看似无法释放的历史输出。
+  for section_index = behavior.sections_count, 2, -1 do
+    behavior.remove_section(section_index)
+  end
   local section = behavior.get_section(1) or behavior.add_section()
-  section.filters = {}
+  -- 显式逐槽清理比给 filters 赋空表更可靠，也能确保本轮输出比上一轮少时，
+  -- 高位旧槽（例如原第 3 个铜矿信号）不会继续残留。
+  for slot_index = 1, 100 do section.clear_slot(slot_index) end
   local index = 1
   for _, value in ipairs(Util.sorted_outputs(outputs)) do
     if value.entry.count ~= 0 and index <= 100 then
       -- set_slot 的 value 是 SignalFilter，而不只是普通 SignalID。当 min 非零时，
-      -- Factorio 2.1 要求 quality 明确指定且 comparator 必须为“=”。流体虽然没有品质玩法，
-      -- 在这个筛选接口中仍需写 normal；否则会报“非简单物品筛选条件”错误。
+      -- Factorio 2.1 要求 quality 明确指定且 comparator 必须为“=”。
       local signal = value.entry.signal
       local safe_signal = Util.make_signal(signal.type, signal.name, signal.quality)
       safe_signal.quality = Util.quality_name(signal.quality)
@@ -207,7 +217,43 @@ local function write_outputs(record, outputs)
       index = index + 1
     end
   end
-  update_hover_tooltip(record, outputs)
+end
+
+---把结果分别写入红、绿隐藏代理，并同步悬浮信息。
+---普通模式把同一集合写入两色线路；带 separated 标记的结果可为两色线路分别提供集合。
+---@param record table 组合器运行记录。
+---@param outputs table 当前输出集合，或 `{separated=true, red=table, green=table}`。
+---@return nil
+local function write_outputs(record, outputs)
+  if not (record.red_proxy and record.red_proxy.valid) then
+    record.red_proxy = create_proxy(record.entity, "red")
+  end
+  if not (record.green_proxy and record.green_proxy.valid) then
+    record.green_proxy = create_proxy(record.entity, "green")
+  end
+  if not (record.detail_proxy and record.detail_proxy.valid) then
+    record.detail_proxy = create_proxy(record.entity, nil, DETAIL_PROXY)
+  end
+  if not (record.red_proxy and record.green_proxy) then return end
+
+  local separated = outputs.separated == true
+  local red_outputs = separated and outputs.red or outputs
+  local green_outputs = separated and outputs.green or outputs
+  write_proxy_outputs(record.red_proxy, red_outputs or {})
+  write_proxy_outputs(record.green_proxy, green_outputs or {})
+  -- 展示代理没有线路连接，只负责在 Alt 详细信息模式显示当前订单产品。
+  if record.detail_proxy then write_proxy_outputs(record.detail_proxy, record.detail_outputs or {}) end
+
+  local tooltip_outputs = outputs
+  if separated then
+    tooltip_outputs = {}
+    for _, wire_outputs in pairs({red_outputs or {}, green_outputs or {}}) do
+      for _, entry in pairs(wire_outputs) do
+        Util.add_output(tooltip_outputs, entry.signal, entry.count)
+      end
+    end
+  end
+  update_hover_tooltip(record, tooltip_outputs)
 end
 
 ---定时更新所有市场选择运算器，并清除已经失效的实体记录。
@@ -217,11 +263,10 @@ local function update_all()
     if record.entity and record.entity.valid then
       write_outputs(record, calculate(record))
     else
-      destroy_proxy(record)
+      destroy_proxies(record)
       state().combinators[unit] = nil
     end
   end
-  -- 原版组合器窗口会实时变化；自定义窗口也同步刷新线路连接状态。
   for player_index, unit in pairs(state().player_gui) do
     local player = game.get_player(player_index)
     local record = state().combinators[unit]
@@ -239,7 +284,14 @@ local function rebuild_all()
       mode_states = save_mode_states(record),
       output_tooltip_id = record.output_tooltip_id
     }
-    destroy_proxy(record)
+    destroy_proxies(record)
+  end
+  -- 开发期热重载或旧版本异常中断可能留下已不受 storage 跟踪的隐藏代理。
+  -- 重建时按本模组专用原型名统一清理，避免旧槽位继续向线路发送滞留信号。
+  local proxy_names = {PROXY}
+  if prototypes.entity[DETAIL_PROXY] then proxy_names[#proxy_names + 1] = DETAIL_PROXY end
+  for _, surface in pairs(game.surfaces) do
+    for _, proxy in pairs(surface.find_entities_filtered{name = proxy_names}) do proxy.destroy() end
   end
   storage.combinators = {}
   for _, surface in pairs(game.surfaces) do
@@ -295,7 +347,7 @@ local function current_record(player_index)
   return unit and state().combinators[unit]
 end
 
--- 网络信息悬浮事件：GUI 模块负责生成/销毁原版信号槽样式面板，控制层只提供当前实体。
+-- 网络信息悬浮事件：GUI 模块负责生成/销毁信号槽面板，控制层只提供当前实体。
 script.on_event(defines.events.on_gui_hover, function(event)
   if not Gui.is_network_info(event.element) then return end
   local record = current_record(event.player_index)
@@ -349,6 +401,11 @@ local function update_numeric_config(record, element_name, value)
     return true
   end
   if element_name == "bmsc-production-timeout" then record.config.production_timeout = value; return true end
+  if element_name == "bmsc-cache-grid-number" then
+    -- 缓存格数必须是非负整数；即使未来有调用方绕过 GUI，也不能写入负值或小数。
+    record.config.cache_grid_number = math.max(0, math.floor(value))
+    return true
+  end
   if element_name == "bmsc-recursion-depth" then record.config.recurise_depth = math.floor(value); return true end
   if element_name == "bmsc-recursion-timeout" then record.config.recursion_timeout = value; return true end
   return false
@@ -422,7 +479,10 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   end
   if event.element.name ~= "bmsc-output" then return end
   local record = current_record(event.player_index)
-  if record then record.config.output_mode = ({"only_item", "only_material", "all"})[event.element.selected_index] end
+  if record then
+    record.config.output_mode = ({"only_item", "only_material", "all", "all_separate_signal"})[event.element.selected_index]
+    Gui.set_cache_grid_visible(event.element, record.config.output_mode == "all_separate_signal")
+  end
 end)
 script.on_event(defines.events.on_gui_click, function(event)
   local player = game.get_player(event.player_index)

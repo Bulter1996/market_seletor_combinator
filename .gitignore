@@ -10,6 +10,7 @@
 *_original.lua
 
 # 需求、开发说明和手工测试数据，不属于 Factorio 运行所需文件
+prompt/
 AGENTS.md
 Requirement.md
 test-blueprint.txt
@@ -17,3 +18,4 @@ test-blueprint.txt
 # 图片制作源稿；游戏实际读取的成品 PNG 保留在 graphics 的其他目录中
 graphics/source/
 graphics/mode-symbols/source/
+

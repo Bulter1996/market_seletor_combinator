@@ -15,6 +15,7 @@ function Mode.reset(record)
   record.remembered_order = nil
   record.production_order_output_count = nil
   record.production_order_changed_tick = nil
+  record.detail_outputs = nil
 end
 
 ---导出需要随存档配置重建保留的模式运行状态。
@@ -65,6 +66,73 @@ local function recipe_has_materials(recipe, inventory, multiplier, locked)
   return true
 end
 
+---计算有限缓存最多能容纳多少个完整配方批次，并同比限制固体原料输出。
+---所有固体原料共用同一个批次数，因此不会为了填满剩余格子而破坏配方比例。
+---液体与 only-in-cursor 特殊物品不能放入普通箱子，不参与格数统计，始终保留完整需求量。
+---@param outputs table 未限制的实际原料需求集合。
+---@param minimum_outputs table 制造一份配方所需的最少原料集合。
+---@param requested_crafts integer 当前商品缺口实际需要的制造次数。
+---@param max_slots integer 可用缓存格数；0 表示不限制。
+---@return table limited_outputs 应写入红线的原料需求集合。
+local function limit_materials_by_cache(outputs, minimum_outputs, requested_crafts, max_slots)
+  if max_slots <= 0 then return outputs end
+  local solids = {}
+  local limited_outputs = {}
+  for key, entry in pairs(outputs) do
+    local signal_type = entry.signal.type or "item"
+    local prototype = signal_type == "item" and prototypes.item[entry.signal.name] or nil
+    local cacheable = prototype and not prototype.has_flag("only-in-cursor")
+    if cacheable then
+      local stack_size = prototype and prototype.stack_size or 1
+      solids[#solids + 1] = {
+        key = key,
+        entry = entry,
+        stack_size = stack_size,
+        minimum = minimum_outputs[key]
+      }
+    else
+      Util.add_output(limited_outputs, entry.signal, entry.count)
+    end
+  end
+  table.sort(solids, function(a, b) return a.key < b.key end)
+  if #solids == 0 then return limited_outputs end
+
+  if max_slots < #solids then
+    -- 连“一种可缓存原料一格”都无法满足时，不输出任何可装箱原料，避免产生
+    -- 一个天然无法保持完整配方比例的缓存请求。液体等忽略项已保留在 limited_outputs。
+    return limited_outputs
+  end
+
+  ---计算指定完整制造次数所需占用的固体缓存格数。
+  ---@param crafts integer 待评估的完整制造次数。
+  ---@return integer slots 所有固体原料向上取整后的总格数。
+  local function slots_for_crafts(crafts)
+    local slots = 0
+    for _, solid in ipairs(solids) do
+      local per_craft = solid.minimum and solid.minimum.count or 0
+      slots = slots + math.ceil(per_craft * crafts / solid.stack_size)
+    end
+    return slots
+  end
+
+  -- 二分查找可容纳的最大完整批次数；无法组成下一批时，剩余格子按规则保持空闲。
+  local low, high, fitted_crafts = 1, requested_crafts, 0
+  while low <= high do
+    local middle = math.floor((low + high) / 2)
+    if slots_for_crafts(middle) <= max_slots then
+      fitted_crafts = middle
+      low = middle + 1
+    else
+      high = middle - 1
+    end
+  end
+  for _, solid in ipairs(solids) do
+    local count = solid.minimum and solid.minimum.count * fitted_crafts or 0
+    if count > 0 then Util.add_output(limited_outputs, solid.entry.signal, count) end
+  end
+  return limited_outputs
+end
+
 ---执行生产订单计算。
 ---新订单在商品库存低于订单量且原料达到需求阈值时启动；锁定后到商品达到上限或
 ---原料下降到保留阈值时结束。开启记忆后，绿色订单消失也不会立即取消当前订单；
@@ -76,6 +144,10 @@ function Mode.calculate(record)
   local inventory = Util.read_network(record.entity, defines.wire_connector_id.combinator_input_red)
   local _, demands = Util.read_network(record.entity, defines.wire_connector_id.combinator_input_green)
   local outputs = {}
+  local product_outputs = {}
+  local material_outputs = {}
+  local minimum_material_outputs = {}
+  local material_crafts = 0
   table.sort(demands, function(a, b) return Util.signal_key(a.signal) < Util.signal_key(b.signal) end)
 
   ---判断一个订单在启动或锁定阶段是否仍可执行。
@@ -199,17 +271,36 @@ function Mode.calculate(record)
   end
 
   if selected_demand then
+    local output_count = selected_output_count or product_output_count(selected_demand)
     if config.output_mode ~= "only_material" then
       -- 产品信号表示“额外生产后的目标上限 - 当前库存”的实时缺口。
-      Util.add_output(outputs, selected_demand.signal, selected_output_count or product_output_count(selected_demand))
+      Util.add_output(outputs, selected_demand.signal, output_count)
+      Util.add_output(product_outputs, selected_demand.signal, output_count)
     end
     if config.output_mode ~= "only_item" then
+      -- 材料需求倍率只用于判断订单能否启动，不参与最终输出数量；这里按商品缺口
+      -- 向上取整到完整制造次数，保证缺口小于单次产量时仍至少请求一份配方原料。
+      local product_amount = Util.recipe_product_amount(selected_recipe, selected_demand.signal)
+      local crafts = product_amount > 0 and math.ceil(output_count / product_amount) or 0
+      material_crafts = crafts
       for _, ingredient in pairs(selected_recipe.ingredients) do
-        Util.add_output(outputs, Util.make_signal(ingredient.type, ingredient.name, "normal"),
-          ingredient.amount * config.material_demand_rate)
+        local signal = Util.make_signal(ingredient.type, ingredient.name, "normal")
+        local count = ingredient.amount * crafts
+        Util.add_output(outputs, signal, count)
+        Util.add_output(material_outputs, signal, count)
+        Util.add_output(minimum_material_outputs, signal, ingredient.amount)
       end
     end
   end
+  if config.output_mode == "all_separate_signal" then
+    -- 分离模式约定：红线只发送配方原料，绿线只发送当前订单商品。
+    local limited_materials = limit_materials_by_cache(
+      material_outputs, minimum_material_outputs, material_crafts, config.cache_grid_number or 0)
+    record.detail_outputs = product_outputs
+    return {separated = true, red = limited_materials, green = product_outputs}
+  end
+  -- 仅原料模式的 product_outputs 为空，因此详细信息模式不会显示产品图标。
+  record.detail_outputs = product_outputs
   return outputs
 end
 

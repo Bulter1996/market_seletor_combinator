@@ -75,7 +75,9 @@ proxy.name = "b-market-selector-output-proxy"
 -- 隐藏实体：不在游戏中显示、不在百科中显示、不能被蓝图复制、不能被拆除
 proxy.hidden = true
 proxy.hidden_in_factoriopedia = true
-proxy.flags = {"placeable-off-grid", "not-on-map", "not-blueprintable", "not-deconstructable"}
+proxy.flags = {
+  "placeable-off-grid", "not-on-map", "not-blueprintable", "not-deconstructable", "hide-alt-info"
+}
 -- 不可在游戏中选中
 proxy.selectable_in_game = false
 -- 碰撞掩码为空，不与其他实体碰撞
@@ -98,8 +100,15 @@ proxy.sprites = {
 proxy.draw_circuit_wires = false
 proxy.draw_copper_wires = false
 
--- 将所有定义的数据扩展到游戏中：实体、物品、配方、代理
-data:extend({entity, item, recipe, proxy})
+-- 详细信息展示代理不连接线路，只借用常量运算器的 Alt 图标显示当前订单产品。
+local detail_proxy = table.deepcopy(proxy)
+detail_proxy.name = "b-market-selector-detail-proxy"
+for index = #detail_proxy.flags, 1, -1 do
+  if detail_proxy.flags[index] == "hide-alt-info" then table.remove(detail_proxy.flags, index) end
+end
+
+-- 将所有定义的数据扩展到游戏中：实体、物品、配方及两类代理
+data:extend({entity, item, recipe, proxy, detail_proxy})
 
 -- 为相关技术添加解锁效果
 -- 遍历电路网络和高级组合器技术

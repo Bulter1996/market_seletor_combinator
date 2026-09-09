@@ -18,6 +18,7 @@ Gui.slider_profiles = {
   ["bmsc-material"] = {1, 2, 5, 10, 20, 50},            -- 材料需求倍率：适合批量准备原料。
   ["bmsc-material-retention"] = {0, 0.5, 1, 2, 5, 10},  -- 原料保留倍率：通常接近单次配方需求。
   ["bmsc-production-timeout"] = {0, 5, 10, 30, 60, 120},-- 超时时间：单位为秒，0 表示永不超时。
+  ["bmsc-cache-grid-number"] = {0, 1, 2, 5, 10, 20, 48},-- 缓存格数：0 不限制，48 对应钢箱容量。
   ["bmsc-recursion-depth"] = {0, 1, 2, 3, 5, 10},       -- 递归深度：只能使用整数。
   ["bmsc-recursion-timeout"] = {0, 5, 10, 30, 60, 120} -- 超时时间：与生产订单使用相同时间档。
 }
@@ -229,11 +230,16 @@ end
 ---@param value number 当前配置值。
 ---@param allow_decimal boolean 是否允许文本框输入小数。
 ---@param tooltip LocalisedString 鼠标悬停在滑块或输入框时显示的参数解释。
+---@param visible boolean|nil 是否显示整行；nil 按 true 处理。
+---@param label_name string|nil 标签元素名称；需要动态显隐时传入。
 ---@return LuaGuiElement textfield 新创建的短输入框。
-local function add_numeric_slider(parent, caption, name, value, allow_decimal, tooltip)
+local function add_numeric_slider(parent, caption, name, value, allow_decimal, tooltip, visible, label_name)
   local values = Gui.slider_profiles[name]
-  parent.add{type = "label", caption = caption}
-  local controls = parent.add{type = "flow", name = name .. "-controls", direction = "horizontal"}
+  local row_visible = visible ~= false
+  parent.add{type = "label", name = label_name, caption = caption, visible = row_visible}
+  local controls = parent.add{
+    type = "flow", name = name .. "-controls", direction = "horizontal", visible = row_visible
+  }
   controls.style.vertical_align = "center"
   controls.style.horizontal_spacing = 8
 
@@ -369,6 +375,21 @@ function Gui.set_recursion_timeout_visible(source_element, visible)
   fields["bmsc-recursion-timeout-controls"].visible = visible
 end
 
+---只在生产订单的“所有（信号分离）”输出模式下显示缓存格数。
+---@param source_element LuaGuiElement 生产订单输出模式下拉框。
+---@param visible boolean true 显示，false 隐藏。
+---@return nil
+function Gui.set_cache_grid_visible(source_element, visible)
+  local window = Gui.containing_window(source_element)
+  local content = window and window["bmsc-content"]
+  local details = content and content["bmsc-production-details"]
+  local settings = details and details["bmsc-production-settings"]
+  local fields = settings and settings["bmsc-production-fields"]
+  if not fields then return end
+  fields["bmsc-cache-grid-number-label"].visible = visible
+  fields["bmsc-cache-grid-number-controls"].visible = visible
+end
+
 ---同步两个模式参数区里的生产机器按钮。
 ---为什么需要：两个模式共用同一配置值，玩家切换模式后不应看到旧的机器名称。
 ---@param source_element LuaGuiElement 触发修改的生产机器选择按钮。
@@ -426,7 +447,6 @@ function Gui.open(player, entity, config)
   local connections = content.add{type = "table", name = "bmsc-connections", column_count = 5}
   connections.style.horizontally_stretchable = true
   connections.style.horizontal_spacing = 8
-  -- 原版连接状态不会贴住窗口边框；分别设置四边间距，保留清晰的标题栏层次。
   connections.style.left_padding = 12
   connections.style.right_padding = 12
   connections.style.top_padding = 6
@@ -495,9 +515,13 @@ function Gui.open(player, entity, config)
   add_numeric_slider(fields, {"bmsc.production-timeout"}, "bmsc-production-timeout",
     config.production_timeout or 0, true, {"bmsc.production-timeout-tooltip"})
   add_labeled(fields, {"bmsc.output-mode"}, {type = "drop-down", name = "bmsc-output",
-    items = {{"bmsc.only-item"}, {"bmsc.only-material"}, {"bmsc.all"}},
-    selected_index = ({only_item = 1, only_material = 2, all = 3})[config.output_mode] or 3,
+    items = {{"bmsc.only-item"}, {"bmsc.only-material"}, {"bmsc.all"}, {"bmsc.all-separate-signal"}},
+    selected_index = ({only_item = 1, only_material = 2, all = 3, all_separate_signal = 4})[config.output_mode] or 3,
     tooltip = {"bmsc.output-mode-tooltip"}})
+  local cache_visible = config.output_mode == "all_separate_signal"
+  add_numeric_slider(fields, {"bmsc.cache-grid-number"}, "bmsc-cache-grid-number",
+    config.cache_grid_number or 0, false, {"bmsc.cache-grid-number-tooltip"}, cache_visible,
+    "bmsc-cache-grid-number-label")
   -- 订单记忆放在参数列表末尾，使它和紧随其后的“清空订单记忆”按钮形成一组。
   add_labeled(fields, {"bmsc.remember-order"}, {type = "drop-down", name = "bmsc-remember-order",
     items = {{"bmsc.yes"}, {"bmsc.no"}}, selected_index = config.remember_order and 1 or 2,

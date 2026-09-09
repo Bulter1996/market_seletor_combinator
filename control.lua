@@ -173,8 +173,10 @@ end
 ---@return nil
 local function update_hover_tooltip(record, outputs)
   local parts = {}
+  local signature_parts = {}
   for _, value in ipairs(Util.sorted_outputs(outputs)) do
     local entry = value.entry
+    signature_parts[#signature_parts + 1] = value.key .. "=" .. tostring(entry.count)
     local signal_type = entry.signal.type or "item"
     local tag_type = signal_type == "virtual" and "virtual-signal" or signal_type
     local quality = signal_type == "item" and Util.quality_name(entry.signal.quality) or nil
@@ -182,18 +184,45 @@ local function update_hover_tooltip(record, outputs)
     parts[#parts + 1] = "[" .. tag_type .. "=" .. entry.signal.name
       .. quality_part .. "] " .. entry.count
   end
+  local signature = table.concat(signature_parts, "|")
+  -- set_tooltip_field 会修改实体运行时状态；输出未变化时直接复用旧字段，避免重复写入。
+  if record.tooltip_output_signature == signature then return end
   local content = #parts > 0 and table.concat(parts, "  ") or {"bmsc.no-output"}
   record.output_tooltip_id = record.entity.set_tooltip_field{
     id = record.output_tooltip_id, name = {"bmsc.output-signals"}, value = content, order = 31
   }
+  record.tooltip_output_signature = signature
   record.entity.custom_status = nil
 end
 
+---把输出集合整理为实际可写入代理的稳定数组和签名。
+---签名只包含最终会上线路的前 100 个非零信号；同一集合无论 pairs 遍历顺序如何，
+---都会得到相同字符串，因此可以安全判断“本轮输出是否真的发生变化”。
+---@param outputs table 当前线路的输出集合。
+---@return table entries 按信号键排序、过滤后的输出数组。
+---@return string signature 用于比较相邻两轮输出的稳定签名。
+local function prepare_proxy_outputs(outputs)
+  local entries = {}
+  local signature_parts = {}
+  for _, value in ipairs(Util.sorted_outputs(outputs)) do
+    if value.entry.count ~= 0 and #entries < 100 then
+      entries[#entries + 1] = value.entry
+      signature_parts[#signature_parts + 1] = value.key .. "=" .. tostring(value.entry.count)
+    end
+  end
+  return entries, table.concat(signature_parts, "|")
+end
+
 ---把一组结果写入指定隐藏代理的常量运算器槽位。
+---输出签名未变化时不访问 Factorio 槽位 API；发生变化时只清理上一轮多出来的槽位。
 ---@param proxy LuaEntity 隐藏常量运算器。
 ---@param outputs table 当前线路的输出集合。
----@return nil
-local function write_proxy_outputs(proxy, outputs)
+---@param cache table|nil 上一轮缓存，格式为 `{signature=string, slot_count=integer}`。
+---@return table cache 本轮签名和实际槽位数，供下一轮复用。
+local function write_proxy_outputs(proxy, outputs, cache)
+  local entries, signature = prepare_proxy_outputs(outputs)
+  if cache and cache.signature == signature then return cache end
+
   local behavior = proxy.get_or_create_control_behavior()
   -- 代理只使用第一节。若旧版本或异常状态留下额外 section，必须先移除，否则其中的
   -- 信号仍会与第一节一起发送到线路，形成看似无法释放的历史输出。
@@ -201,22 +230,20 @@ local function write_proxy_outputs(proxy, outputs)
     behavior.remove_section(section_index)
   end
   local section = behavior.get_section(1) or behavior.add_section()
-  -- 显式逐槽清理比给 filters 赋空表更可靠，也能确保本轮输出比上一轮少时，
-  -- 高位旧槽（例如原第 3 个铜矿信号）不会继续残留。
-  for slot_index = 1, 100 do section.clear_slot(slot_index) end
-  local index = 1
-  for _, value in ipairs(Util.sorted_outputs(outputs)) do
-    if value.entry.count ~= 0 and index <= 100 then
-      -- set_slot 的 value 是 SignalFilter，而不只是普通 SignalID。当 min 非零时，
-      -- Factorio 2.1 要求 quality 明确指定且 comparator 必须为“=”。
-      local signal = value.entry.signal
-      local safe_signal = Util.make_signal(signal.type, signal.name, signal.quality)
-      safe_signal.quality = Util.quality_name(signal.quality)
-      safe_signal.comparator = "="
-      section.set_slot(index, {value = safe_signal, min = value.entry.count})
-      index = index + 1
-    end
+  for index, entry in ipairs(entries) do
+    -- set_slot 的 value 是 SignalFilter，而不只是普通 SignalID。当 min 非零时，
+    -- Factorio 2.1 要求 quality 明确指定且 comparator 必须为“=”。
+    local signal = entry.signal
+    local safe_signal = Util.make_signal(signal.type, signal.name, signal.quality)
+    safe_signal.quality = Util.quality_name(signal.quality)
+    safe_signal.comparator = "="
+    section.set_slot(index, {value = safe_signal, min = entry.count})
   end
+  -- 新建或从旧版本接管的代理没有可信缓存，首次最多清理 100 格；之后只清理
+  -- “新槽位数 + 1”到“旧槽位数”，避免每轮固定执行 100 次 clear_slot。
+  local previous_slot_count = cache and cache.slot_count or 100
+  for slot_index = #entries + 1, previous_slot_count do section.clear_slot(slot_index) end
+  return {signature = signature, slot_count = #entries}
 end
 
 ---把结果分别写入红、绿隐藏代理，并同步悬浮信息。
@@ -225,24 +252,33 @@ end
 ---@param outputs table 当前输出集合，或 `{separated=true, red=table, green=table}`。
 ---@return nil
 local function write_outputs(record, outputs)
+  record.proxy_output_cache = record.proxy_output_cache or {}
   if not (record.red_proxy and record.red_proxy.valid) then
     record.red_proxy = create_proxy(record.entity, "red")
+    record.proxy_output_cache.red = nil
   end
   if not (record.green_proxy and record.green_proxy.valid) then
     record.green_proxy = create_proxy(record.entity, "green")
+    record.proxy_output_cache.green = nil
   end
   if not (record.detail_proxy and record.detail_proxy.valid) then
     record.detail_proxy = create_proxy(record.entity, nil, DETAIL_PROXY)
+    record.proxy_output_cache.detail = nil
   end
   if not (record.red_proxy and record.green_proxy) then return end
 
   local separated = outputs.separated == true
   local red_outputs = separated and outputs.red or outputs
   local green_outputs = separated and outputs.green or outputs
-  write_proxy_outputs(record.red_proxy, red_outputs or {})
-  write_proxy_outputs(record.green_proxy, green_outputs or {})
+  record.proxy_output_cache.red = write_proxy_outputs(
+    record.red_proxy, red_outputs or {}, record.proxy_output_cache.red)
+  record.proxy_output_cache.green = write_proxy_outputs(
+    record.green_proxy, green_outputs or {}, record.proxy_output_cache.green)
   -- 展示代理没有线路连接，只负责在 Alt 详细信息模式显示当前订单产品。
-  if record.detail_proxy then write_proxy_outputs(record.detail_proxy, record.detail_outputs or {}) end
+  if record.detail_proxy then
+    record.proxy_output_cache.detail = write_proxy_outputs(
+      record.detail_proxy, record.detail_outputs or {}, record.proxy_output_cache.detail)
+  end
 
   local tooltip_outputs = outputs
   if separated then

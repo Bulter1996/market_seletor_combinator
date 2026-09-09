@@ -12,6 +12,7 @@ local Util = require("scripts.common_util")            -- 通用工具：输出�
 local MODES = require("scripts.mode_registry")          -- 模式注册表：统一调度彼此独立的算法模块。
 local MODE_PRODUCTION_ORDER = Config.mode.production_order
 local MODE_ORDER_RECURSION = Config.mode.order_recursion
+local MODE_RECIPE_QUERY = Config.mode.recipe_query
 
 ---取得并初始化本模组的持久状态。
 ---为什么需要：`storage` 会随存档保存，但首次运行时字段不存在，所有入口都通过此函数安全访问。
@@ -396,7 +397,8 @@ script.on_event(defines.events.on_gui_leave, function(event)
 end)
 
 script.on_event(defines.events.on_gui_elem_changed, function(event)
-  if event.element.name ~= "bmsc-production-machine" and event.element.name ~= "bmsc-recursion-machine" then return end
+  if event.element.name ~= "bmsc-production-machine" and event.element.name ~= "bmsc-recursion-machine"
+    and event.element.name ~= "bmsc-recipe-query-machine" then return end
   local record = current_record(event.player_index)
   local machine = event.element.elem_value
   local prototype = machine and prototypes.entity[machine]
@@ -405,7 +407,7 @@ script.on_event(defines.events.on_gui_elem_changed, function(event)
     record.config.production_machine = machine
     Gui.sync_machine_buttons(event.element, machine)
     if machine_changed then
-      -- 生产机器决定哪些配方能够被查询。两种模式都可能保存基于旧机器得到的锁定项、
+      -- 生产机器决定哪些配方能够被查询。各模式都可能保存基于旧机器得到的锁定项、
       -- 目标库存和超时状态，因此不能只修改配置字段；必须统一清除运行缓存。
       -- 订单记忆代表玩家已经接受的订单，不是配方查询缓存；切换机器时先暂存它，
       -- 清理派生状态后再恢复，使绿线订单已经消失时仍能由新机器重新验证并继续执行。
@@ -488,12 +490,22 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   if event.element.name == "bmsc-mode" then
     local record = current_record(event.player_index)
     if not record then return end
-    record.config.mode = event.element.selected_index == 2 and MODE_ORDER_RECURSION or MODE_PRODUCTION_ORDER
+    record.config.mode = ({MODE_PRODUCTION_ORDER, MODE_ORDER_RECURSION, MODE_RECIPE_QUERY})
+      [event.element.selected_index] or MODE_PRODUCTION_ORDER
     reset_all_modes(record)
     sync_mode_visual(record)
 
     -- 模式参数属于同一个窗口；像原版一样随下拉选项即时出现或隐藏。
     Gui.show_mode_details(event.element, record.config.mode)
+    return
+  end
+  if event.element.name == "bmsc-multiple-recipe-support" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    -- 第一项为“否”、第二项为“是”；切换后立即重算，避免界面与线路短暂不一致。
+    record.config.multiple_recipe_support = event.element.selected_index == 2
+    MODES[MODE_RECIPE_QUERY].reset(record)
+    write_outputs(record, calculate(record))
     return
   end
   if event.element.name == "bmsc-remember-order" then

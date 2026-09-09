@@ -5,8 +5,10 @@
 
 local production_order = require("scripts.modes.production_order")
 local order_recursion = require("scripts.modes.order_recursion")
+local recipe_query = require("scripts.modes.recipe_query")
 
 return {
   [production_order.name] = production_order,
-  [order_recursion.name] = order_recursion
+  [order_recursion.name] = order_recursion,
+  [recipe_query.name] = recipe_query
 }

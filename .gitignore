@@ -1,0 +1,19 @@
+# 操作系统和编辑器产生的本地文件
+.DS_Store
+.vscode/
+
+# 本地运行测试目录与发布压缩包；Factorio 模组源码不需要这些副本
+.runtime-test-mod/
+*.zip
+
+# 开发过程中的旧版备份，不参与当前模组加载
+*_original.lua
+
+# 需求、开发说明和手工测试数据，不属于 Factorio 运行所需文件
+AGENTS.md
+Requirement.md
+test-blueprint.txt
+
+# 图片制作源稿；游戏实际读取的成品 PNG 保留在 graphics 的其他目录中
+graphics/source/
+graphics/mode-symbols/source/

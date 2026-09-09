@@ -1,0 +1,493 @@
+-- Market Selector Combinator 运行阶段主文件。
+-- Factorio 加载存档后执行本文件；这里只负责编排实体状态、模式模块、GUI、输出代理和蓝图配置。
+
+local ENTITY = "b-market-selector-combinator"          -- 参数：玩家可放置的主实体原型名。
+local PROXY = "b-market-selector-output-proxy"         -- 参数：向线路发送计算结果的隐藏实体原型名。
+local TICK_INTERVAL = 10                                -- 参数：每 10 tick 重算，平衡实时性和性能。
+local Gui = require("scripts.gui")                     -- GUI 模块：只负责界面，不参与生产计算。
+local Config = require("scripts.config")               -- 配置模块：默认值、模式常量和外部数据校验。
+local Util = require("scripts.common_util")            -- 通用工具：输出排序等无状态功能。
+local MODES = require("scripts.mode_registry")          -- 模式注册表：统一调度彼此独立的算法模块。
+local MODE_PRODUCTION_ORDER = Config.mode.production_order
+local MODE_ORDER_RECURSION = Config.mode.order_recursion
+
+---取得并初始化本模组的持久状态。
+---为什么需要：`storage` 会随存档保存，但首次运行时字段不存在，所有入口都通过此函数安全访问。
+---@return table state 包含 combinators（实体记录）和 player_gui（玩家正在编辑的实体）。
+local function state()
+  storage.combinators = storage.combinators or {}
+  storage.player_gui = storage.player_gui or {}
+  return storage
+end
+
+---配置校验函数的本地别名，让实体生命周期代码保持简洁。
+---@type fun(source: table|nil): table
+local normalize_config = Config.normalize
+
+---清除一台组合器的全部模式运行缓存。
+---@param record table 组合器记录。
+---@return nil
+local function reset_all_modes(record)
+  for _, mode in pairs(MODES) do mode.reset(record) end
+end
+
+---导出所有模式的运行缓存，control.lua 不需要知道各模式包含哪些字段。
+---@param record table 组合器记录。
+---@return table states 以模式名为键的状态集合。
+local function save_mode_states(record)
+  local states = {}
+  for name, mode in pairs(MODES) do states[name] = mode.save_state(record) end
+  return states
+end
+
+---恢复各模式自行导出的运行缓存。
+---@param record table 新建的组合器记录。
+---@param states table|nil save_mode_states 的返回值。
+---@return nil
+local function restore_mode_states(record, states)
+  states = states or {}
+  for name, mode in pairs(MODES) do mode.restore_state(record, states[name]) end
+end
+
+---销毁某条记录的隐藏输出代理。
+---@param record table|nil 组合器运行记录。
+---@return nil
+local function destroy_proxy(record)
+  if record and record.proxy and record.proxy.valid then record.proxy.destroy() end
+end
+
+---把隐藏代理的红/绿线分别接到主实体的红/绿输出端。
+---为什么需要：选择运算器原生模式不能发送脚本任意生成的一组信号，因此使用隐藏常量运算器发射。
+---@param entity LuaEntity 主选择运算器。
+---@param proxy LuaEntity 隐藏常量运算器。
+---@return nil
+local function connect_proxy(entity, proxy)
+  local proxy_red = proxy.get_wire_connector(defines.wire_connector_id.circuit_red, true)
+  local proxy_green = proxy.get_wire_connector(defines.wire_connector_id.circuit_green, true)
+  local output_red = entity.get_wire_connector(defines.wire_connector_id.combinator_output_red, true)
+  local output_green = entity.get_wire_connector(defines.wire_connector_id.combinator_output_green, true)
+  if proxy_red and output_red then proxy_red.connect_to(output_red, false, defines.wire_origin.script) end
+  if proxy_green and output_green then proxy_green.connect_to(output_green, false, defines.wire_origin.script) end
+end
+
+---在主实体位置创建不可见、不可操作的输出代理。
+---@param entity LuaEntity 主选择运算器。
+---@return LuaEntity|nil proxy 创建失败时返回 nil。
+local function create_proxy(entity)
+  local proxy = entity.surface.create_entity{
+    name = PROXY, position = entity.position, force = entity.force, create_build_effect_smoke = false
+  }
+  if proxy then
+    proxy.destructible = false
+    proxy.operable = false
+    connect_proxy(entity, proxy)
+  end
+  return proxy
+end
+
+---同步实体小屏幕的原版模式外观，同时关闭原生信号输出。
+---为什么需要：实体预览直接渲染真实 LuaEntity；修改原生 operation 后，世界实体和 GUI 预览
+---会由游戏引擎自动显示对应符号。实际计算仍由模式模块完成，原生行为只承担视觉展示。
+---模式可以提供完整的 visual_parameters；旧模式只声明 visual_operation 时仍可兼容。
+---@param record table 组合器记录，必须包含 entity 和 config.mode。
+---@return nil
+local function sync_mode_visual(record)
+  if not (record and record.entity and record.entity.valid) then return end
+  local behavior = record.entity.get_or_create_control_behavior()
+  if not behavior then return end
+  local mode = MODES[record.config.mode]
+  -- `max`/`min` 并不是合法 operation：它们属于 select 操作的 select_max 参数。
+  -- 完整参数表由模式自行声明，能避免把“素材字段名”误当成运行时操作名。
+  local visual_parameters = mode and mode.visual_parameters
+  behavior.parameters = visual_parameters or {operation = mode and mode.visual_operation or "select"}
+  -- 禁止用于动画的原生操作向线路发送信号，真实输出仍由隐藏常量运算器代理提供。
+  behavior.output_networks = {red = false, green = false}
+end
+
+---注册新建、克隆或从蓝图恢复的主实体。
+---@param entity LuaEntity|nil 待注册实体。
+---@param tags table|nil 蓝图携带的配置标签。
+---@return nil
+local function register(entity, tags)
+  if not (entity and entity.valid and entity.name == ENTITY) then return end
+  destroy_proxy(state().combinators[entity.unit_number])
+  local source = tags and tags.bmsc or tags
+  local record = {
+    entity = entity,
+    proxy = create_proxy(entity),
+    config = normalize_config(source)
+  }
+  reset_all_modes(record)
+  state().combinators[entity.unit_number] = record
+  sync_mode_visual(record)
+end
+
+---取消注册实体并清理其辅助对象。
+---@param entity LuaEntity|nil 被挖掘或摧毁的实体。
+---@return nil
+local function remove(entity)
+  if not (entity and entity.valid and entity.unit_number) then return end
+  destroy_proxy(state().combinators[entity.unit_number])
+  state().combinators[entity.unit_number] = nil
+end
+
+---调用当前配置所对应的模式模块。
+---每个模式遵守相同接口：calculate(record) 计算输出，reset(record) 清理该模式缓存。
+---@param record table 当前组合器运行记录。
+---@return table outputs 当前模式产生的标准输出集合。
+local function calculate(record)
+  -- 防御旧运行状态：即使存档尚未经过配置迁移，也不允许相等/倒置阈值进入模式算法。
+  if not Config.material_rates_valid(record.config.material_demand_rate, record.config.material_retention_rate) then
+    record.config = normalize_config(record.config)
+  end
+  local active = MODES[record.config.mode]
+  for _, mode in pairs(MODES) do
+    if mode ~= active then mode.reset(record) end
+  end
+  return active and active.calculate(record) or {}
+end
+
+---更新鼠标悬浮信息卡中的输出信号字段。
+---为什么需要：真实信号由隐藏代理产生，主实体的原生输出区不会自动识别这些脚本信号。
+---Factorio 2.1 的 `set_tooltip_field` 会把字段加入原生信息卡，名称、数值字号与输入信号一致。
+---@param record table 组合器运行记录；其中保存 tooltip 字段编号，避免每次刷新都新增一行。
+---@param outputs table 当前输出集合。
+---@return nil
+local function update_hover_tooltip(record, outputs)
+  local parts = {}
+  for _, value in ipairs(Util.sorted_outputs(outputs)) do
+    local entry = value.entry
+    local signal_type = entry.signal.type or "item"
+    -- `[img=...]` 只会生成较小的行内图片；item/fluid/virtual-signal 专用标签会按照
+    -- Factorio 的原生信号富文本规则渲染。外层 default-large 字体同时放大图标占用的行高，
+    -- 使脚本添加的输出信号与引擎生成的输入信号在信息卡中尺寸更接近。
+    local tag_type = signal_type == "virtual" and "virtual-signal" or signal_type
+    local quality = signal_type == "item" and Util.quality_name(entry.signal.quality) or nil
+    local quality_part = quality and quality ~= "normal" and ",quality=" .. quality or ""
+    -- tooltip 富文本图标使用引擎固定的“小型行内图标”尺寸；字体标签只改变数字文字，
+    -- 不会缩放图标。保留语义化信号标签，但不再套用无效且会放大数字的字体标签。
+    parts[#parts + 1] = "[" .. tag_type .. "=" .. entry.signal.name
+      .. quality_part .. "] " .. entry.count
+  end
+  local content = #parts > 0 and table.concat(parts, "  ") or {"bmsc.no-output"}
+  -- 原版输入信号字段使用同一排序区间。旧值 30 与原生字段发生并列时，
+  -- 自定义字段会被排在输入信号之前；改为紧随其后的 31，得到“输入信号 → 输出信号”。
+  -- 该值仍小于操作者、阵营和生命值字段，因此输出不会落到通用实体信息之后。
+  record.output_tooltip_id = record.entity.set_tooltip_field{
+    id = record.output_tooltip_id,
+    name = {"bmsc.output-signals"},
+    value = content,
+    order = 31
+  }
+  -- 清除旧版本借用的状态行，避免输出信号仍显示在输入信号上方。
+  record.entity.custom_status = nil
+end
+
+---把结果写入隐藏代理的常量运算器槽位，并同步悬浮状态。
+---@param record table 组合器运行记录。
+---@param outputs table 当前输出集合。
+---@return nil
+local function write_outputs(record, outputs)
+  if not (record.proxy and record.proxy.valid) then record.proxy = create_proxy(record.entity) end
+  if not record.proxy then return end
+  local behavior = record.proxy.get_or_create_control_behavior()
+  local section = behavior.get_section(1) or behavior.add_section()
+  section.filters = {}
+  local index = 1
+  for _, value in ipairs(Util.sorted_outputs(outputs)) do
+    if value.entry.count ~= 0 and index <= 100 then
+      -- set_slot 的 value 是 SignalFilter，而不只是普通 SignalID。当 min 非零时，
+      -- Factorio 2.1 要求 quality 明确指定且 comparator 必须为“=”。流体虽然没有品质玩法，
+      -- 在这个筛选接口中仍需写 normal；否则会报“非简单物品筛选条件”错误。
+      local signal = value.entry.signal
+      local safe_signal = Util.make_signal(signal.type, signal.name, signal.quality)
+      safe_signal.quality = Util.quality_name(signal.quality)
+      safe_signal.comparator = "="
+      section.set_slot(index, {value = safe_signal, min = value.entry.count})
+      index = index + 1
+    end
+  end
+  update_hover_tooltip(record, outputs)
+end
+
+---定时更新所有市场选择运算器，并清除已经失效的实体记录。
+---@return nil
+local function update_all()
+  for unit, record in pairs(state().combinators) do
+    if record.entity and record.entity.valid then
+      write_outputs(record, calculate(record))
+    else
+      destroy_proxy(record)
+      state().combinators[unit] = nil
+    end
+  end
+  -- 原版组合器窗口会实时变化；自定义窗口也同步刷新线路连接状态。
+  for player_index, unit in pairs(state().player_gui) do
+    local player = game.get_player(player_index)
+    local record = state().combinators[unit]
+    if player and record then Gui.refresh_connection_status(player, record.entity) end
+  end
+end
+
+---配置迁移时重建所有代理，同时保留玩家配置和当前锁定产品。
+---@return nil
+local function rebuild_all()
+  local saved = {}
+  for unit, record in pairs(state().combinators) do
+    saved[unit] = {
+      config = record.config,
+      mode_states = save_mode_states(record),
+      output_tooltip_id = record.output_tooltip_id
+    }
+    destroy_proxy(record)
+  end
+  storage.combinators = {}
+  for _, surface in pairs(game.surfaces) do
+    for _, entity in pairs(surface.find_entities_filtered{name = ENTITY}) do
+      local old = saved[entity.unit_number]
+      register(entity, old and {bmsc = old.config} or nil)
+      if old then
+        local record = storage.combinators[entity.unit_number]
+        restore_mode_states(record, old.mode_states)
+        record.output_tooltip_id = old.output_tooltip_id
+      end
+    end
+  end
+end
+
+-- 生命周期事件：初始化新存档，或在模组版本/配置变化后迁移旧存档。
+script.on_init(function() state(); rebuild_all() end)
+script.on_configuration_changed(rebuild_all)
+
+-- 建造/移除事件：所有建造来源统一注册，所有销毁来源统一清理。
+script.on_event({defines.events.on_built_entity, defines.events.on_robot_built_entity,
+  defines.events.script_raised_built, defines.events.script_raised_revive, defines.events.on_entity_cloned}, function(event)
+  register(event.created_entity or event.entity or event.destination, event.tags)
+end)
+script.on_event({defines.events.on_player_mined_entity, defines.events.on_robot_mined_entity,
+  defines.events.on_entity_died, defines.events.script_raised_destroy}, function(event) remove(event.entity) end)
+
+-- GUI 事件：拦截原版选择运算器窗口，改为本模组自己的参数窗口。
+script.on_event(defines.events.on_gui_opened, function(event)
+  if event.entity and event.entity.valid and event.entity.name == ENTITY then
+    local player = game.get_player(event.player_index)
+    player.opened = nil
+    local record = state().combinators[event.entity.unit_number]
+    if not record then register(event.entity); record = state().combinators[event.entity.unit_number] end
+    Gui.open(player, event.entity, record.config)
+    state().player_gui[player.index] = event.entity.unit_number
+  end
+end)
+script.on_event(defines.events.on_gui_closed, function(event)
+  if not (event.element and event.element.valid and event.element.name == Gui.name) then return end
+
+  -- player.opened 使 E、Esc、打开其他实体等操作都会进入这里，行为与原版实体窗口一致。
+  state().player_gui[event.player_index] = nil
+  Gui.hide_network_popup(game.get_player(event.player_index))
+  event.element.destroy()
+end)
+
+---根据玩家索引取得其当前正在编辑的组合器记录。
+---@param player_index uint 玩家索引。
+---@return table|nil record。
+local function current_record(player_index)
+  local unit = state().player_gui[player_index]
+  return unit and state().combinators[unit]
+end
+
+-- 网络信息悬浮事件：GUI 模块负责生成/销毁原版信号槽样式面板，控制层只提供当前实体。
+script.on_event(defines.events.on_gui_hover, function(event)
+  if not Gui.is_network_info(event.element) then return end
+  local record = current_record(event.player_index)
+  if record then Gui.show_network_popup(game.get_player(event.player_index), event.element, record.entity) end
+end)
+script.on_event(defines.events.on_gui_leave, function(event)
+  if Gui.is_network_info(event.element) then
+    Gui.hide_network_popup(game.get_player(event.player_index))
+  end
+end)
+
+script.on_event(defines.events.on_gui_elem_changed, function(event)
+  if event.element.name ~= "bmsc-production-machine" and event.element.name ~= "bmsc-recursion-machine" then return end
+  local record = current_record(event.player_index)
+  local machine = event.element.elem_value
+  local prototype = machine and prototypes.entity[machine]
+  if record and prototype and prototype.crafting_categories then
+    local machine_changed = record.config.production_machine ~= machine
+    record.config.production_machine = machine
+    Gui.sync_machine_buttons(event.element, machine)
+    if machine_changed then
+      -- 生产机器决定哪些配方能够被查询。两种模式都可能保存基于旧机器得到的锁定项、
+      -- 目标库存和超时状态，因此不能只修改配置字段；必须统一清除运行缓存。
+      -- 订单记忆代表玩家已经接受的订单，不是配方查询缓存；切换机器时先暂存它，
+      -- 清理派生状态后再恢复，使绿线订单已经消失时仍能由新机器重新验证并继续执行。
+      local remembered_order = record.config.remember_order and record.remembered_order or nil
+      reset_all_modes(record)
+      record.remembered_order = remembered_order
+      -- GUI 参数变更后立即用新机器重新查配方并覆盖代理输出，不必等待下一个 10 tick。
+      -- 若新机器不支持当前产品，calculate 返回空集合，旧输出也会立刻被清除。
+      write_outputs(record, calculate(record))
+    end
+  end
+end)
+---把一个已经校验的数值写入其对应配置字段。
+---文本框和滑块共用这个入口，避免两类 GUI 事件分别维护一套参数名称映射。
+---@param record table 当前组合器记录。
+---@param element_name string 数值输入框的 GUI 名称。
+---@param value number 非负参数值。
+---@return boolean accepted 是否接受该数值；材料倍率关系无效时返回 false。
+local function update_numeric_config(record, element_name, value)
+  if element_name == "bmsc-additional" then record.config.additional_production_rate = value; return true end
+  if element_name == "bmsc-material" then
+    if not Config.material_rates_valid(value, record.config.material_retention_rate) then return false end
+    record.config.material_demand_rate = value
+    return true
+  end
+  if element_name == "bmsc-material-retention" then
+    if not Config.material_rates_valid(record.config.material_demand_rate, value) then return false end
+    record.config.material_retention_rate = value
+    return true
+  end
+  if element_name == "bmsc-production-timeout" then record.config.production_timeout = value; return true end
+  if element_name == "bmsc-recursion-depth" then record.config.recurise_depth = math.floor(value); return true end
+  if element_name == "bmsc-recursion-timeout" then record.config.recursion_timeout = value; return true end
+  return false
+end
+
+script.on_event(defines.events.on_gui_text_changed, function(event)
+  local record = current_record(event.player_index)
+  local value = tonumber(event.element.text)
+  if not record then return end
+  if event.element.name == "bmsc-material" or event.element.name == "bmsc-material-retention" then
+    local valid, demand, retention = Gui.validate_material_rate_inputs(event.element)
+    if valid then
+      -- 两个输入框作为一个参数组同时提交，避免修改顺序受到旧配置值影响。
+      record.config.material_demand_rate = demand
+      record.config.material_retention_rate = retention
+      Gui.sync_numeric_slider(event.element, value)
+    end
+    return
+  end
+  if not (value and value >= 0) then return end
+  local accepted = update_numeric_config(record, event.element.name, value)
+  -- 输入任意值时只移动滑块到最近档位，不改写玩家输入的精确数值。
+  if accepted then Gui.sync_numeric_slider(event.element, value) end
+end)
+
+script.on_event(defines.events.on_gui_value_changed, function(event)
+  if not event.element.tags.bmsc_numeric_input then return end
+  local record = current_record(event.player_index)
+  if not record then return end
+  -- slider_value 是离散档位索引；GUI 模块根据具体参数映射为倍率、秒数或递归深度。
+  local textfield, value = Gui.apply_numeric_slider(event.element)
+  if not (textfield and value) then return end
+  if textfield.name == "bmsc-material" or textfield.name == "bmsc-material-retention" then
+    local valid, demand, retention = Gui.validate_material_rate_inputs(textfield)
+    if valid then
+      record.config.material_demand_rate = demand
+      record.config.material_retention_rate = retention
+    end
+    return
+  end
+  update_numeric_config(record, textfield.name, value)
+end)
+script.on_event(defines.events.on_gui_selection_state_changed, function(event)
+  if event.element.name == "bmsc-mode" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    record.config.mode = event.element.selected_index == 2 and MODE_ORDER_RECURSION or MODE_PRODUCTION_ORDER
+    reset_all_modes(record)
+    sync_mode_visual(record)
+
+    -- 模式参数属于同一个窗口；像原版一样随下拉选项即时出现或隐藏。
+    Gui.show_mode_details(event.element, record.config.mode)
+    return
+  end
+  if event.element.name == "bmsc-remember-order" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    -- 下拉框第一项为“是”、第二项为“否”。关闭记忆时立即丢弃缓存，恢复绿线实时控制。
+    record.config.remember_order = event.element.selected_index == 1
+    if not record.config.remember_order then MODES[MODE_PRODUCTION_ORDER].reset(record) end
+    return
+  end
+  if event.element.name == "bmsc-recursion-output" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    record.config.recursion_output_mode = event.element.selected_index == 2 and "all" or "single"
+    -- 改变输出策略时解除旧锁定，下一运算周期会按新策略重新选择结果。
+    MODES[MODE_ORDER_RECURSION].reset(record)
+    Gui.set_recursion_timeout_visible(event.element, record.config.recursion_output_mode == "single")
+    return
+  end
+  if event.element.name ~= "bmsc-output" then return end
+  local record = current_record(event.player_index)
+  if record then record.config.output_mode = ({"only_item", "only_material", "all"})[event.element.selected_index] end
+end)
+script.on_event(defines.events.on_gui_click, function(event)
+  local player = game.get_player(event.player_index)
+  local record = current_record(event.player_index)
+
+  if event.element.name == "bmsc-clear-order-memory" then
+    if record then
+      MODES[MODE_PRODUCTION_ORDER].reset(record)
+      write_outputs(record, {})
+    end
+    return
+  end
+  if event.element.name == "bmsc-description-toggle" then
+    if record and record.entity.valid then
+      -- combinator_description 是 Factorio 为组合器提供的原生说明字段，会显示并随蓝图保存。
+      Gui.show_description_editor(event.element, record.entity.combinator_description)
+    end
+    return
+  end
+  if event.element.name == "bmsc-description-save" then
+    local description = Gui.get_description(event.element)
+    if record and record.entity.valid and description then record.entity.combinator_description = description end
+    -- 写入实体后立即刷新当前窗口，不必关闭再打开才能看到新说明。
+    if description then Gui.refresh_saved_description(event.element, description) end
+    Gui.hide_description_editor(event.element)
+    return
+  end
+  if event.element.name == "bmsc-description-cancel" then
+    Gui.hide_description_editor(event.element)
+    return
+  end
+  if event.element.name == "bmsc-close" then
+    Gui.close(player)
+    state().player_gui[event.player_index] = nil
+  end
+end)
+
+-- 蓝图和设置复制事件：保证配置能随蓝图以及 Shift+右键/左键复制。
+script.on_event(defines.events.on_player_setup_blueprint, function(event)
+  local blueprint = event.stack
+  if not (blueprint and blueprint.valid_for_read and blueprint.is_blueprint) then return end
+  for number, entity in pairs(event.mapping.get()) do
+    if entity.valid and entity.name == ENTITY then
+      local record = state().combinators[entity.unit_number]
+      if record then blueprint.set_blueprint_entity_tags(number, {bmsc = record.config}) end
+    end
+  end
+end)
+script.on_event(defines.events.on_entity_settings_pasted, function(event)
+  if event.destination.name ~= ENTITY then return end
+  local destination = state().combinators[event.destination.unit_number]
+  local source = event.source.name == ENTITY and state().combinators[event.source.unit_number]
+  if destination and source then
+    -- table.deepcopy 只在数据阶段（data.lua）由 Factorio 提供，运行阶段（control.lua）不存在。
+    -- normalize_config 会创建一张全新的配置表，并逐项复制、校验来源配置，因此也能避免
+    -- 两台运算器意外共用同一张 table；其效果等同于这里真正需要的“安全深拷贝”。
+    destination.config = normalize_config(source.config)
+    sync_mode_visual(destination)
+
+    -- 运行缓存不属于配置，粘贴后由各模式自己的 reset 接口统一清除。
+    reset_all_modes(destination)
+    -- write_outputs 是上方定义的局部函数；传入空集合会清空代理槽位及悬浮信号。
+    -- 项目中并没有 clear_outputs，调用它时 Lua 会将其视为值为 nil 的全局变量。
+    write_outputs(destination, {})
+  end
+end)
+
+script.on_nth_tick(TICK_INTERVAL, update_all)

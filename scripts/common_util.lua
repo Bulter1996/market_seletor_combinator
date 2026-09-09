@@ -3,6 +3,10 @@
 
 local Util = {}
 
+-- 配方原型在一次 Factorio 运行期间不会变化，因此可以缓存“机器 + 目标信号”的候选列表。
+-- 注意这里只缓存原型筛选和排序结果，不缓存某个势力是否已解锁配方；科技状态仍实时检查。
+local recipe_candidate_cache = {}
+
 ---把品质对象或名称统一为品质原型名。
 ---@param quality LuaQualityPrototype|string|nil Factorio API 返回的品质。
 ---@return string name 品质名；缺省为 normal。
@@ -84,30 +88,40 @@ end
 function Util.find_recipe(force, target_signal, machine_name)
   if not Util.is_recipe_signal(target_signal) then return nil end
   local target_type = target_signal.type or "item"
-  local candidates = {}
-  for recipe_name, recipe in pairs(prototypes.recipe) do
-    local force_recipe = force.recipes[recipe_name]
-    if force_recipe and force_recipe.enabled and Util.machine_supports(machine_name, recipe)
-      and not string.find(recipe_name, "recycling", 1, true) then
-      for _, product in pairs(recipe.products) do
-        if product.type == target_type and product.name == target_signal.name then
-          local main_product = recipe.main_product
-          candidates[#candidates + 1] = {
-            recipe = recipe,
-            primary = main_product and main_product.type == target_type and main_product.name == target_signal.name,
-            same_name = recipe.name == target_signal.name
-          }
-          break
+  -- 品质不会改变配方原型；同名普通/高品质物品可共用候选列表，减少重复缓存。
+  local cache_key = machine_name .. "|" .. target_type .. "|" .. target_signal.name
+  local candidates = recipe_candidate_cache[cache_key]
+  if not candidates then
+    candidates = {}
+    for recipe_name, recipe in pairs(prototypes.recipe) do
+      if Util.machine_supports(machine_name, recipe)
+        and not string.find(recipe_name, "recycling", 1, true) then
+        for _, product in pairs(recipe.products) do
+          if product.type == target_type and product.name == target_signal.name then
+            local main_product = recipe.main_product
+            candidates[#candidates + 1] = {
+              recipe = recipe,
+              primary = main_product and main_product.type == target_type and main_product.name == target_signal.name,
+              same_name = recipe.name == target_signal.name
+            }
+            break
+          end
         end
       end
     end
+    table.sort(candidates, function(a, b)
+      if a.primary ~= b.primary then return a.primary end
+      if a.same_name ~= b.same_name then return a.same_name end
+      return a.recipe.name < b.recipe.name
+    end)
+    recipe_candidate_cache[cache_key] = candidates
   end
-  table.sort(candidates, function(a, b)
-    if a.primary ~= b.primary then return a.primary end
-    if a.same_name ~= b.same_name then return a.same_name end
-    return a.recipe.name < b.recipe.name
-  end)
-  return candidates[1] and candidates[1].recipe or nil
+  -- 势力配方的 enabled 会随研究进度变化，不能写进静态缓存；按稳定候选顺序实时选择。
+  for _, candidate in ipairs(candidates) do
+    local force_recipe = force.recipes[candidate.recipe.name]
+    if force_recipe and force_recipe.enabled then return candidate.recipe end
+  end
+  return nil
 end
 
 ---取得配方一次制造对目标信号的平均产量。

@@ -11,7 +11,7 @@ local Config = require("scripts.config")               -- 配置模块：默认�
 local Util = require("scripts.common_util")            -- 通用工具：输出排序等无状态功能。
 local MODES = require("scripts.mode_registry")          -- 模式注册表：统一调度彼此独立的算法模块。
 local MODE_PRODUCTION_ORDER = Config.mode.production_order
-local MODE_ORDER_RECURSION = Config.mode.order_recursion
+local MODE_SUPERMARKET_ORDER = Config.mode.supermarket_order
 
 ---取得并初始化本模组的持久状态。
 ---为什么需要：`storage` 会随存档保存，但首次运行时字段不存在，所有入口都通过此函数安全访问。
@@ -118,6 +118,21 @@ local function sync_mode_visual(record)
   behavior.parameters = visual_parameters or {operation = mode and mode.visual_operation or "select"}
   -- 主实体的原生操作仅用于屏幕动画：同时关闭输入读取和输出发送，避免 count 等视觉
   -- 操作保留旧 count_signal 后产生“某物品 ×1”。脚本仍会直接从实体连接器读取网络。
+  behavior.input_networks = {red = false, green = false}
+  behavior.output_networks = {red = false, green = false}
+end
+
+---持续屏蔽主选择运算器的原生线路输入和输出。
+---为什么需要：超市订单借用原版 `select max` 来显示购物车图标；实体创建、蓝图还原或
+---其他模组改写控制行为后，游戏可能再次启用默认的红绿网络。此时原版最大值会与隐藏
+---代理的脚本结果叠加，造成递归输出数量不准确。每轮计算前重新应用开关，既不影响脚本
+---直接读取输入连接器，也能保证线路上只存在代理输出。
+---@param record table 组合器记录。
+---@return nil
+local function suppress_native_networks(record)
+  if not (record and record.entity and record.entity.valid) then return end
+  local behavior = record.entity.get_or_create_control_behavior()
+  if not behavior then return end
   behavior.input_networks = {red = false, green = false}
   behavior.output_networks = {red = false, green = false}
 end
@@ -297,6 +312,9 @@ end
 local function update_all()
   for unit, record in pairs(state().combinators) do
     if record.entity and record.entity.valid then
+      -- 原生 select/max 在超市订单模式下本身会产生一个最大值信号；必须先重新屏蔽，
+      -- 再写代理结果，避免它与脚本计算值在同一输出网络中相加。
+      suppress_native_networks(record)
       write_outputs(record, calculate(record))
     else
       destroy_proxies(record)
@@ -488,7 +506,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   if event.element.name == "bmsc-mode" then
     local record = current_record(event.player_index)
     if not record then return end
-    record.config.mode = event.element.selected_index == 2 and MODE_ORDER_RECURSION or MODE_PRODUCTION_ORDER
+    record.config.mode = event.element.selected_index == 2 and MODE_SUPERMARKET_ORDER or MODE_PRODUCTION_ORDER
     reset_all_modes(record)
     sync_mode_visual(record)
 
@@ -509,7 +527,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     if not record then return end
     record.config.recursion_output_mode = event.element.selected_index == 2 and "all" or "single"
     -- 改变输出策略时解除旧锁定，下一运算周期会按新策略重新选择结果。
-    MODES[MODE_ORDER_RECURSION].reset(record)
+    MODES[MODE_SUPERMARKET_ORDER].reset(record)
     Gui.set_recursion_timeout_visible(event.element, record.config.recursion_output_mode == "single")
     return
   end

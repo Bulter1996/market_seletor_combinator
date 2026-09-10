@@ -4,9 +4,9 @@
 -- 简单模式也可以只声明 visual_operation，由 control.lua 自动包装。
 
 local production_order = require("scripts.modes.production_order")
-local order_recursion = require("scripts.modes.order_recursion")
+local supermarket_order = require("scripts.modes.supermarket_order")
 
 return {
   [production_order.name] = production_order,
-  [order_recursion.name] = order_recursion
+  [supermarket_order.name] = supermarket_order
 }

@@ -9,7 +9,7 @@ Gui.name = "bmsc-window"                              -- 参数：窗口唯一�
 Gui.network_info_name = "bmsc-network-info"           -- 参数：网络信息图标名称前缀；实际名称会追加颜色和网络编号。
 Gui.network_popup_name = "bmsc-network-popup"         -- 参数：仿原版网络信号悬浮面板的唯一名称。
 Gui.production_order = Config.mode.production_order    -- 参数：生产订单模式标识，只用于决定参数区是否可见。
-Gui.order_recursion = Config.mode.order_recursion      -- 参数：订单递归模式标识，只用于决定参数区是否可见。
+Gui.supermarket_order = Config.mode.supermarket_order  -- 参数：超市订单模式标识，只用于决定参数区是否可见。
 -- 参数：每一种数值参数自己的吸附档位。
 -- Factorio 原生离散滑块只能等距吸附，因此滑块内部仍使用 1~6 的索引，再由这里映射实际值。
 -- 后续新增参数时，只需在本表增加“输入框名称 → 档位数组”，无需修改通用滑块函数。
@@ -357,11 +357,11 @@ function Gui.show_mode_details(source_element, mode)
   local production_details = content["bmsc-production-details"]
   local recursion_details = content["bmsc-recursion-details"]
   if production_details then production_details.visible = mode == Gui.production_order end
-  if recursion_details then recursion_details.visible = mode == Gui.order_recursion end
+  if recursion_details then recursion_details.visible = mode == Gui.supermarket_order end
 end
 
----只在订单递归的 single 输出模式下显示超时输入框。
----@param source_element LuaGuiElement 订单递归输出模式下拉框。
+---只在超市订单的 single 输出模式下显示超时输入框。
+---@param source_element LuaGuiElement 超市订单输出模式下拉框。
 ---@param visible boolean true 显示，false 隐藏。
 ---@return nil
 function Gui.set_recursion_timeout_visible(source_element, visible)
@@ -485,8 +485,8 @@ function Gui.open(player, entity, config)
   -- 原版选择运算器使用醒目的“操作模式”标题；直接复用原版粗体标题样式。
   mode_fields.add{type = "label", caption = {"bmsc.mode"}, style = "heading_2_label"}
   mode_fields.add{type = "drop-down", name = "bmsc-mode",
-    items = {{"bmsc.production-order"}, {"bmsc.order-recursion"}},
-    selected_index = config.mode == Gui.order_recursion and 2 or 1,
+    items = {{"bmsc.production-order"}, {"bmsc.supermarket-order"}},
+    selected_index = config.mode == Gui.supermarket_order and 2 or 1,
     tooltip = {"bmsc.mode-tooltip"}}
 
   -- 功能说明紧跟操作模式，位置与原版对当前模式的解释文字一致。
@@ -531,12 +531,12 @@ function Gui.open(player, entity, config)
     caption = {"bmsc.clear-order-memory"}, tooltip = {"bmsc.clear-order-memory-tooltip"}}
 
   local recursion_details = content.add{type = "flow", name = "bmsc-recursion-details", direction = "vertical"}
-  recursion_details.visible = config.mode == Gui.order_recursion
+  recursion_details.visible = config.mode == Gui.supermarket_order
   recursion_details.add{type = "line"}
   local recursion_settings = recursion_details.add{
     type = "frame", name = "bmsc-recursion-settings",
     style = "inside_shallow_frame_with_padding", direction = "vertical"}
-  recursion_settings.add{type = "label", caption = {"bmsc.order-recursion-settings"}, style = "heading_2_label"}
+  recursion_settings.add{type = "label", caption = {"bmsc.supermarket-order-settings"}, style = "heading_2_label"}
   local recursion_fields = recursion_settings.add{type = "table", name = "bmsc-recursion-fields", column_count = 2}
   local recursion_machine = add_labeled(recursion_fields, {"bmsc.production-machine"}, {type = "choose-elem-button",
     name = "bmsc-recursion-machine", elem_type = "entity", entity = config.production_machine,

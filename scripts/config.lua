@@ -2,6 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
+Config.schema_revision = 2
 
 Config.mode = {
   production_order = "production_order",
@@ -27,6 +28,7 @@ end
 ---@return table config 新配置。
 function Config.default()
   return {
+    schema_revision = Config.schema_revision,          -- 内部字段：用于识别热加载遗留的旧配置。
     mode = Config.mode.supermarket_order,          -- 参数：当前操作模式。
     production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
     multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
@@ -39,6 +41,7 @@ function Config.default()
     cache_grid_number = 0,                      -- 参数：分离模式可占用的固体原料格数；0 表示不限制。
     recurise_depth = 0,                          -- 参数：超市订单最大递归深度；0 表示不限制。
     recursion_output_mode = "single",            -- 参数：超市订单输出单项或全部结果。
+    sequential_production = true,                -- 参数：single 模式是否按订单顺序逐个完成。
     recursion_timeout = 0                        -- 参数：single 无变化轮换秒数；0 表示禁用。
   }
 end
@@ -90,6 +93,9 @@ function Config.normalize(source)
   end
   if source.recursion_output_mode == "single" or source.recursion_output_mode == "all" then
     config.recursion_output_mode = source.recursion_output_mode
+  end
+  if type(source.sequential_production) == "boolean" then
+    config.sequential_production = source.sequential_production
   end
   if type(source.recursion_timeout) == "number" then
     config.recursion_timeout = math.max(0, source.recursion_timeout)

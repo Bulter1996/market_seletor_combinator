@@ -23,3 +23,5 @@ graphics/mode-symbols/source/
 switch_worktree.sh
 .market-selector-combinator_0.1.0.tmp
 
+# 本地图片处理临时脚本，不属于模组源码
+/tmp.py

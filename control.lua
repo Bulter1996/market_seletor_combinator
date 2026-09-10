@@ -4,6 +4,7 @@
 local ENTITY = "b-market-selector-combinator"          -- 参数：玩家可放置的主实体原型名。
 local PROXY = "b-market-selector-output-proxy"         -- 参数：向线路发送计算结果的隐藏实体原型名。
 local DETAIL_PROXY = "b-market-selector-detail-proxy" -- 参数：只在 Alt 模式显示当前订单产品的隐藏实体。
+local OUTPUT_PROXY_REVISION = 2                       -- 修改代理连接/写入策略时递增，强制旧存档重建。
 local TICK_INTERVAL = settings.startup["bmsc-update-interval"].value
                                                           -- 参数：玩家配置的刷新间隔，默认 30 tick。
 local Gui = require("scripts.gui")                     -- GUI 模块：只负责界面，不参与生产计算。
@@ -60,6 +61,23 @@ local function destroy_proxies(record)
   if not record then return end
   for _, proxy in pairs({record.proxy, record.red_proxy, record.green_proxy, record.detail_proxy}) do
     if proxy and proxy.valid then proxy.destroy() end
+  end
+end
+
+---清理主实体位置上未被当前 storage 记录跟踪的历史代理。
+---开发期热加载可能丢失 LuaEntity 引用，但旧常量运算器仍留在线路上持续发送旧槽位。
+---@param entity LuaEntity 主选择运算器。
+---@return nil
+local function destroy_proxies_at(entity)
+  local position = entity.position
+  local area = {
+    {position.x - 0.01, position.y - 0.01},
+    {position.x + 0.01, position.y + 0.01}
+  }
+  for _, proxy in pairs(entity.surface.find_entities_filtered{
+    area = area, name = {PROXY, DETAIL_PROXY}
+  }) do
+    proxy.destroy()
   end
 end
 
@@ -121,6 +139,7 @@ local function sync_mode_visual(record)
   -- 操作保留旧 count_signal 后产生“某物品 ×1”。脚本仍会直接从实体连接器读取网络。
   behavior.input_networks = {red = false, green = false}
   behavior.output_networks = {red = false, green = false}
+  record.native_behavior_mode = record.config.mode .. ":" .. tostring(mode and mode.visual_revision or 1)
 end
 
 ---注册新建、克隆或从蓝图恢复的主实体。
@@ -130,13 +149,15 @@ end
 local function register(entity, tags)
   if not (entity and entity.valid and entity.name == ENTITY) then return end
   destroy_proxies(state().combinators[entity.unit_number])
+  destroy_proxies_at(entity)
   local source = tags and tags.bmsc or tags
   local record = {
     entity = entity,
     red_proxy = create_proxy(entity, "red"),
     green_proxy = create_proxy(entity, "green"),
     detail_proxy = create_proxy(entity, nil, DETAIL_PROXY),
-    config = normalize_config(source)
+    config = normalize_config(source),
+    output_proxy_revision = OUTPUT_PROXY_REVISION
   }
   reset_all_modes(record)
   state().combinators[entity.unit_number] = record
@@ -161,6 +182,11 @@ local function calculate(record)
   if not Config.material_rates_valid(record.config.material_demand_rate, record.config.material_retention_rate) then
     record.config = normalize_config(record.config)
   end
+  -- 开发期热加载不一定触发实体重建；模式的安全显示参数发生变化后，在下一轮计算时
+  -- 同步一次，避免旧存档继续沿用曾经保存的 random 或默认 select 参数。
+  local visual_mode = MODES[record.config.mode]
+  local visual_key = record.config.mode .. ":" .. tostring(visual_mode and visual_mode.visual_revision or 1)
+  if record.native_behavior_mode ~= visual_key then sync_mode_visual(record) end
   local active = MODES[record.config.mode]
   for _, mode in pairs(MODES) do
     if mode ~= active then mode.reset(record) end
@@ -253,6 +279,16 @@ end
 ---@param outputs table 当前输出集合，或 `{separated=true, red=table, green=table}`。
 ---@return nil
 local function write_outputs(record, outputs)
+  if record.output_proxy_revision ~= OUTPUT_PROXY_REVISION then
+    -- 版本迁移不能只清除 storage 中仍有引用的代理；失联代理正是线路保留旧信号的来源。
+    destroy_proxies(record)
+    destroy_proxies_at(record.entity)
+    record.red_proxy = create_proxy(record.entity, "red")
+    record.green_proxy = create_proxy(record.entity, "green")
+    record.detail_proxy = create_proxy(record.entity, nil, DETAIL_PROXY)
+    record.proxy_output_cache = {}
+    record.output_proxy_revision = OUTPUT_PROXY_REVISION
+  end
   record.proxy_output_cache = record.proxy_output_cache or {}
   if not (record.red_proxy and record.red_proxy.valid) then
     record.red_proxy = create_proxy(record.entity, "red")

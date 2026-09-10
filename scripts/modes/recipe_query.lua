@@ -4,7 +4,10 @@
 local Util = require("scripts.common_util")
 local Mode = {
   name = "recipe_query",                           -- 模式注册名，必须与 config.lua 的值一致。
-  visual_operation = "random"                     -- 借用原版橙色“?”外观；真实计算由本模块完成。
+  -- 使用最小值选择对应的独立素材槽位显示“?”，但把索引设为 int32 最大值。线路中的
+  -- 信号种类不可能达到该索引，因此原版选择逻辑不会产生输出；真实查询仍由本模块完成。
+  visual_parameters = {operation = "select", select_max = false, index_constant = 2147483647},
+  visual_revision = 2                               -- 强制旧存档替换曾保存的 random/default select。
 }
 
 ---配方查询没有锁定、记忆或超时状态，因此重置只需保持统一模式接口。

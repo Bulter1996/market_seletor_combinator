@@ -19,3 +19,7 @@ test-blueprint.txt
 graphics/source/
 graphics/mode-symbols/source/
 
+# 用于多worktree开发用的脚本文件
+switch_worktree.sh
+.market-selector-combinator_0.1.0.tmp
+

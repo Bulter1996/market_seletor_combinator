@@ -359,12 +359,13 @@ function Gui.show_mode_details(source_element, mode)
   local recursion_details = content["bmsc-recursion-details"]
   local recipe_query_details = content["bmsc-recipe-query-details"]
   if production_details then production_details.visible = mode == Gui.production_order end
-  if recursion_details then recursion_details.visible = mode == Gui.order_recursion end
+  if recursion_details then recursion_details.visible = mode == Gui.supermarket_order end
   if recipe_query_details then recipe_query_details.visible = mode == Gui.recipe_query end
+
 end
 
----只在订单递归的 single 输出模式下显示超时输入框。
----@param source_element LuaGuiElement 订单递归输出模式下拉框。
+---只在超市订单的 single 输出模式下显示超时输入框。
+---@param source_element LuaGuiElement 超市订单输出模式下拉框。
 ---@param visible boolean true 显示，false 隐藏。
 ---@return nil
 function Gui.set_recursion_timeout_visible(source_element, visible)
@@ -494,8 +495,9 @@ function Gui.open(player, entity, config)
   -- 原版选择运算器使用醒目的“操作模式”标题；直接复用原版粗体标题样式。
   mode_fields.add{type = "label", caption = {"bmsc.mode"}, style = "heading_2_label"}
   mode_fields.add{type = "drop-down", name = "bmsc-mode",
-    items = {{"bmsc.production-order"}, {"bmsc.order-recursion"}, {"bmsc.recipe-query"}},
-    selected_index = ({[Gui.production_order] = 1, [Gui.order_recursion] = 2, [Gui.recipe_query] = 3})[config.mode] or 1,
+    items = {{"bmsc.production-order"}, {"bmsc.supermarket-order"}, {"bmsc.recipe-query"}},
+    selected_index = ({[Gui.production_order] = 1, [Gui.supermarket_order] = 2, [Gui.recipe_query] = 3})[config.mode] or 1,
+
     tooltip = {"bmsc.mode-tooltip"}}
 
   -- 功能说明紧跟操作模式，位置与原版对当前模式的解释文字一致。
@@ -540,12 +542,12 @@ function Gui.open(player, entity, config)
     caption = {"bmsc.clear-order-memory"}, tooltip = {"bmsc.clear-order-memory-tooltip"}}
 
   local recursion_details = content.add{type = "flow", name = "bmsc-recursion-details", direction = "vertical"}
-  recursion_details.visible = config.mode == Gui.order_recursion
+  recursion_details.visible = config.mode == Gui.supermarket_order
   recursion_details.add{type = "line"}
   local recursion_settings = recursion_details.add{
     type = "frame", name = "bmsc-recursion-settings",
     style = "inside_shallow_frame_with_padding", direction = "vertical"}
-  recursion_settings.add{type = "label", caption = {"bmsc.order-recursion-settings"}, style = "heading_2_label"}
+  recursion_settings.add{type = "label", caption = {"bmsc.supermarket-order-settings"}, style = "heading_2_label"}
   local recursion_fields = recursion_settings.add{type = "table", name = "bmsc-recursion-fields", column_count = 2}
   local recursion_machine = add_labeled(recursion_fields, {"bmsc.production-machine"}, {type = "choose-elem-button",
     name = "bmsc-recursion-machine", elem_type = "entity", entity = config.production_machine,

@@ -5,7 +5,8 @@ local Config = {}
 
 Config.mode = {
   production_order = "production_order",
-  supermarket_order = "supermarket_order"
+  supermarket_order = "supermarket_order",
+  recipe_query = "recipe_query"
 }
 
 -- 旧版存档和蓝图使用的模式值；只用于迁移，规范化后统一写为 supermarket_order。
@@ -26,8 +27,9 @@ end
 ---@return table config 新配置。
 function Config.default()
   return {
-    mode = Config.mode.supermarket_order,         -- 参数：当前操作模式；新实体默认使用超市订单。
-    production_machine = "assembling-machine-1", -- 参数：两个模式查询配方时使用的制造机。
+    mode = Config.mode.supermarket_order,          -- 参数：当前操作模式。
+    production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
+    multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
     additional_production_rate = 1,              -- 参数：生产订单的产品库存停止倍率。
     material_demand_rate = 10,                   -- 参数：生产订单启动所需原料倍率。
     material_retention_rate = 1,                 -- 参数：生产订单运行后的原料停止倍率。
@@ -48,12 +50,16 @@ end
 function Config.normalize(source)
   local config = Config.default()
   if type(source) ~= "table" then return config end
-  if source.mode == Config.mode.production_order or source.mode == Config.mode.supermarket_order then
+  if source.mode == Config.mode.production_order or source.mode == Config.mode.supermarket_order
+    or source.mode == Config.mode.recipe_query then
     config.mode = source.mode
   elseif source.mode == LEGACY_ORDER_RECURSION then
     config.mode = Config.mode.supermarket_order
   end
   if type(source.production_machine) == "string" then config.production_machine = source.production_machine end
+  if type(source.multiple_recipe_support) == "boolean" then
+    config.multiple_recipe_support = source.multiple_recipe_support
+  end
   if type(source.additional_production_rate) == "number" then
     config.additional_production_rate = math.max(0, source.additional_production_rate)
   end

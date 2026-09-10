@@ -9,7 +9,8 @@ Gui.name = "bmsc-window"                              -- 参数：窗口唯一�
 Gui.network_info_name = "bmsc-network-info"           -- 参数：网络信息图标名称前缀；实际名称会追加颜色和网络编号。
 Gui.network_popup_name = "bmsc-network-popup"         -- 参数：仿原版网络信号悬浮面板的唯一名称。
 Gui.production_order = Config.mode.production_order    -- 参数：生产订单模式标识，只用于决定参数区是否可见。
-Gui.supermarket_order = Config.mode.supermarket_order  -- 参数：超市订单模式标识，只用于决定参数区是否可见。
+Gui.order_recursion = Config.mode.order_recursion      -- 参数：订单递归模式标识，只用于决定参数区是否可见。
+Gui.recipe_query = Config.mode.recipe_query            -- 参数：配方查询模式标识，只用于决定参数区是否可见。
 -- 参数：每一种数值参数自己的吸附档位。
 -- Factorio 原生离散滑块只能等距吸附，因此滑块内部仍使用 1~6 的索引，再由这里映射实际值。
 -- 后续新增参数时，只需在本表增加“输入框名称 → 档位数组”，无需修改通用滑块函数。
@@ -356,8 +357,11 @@ function Gui.show_mode_details(source_element, mode)
   if not content then return end
   local production_details = content["bmsc-production-details"]
   local recursion_details = content["bmsc-recursion-details"]
+  local recipe_query_details = content["bmsc-recipe-query-details"]
   if production_details then production_details.visible = mode == Gui.production_order end
   if recursion_details then recursion_details.visible = mode == Gui.supermarket_order end
+  if recipe_query_details then recipe_query_details.visible = mode == Gui.recipe_query end
+
 end
 
 ---只在超市订单的 single 输出模式下显示超时输入框。
@@ -390,8 +394,8 @@ function Gui.set_cache_grid_visible(source_element, visible)
   fields["bmsc-cache-grid-number-controls"].visible = visible
 end
 
----同步两个模式参数区里的生产机器按钮。
----为什么需要：两个模式共用同一配置值，玩家切换模式后不应看到旧的机器名称。
+---同步各模式参数区里的生产机器按钮。
+---为什么需要：三个模式共用同一配置值，玩家切换模式后不应看到旧的机器名称。
 ---@param source_element LuaGuiElement 触发修改的生产机器选择按钮。
 ---@param machine_name string 新选择的制造机原型名。
 ---@return nil
@@ -401,15 +405,21 @@ function Gui.sync_machine_buttons(source_element, machine_name)
   if not content then return end
   local production = content["bmsc-production-details"]
   local recursion = content["bmsc-recursion-details"]
+  local recipe_query = content["bmsc-recipe-query-details"]
   local production_settings = production and production["bmsc-production-settings"]
   local recursion_settings = recursion and recursion["bmsc-recursion-settings"]
+  local recipe_query_settings = recipe_query and recipe_query["bmsc-recipe-query-settings"]
   local production_fields = production_settings and production_settings["bmsc-production-fields"]
   local recursion_fields = recursion_settings and recursion_settings["bmsc-recursion-fields"]
+  local recipe_query_fields = recipe_query_settings and recipe_query_settings["bmsc-recipe-query-fields"]
   if production_fields and production_fields["bmsc-production-machine"] then
     production_fields["bmsc-production-machine"].elem_value = machine_name
   end
   if recursion_fields and recursion_fields["bmsc-recursion-machine"] then
     recursion_fields["bmsc-recursion-machine"].elem_value = machine_name
+  end
+  if recipe_query_fields and recipe_query_fields["bmsc-recipe-query-machine"] then
+    recipe_query_fields["bmsc-recipe-query-machine"].elem_value = machine_name
   end
 end
 
@@ -485,8 +495,9 @@ function Gui.open(player, entity, config)
   -- 原版选择运算器使用醒目的“操作模式”标题；直接复用原版粗体标题样式。
   mode_fields.add{type = "label", caption = {"bmsc.mode"}, style = "heading_2_label"}
   mode_fields.add{type = "drop-down", name = "bmsc-mode",
-    items = {{"bmsc.production-order"}, {"bmsc.supermarket-order"}},
-    selected_index = config.mode == Gui.supermarket_order and 2 or 1,
+    items = {{"bmsc.production-order"}, {"bmsc.supermarket-order"}, {"bmsc.recipe-query"}},
+    selected_index = ({[Gui.production_order] = 1, [Gui.supermarket_order] = 2, [Gui.recipe_query] = 3})[config.mode] or 1,
+
     tooltip = {"bmsc.mode-tooltip"}}
 
   -- 功能说明紧跟操作模式，位置与原版对当前模式的解释文字一致。
@@ -569,6 +580,24 @@ function Gui.open(player, entity, config)
     tooltip = {"bmsc.recursion-timeout-tooltip"},
     tags = {bmsc_numeric_slider = "bmsc-recursion-timeout-slider"}}
   timeout_input.style.width = 64
+
+  local recipe_query_details = content.add{type = "flow", name = "bmsc-recipe-query-details", direction = "vertical"}
+  recipe_query_details.visible = config.mode == Gui.recipe_query
+  recipe_query_details.add{type = "line"}
+  local recipe_query_settings = recipe_query_details.add{
+    type = "frame", name = "bmsc-recipe-query-settings",
+    style = "inside_shallow_frame_with_padding", direction = "vertical"}
+  recipe_query_settings.add{type = "label", caption = {"bmsc.recipe-query-settings"}, style = "heading_2_label"}
+  local recipe_query_fields = recipe_query_settings.add{
+    type = "table", name = "bmsc-recipe-query-fields", column_count = 2}
+  local recipe_query_machine = add_labeled(recipe_query_fields, {"bmsc.recipe-query-machine"}, {
+    type = "choose-elem-button", name = "bmsc-recipe-query-machine", elem_type = "entity",
+    entity = config.production_machine, tooltip = {"bmsc.recipe-query-machine-tooltip"}})
+  recipe_query_machine.style.size = 52                -- 参数：与其他模式保持一致的机器选择按钮尺寸。
+  add_labeled(recipe_query_fields, {"bmsc.multiple-recipe-support"}, {
+    type = "drop-down", name = "bmsc-multiple-recipe-support",
+    items = {{"bmsc.no"}, {"bmsc.yes"}}, selected_index = config.multiple_recipe_support and 2 or 1,
+    tooltip = {"bmsc.multiple-recipe-support-tooltip"}})
 
   -- 已保存的说明直接显示在配置界面内；内容支持 Factorio 富文本图标。
   local saved_description = content.add{type = "flow", name = "bmsc-saved-description", direction = "vertical"}

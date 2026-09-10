@@ -85,13 +85,15 @@ end
 
 ---把自定义模式外观安装到复制出来的选择运算器原型。
 ---`count_symbol_sprites` 对应生产订单模式使用的 operation="count"；
----`max_symbol_sprites` 对应超市订单模式借用的 select/max 外观。
+---`max_symbol_sprites` 对应超市订单模式使用的最大值选择；`min_symbol_sprites` 则作为
+---配方查询的独立显示槽位，使用蓝色的“?”素材。
 ---@param entity table 从原版 selector-combinator 深拷贝得到的实体原型。
 ---@return nil
 function ModeSymbols.apply(entity)
   entity.count_symbol_sprites = four_way_symbol("production-order.png")
   entity.max_symbol_sprites = overlay_four_way(
     four_way_base_screen(), four_way_symbol("supermarket-order.png"))
+  entity.min_symbol_sprites = four_way_symbol("recipe-query.png")
 end
 
 return ModeSymbols

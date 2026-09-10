@@ -12,7 +12,7 @@ local Config = require("scripts.config")               -- 配置模块：默认�
 local Util = require("scripts.common_util")            -- 通用工具：输出排序等无状态功能。
 local MODES = require("scripts.mode_registry")          -- 模式注册表：统一调度彼此独立的算法模块。
 local MODE_PRODUCTION_ORDER = Config.mode.production_order
-local MODE_ORDER_RECURSION = Config.mode.order_recursion
+local MODE_SUPERMARKET_ORDER = Config.mode.supermarket_order
 local MODE_RECIPE_QUERY = Config.mode.recipe_query
 
 
@@ -20,8 +20,9 @@ local MODE_RECIPE_QUERY = Config.mode.recipe_query
 ---为什么需要：`storage` 会随存档保存，但首次运行时字段不存在，所有入口都通过此函数安全访问。
 ---@return table state 包含 combinators（实体记录）和 player_gui（玩家正在编辑的实体）。
 local function state()
-  storage.combinators = storage.combinators or {}
-  storage.player_gui = storage.player_gui or {}
+  -- 防御开发期脚本曾写入错误类型的半旧 storage；只依赖 `or {}` 无法修复 truthy 字符串。
+  if type(storage.combinators) ~= "table" then storage.combinators = {} end
+  if type(storage.player_gui) ~= "table" then storage.player_gui = {} end
   return storage
 end
 
@@ -29,11 +30,37 @@ end
 ---@type fun(source: table|nil): table
 local normalize_config = Config.normalize
 
+---把外部或旧版本配置转换成当前运行阶段可安全使用的配置。
+---Config.normalize 只负责纯数据校验；Factorio 原型是否仍存在必须留在 control 层检查，
+---这样配置模块不会依赖全局 prototypes，也能处理移除其他模组后失效的机器名称。
+---@param source table|nil 存档、蓝图、复制设置或热加载遗留配置。
+---@return table config 当前版本且生产机器有效的配置。
+local function normalize_runtime_config(source)
+  local config = normalize_config(source)
+  local machine = prototypes.entity[config.production_machine]
+  if not (machine and machine.crafting_categories) then
+    local default_machine = Config.default().production_machine
+    local fallback = prototypes.entity[default_machine]
+    config.production_machine = fallback and fallback.crafting_categories and default_machine or nil
+  end
+  return config
+end
+
 ---清除一台组合器的全部模式运行缓存。
 ---@param record table 组合器记录。
 ---@return nil
 local function reset_all_modes(record)
   for _, mode in pairs(MODES) do mode.reset(record) end
+end
+
+---通知所有声明了 invalidate_plan 钩子的模式：Factorio 配方可用性已经变化。
+---control 层不需要知道哪些模式缓存了配方树，新增模式也无需再修改研究事件处理器。
+---@param record table 组合器记录。
+---@return nil
+local function invalidate_all_recipe_plans(record)
+  for _, mode in pairs(MODES) do
+    if mode.invalidate_plan then mode.invalidate_plan(record) end
+  end
 end
 
 ---导出所有模式的运行缓存，control.lua 不需要知道各模式包含哪些字段。
@@ -50,7 +77,7 @@ end
 ---@param states table|nil save_mode_states 的返回值。
 ---@return nil
 local function restore_mode_states(record, states)
-  states = states or {}
+  states = type(states) == "table" and states or {}
   for name, mode in pairs(MODES) do mode.restore_state(record, states[name]) end
 end
 
@@ -172,7 +199,7 @@ local function register(entity, tags)
     red_proxy = create_proxy(entity, "red"),
     green_proxy = create_proxy(entity, "green"),
     detail_proxy = create_proxy(entity, nil, DETAIL_PROXY),
-    config = normalize_config(source),
+    config = normalize_runtime_config(source),
     output_proxy_revision = OUTPUT_PROXY_REVISION
   }
   reset_all_modes(record)
@@ -194,9 +221,14 @@ end
 ---@param record table 当前组合器运行记录。
 ---@return table outputs 当前模式产生的标准输出集合。
 local function calculate(record)
-  -- 防御旧运行状态：即使存档尚未经过配置迁移，也不允许相等/倒置阈值进入模式算法。
-  if not Config.material_rates_valid(record.config.material_demand_rate, record.config.material_retention_rate) then
-    record.config = normalize_config(record.config)
+  -- game.reload_mods 等开发期热加载不一定执行完整迁移。配置缺失、版本过旧、模式非法、
+  -- 机器原型被其他模组移除或倍率关系损坏时，在进入任何模式算法前统一修复。
+  local config = record.config
+  local machine = type(config) == "table" and prototypes.entity[config.production_machine]
+  if type(config) ~= "table" or config.schema_revision ~= Config.schema_revision
+    or not MODES[config.mode] or not (machine and machine.crafting_categories)
+    or not Config.material_rates_valid(config.material_demand_rate, config.material_retention_rate) then
+    record.config = normalize_runtime_config(config)
   end
   -- 开发期热加载不一定触发实体重建；模式的安全显示参数发生变化后，在下一轮计算时
   -- 同步一次，避免旧存档继续沿用曾经保存的 random 或默认 select 参数。
@@ -250,7 +282,8 @@ local function prepare_proxy_outputs(outputs)
   for _, value in ipairs(Util.sorted_outputs(outputs)) do
     if value.entry.count ~= 0 and #entries < 100 then
       entries[#entries + 1] = value.entry
-      signature_parts[#signature_parts + 1] = value.key .. "=" .. tostring(value.entry.count)
+      signature_parts[#signature_parts + 1] = tostring(value.entry.sort_priority or 0) .. ":"
+        .. value.key .. "=" .. tostring(value.entry.count)
     end
   end
   return entries, table.concat(signature_parts, "|")
@@ -262,9 +295,12 @@ end
 ---@param outputs table 当前线路的输出集合。
 ---@param cache table|nil 上一轮缓存，格式为 `{signature=string, slot_count=integer}`。
 ---@return table cache 本轮签名和实际槽位数，供下一轮复用。
+---@return table entries 本轮实际写入代理的信号数组（已过滤、排序且最多 100 项）。
 local function write_proxy_outputs(proxy, outputs, cache)
   local entries, signature = prepare_proxy_outputs(outputs)
-  if cache and cache.signature == signature then return cache end
+  -- 即使线路内容没有变化，也要把 entries 返回给 GUI。GUI 与线路共用这份快照，避免
+  -- 在代理刚写入的同一 tick 读取电路网络时拿到 Factorio 尚未传播的上一轮信号。
+  if cache and cache.signature == signature then return cache, entries end
 
   local behavior = proxy.get_or_create_control_behavior()
   -- 代理只使用第一节。若旧版本或异常状态留下额外 section，必须先移除，否则其中的
@@ -286,7 +322,25 @@ local function write_proxy_outputs(proxy, outputs, cache)
   -- “新槽位数 + 1”到“旧槽位数”，避免每轮固定执行 100 次 clear_slot。
   local previous_slot_count = cache and cache.slot_count or 100
   for slot_index = #entries + 1, previous_slot_count do section.clear_slot(slot_index) end
-  return {signature = signature, slot_count = #entries}
+  return {signature = signature, slot_count = #entries}, entries
+end
+
+---把代理槽位数组复制成 GUI 信号面板使用的网络快照。
+---这里故意不让 GUI 再读一次实体输出网络：Factorio 的线路传播发生在脚本写槽位之后，
+---同一更新周期内直接读取线路可能还是旧值。复制数据也避免后续计算修改原表。
+---@param color string `red` 或 `green`。
+---@param entries table write_proxy_outputs 返回的实际槽位数组。
+---@return table network 与 scripts/gui.lua 网络数据格式一致的快照。
+local function make_gui_output_network(color, entries)
+  local signals = {}
+  for index, entry in ipairs(entries or {}) do
+    signals[index] = {
+      signal = Util.make_signal(entry.signal.type, entry.signal.name, entry.signal.quality),
+      count = entry.count,
+      sort_priority = entry.sort_priority
+    }
+  end
+  return {color = color, signals = signals}
 end
 
 ---把结果分别写入红、绿隐藏代理，并同步悬浮信息。
@@ -295,6 +349,9 @@ end
 ---@param outputs table 当前输出集合，或 `{separated=true, red=table, green=table}`。
 ---@return nil
 local function write_outputs(record, outputs)
+  -- 模式模块按约定应返回 table；热加载期间若新旧模块接口短暂不一致，按空输出处理，
+  -- 让代理清掉历史槽位，而不是在读取 outputs.separated 时中断整个 on_nth_tick。
+  if type(outputs) ~= "table" then outputs = {} end
   if record.output_proxy_revision ~= OUTPUT_PROXY_REVISION then
     -- 版本迁移不能只清除 storage 中仍有引用的代理；失联代理正是线路保留旧信号的来源。
     destroy_proxies(record)
@@ -323,10 +380,16 @@ local function write_outputs(record, outputs)
   local separated = outputs.separated == true
   local red_outputs = separated and outputs.red or outputs
   local green_outputs = separated and outputs.green or outputs
-  record.proxy_output_cache.red = write_proxy_outputs(
+  local red_entries, green_entries
+  record.proxy_output_cache.red, red_entries = write_proxy_outputs(
     record.red_proxy, red_outputs or {}, record.proxy_output_cache.red)
-  record.proxy_output_cache.green = write_proxy_outputs(
+  record.proxy_output_cache.green, green_entries = write_proxy_outputs(
     record.green_proxy, green_outputs or {}, record.proxy_output_cache.green)
+  -- 信号 GUI 展示的必须是本轮真正写入两个输出代理的内容，而不是线路传播前的旧值。
+  record.gui_output_networks = {
+    make_gui_output_network("red", red_entries),
+    make_gui_output_network("green", green_entries)
+  }
   -- 展示代理没有线路连接，只负责在 Alt 详细信息模式显示当前订单产品。
   if record.detail_proxy then
     record.proxy_output_cache.detail = write_proxy_outputs(
@@ -362,7 +425,9 @@ local function update_all()
   for player_index, unit in pairs(state().player_gui) do
     local player = game.get_player(player_index)
     local record = state().combinators[unit]
-    if player and record then Gui.refresh_connection_status(player, record.entity) end
+    if player and record then
+      Gui.refresh_connection_status(player, record.entity, record.gui_output_networks)
+    end
   end
 end
 
@@ -411,6 +476,23 @@ end)
 script.on_event({defines.events.on_player_mined_entity, defines.events.on_robot_mined_entity,
   defines.events.on_entity_died, defines.events.script_raised_destroy}, function(event) remove(event.entity) end)
 
+-- 科技完成、撤销或整体重算都可能改变 force.recipes[name].enabled。机器的静态能力索引
+-- 无需重建，但对应势力已生成的订单树必须失效，下一刷新周期会重新选择可用配方。
+local research_events = {defines.events.on_research_finished}
+local research_reversed = defines.events.on_research_reversed
+local technology_effects_reset = defines.events.on_technology_effects_reset
+if research_reversed then research_events[#research_events + 1] = research_reversed end
+if technology_effects_reset then research_events[#research_events + 1] = technology_effects_reset end
+script.on_event(research_events, function(event)
+  local force = event.force or (event.research and event.research.force)
+  if not force then return end
+  for _, record in pairs(state().combinators) do
+    if record.entity and record.entity.valid and record.entity.force == force then
+      invalidate_all_recipe_plans(record)
+    end
+  end
+end)
+
 -- GUI 事件：拦截原版选择运算器窗口，改为本模组自己的参数窗口。
 script.on_event(defines.events.on_gui_opened, function(event)
   if event.entity and event.entity.valid and event.entity.name == ENTITY then
@@ -418,7 +500,10 @@ script.on_event(defines.events.on_gui_opened, function(event)
     player.opened = nil
     local record = state().combinators[event.entity.unit_number]
     if not record then register(event.entity); record = state().combinators[event.entity.unit_number] end
-    Gui.open(player, event.entity, record.config)
+    -- 热加载可能保留旧 schema 的 record；GUI 创建会直接读取全部字段，因此打开前也要
+    -- 做一次迁移，不能只依赖下一次定时计算来修复配置。
+    record.config = normalize_runtime_config(record.config)
+    Gui.open(player, event.entity, record.config, record.gui_output_networks)
     state().player_gui[player.index] = event.entity.unit_number
   end
 end)
@@ -469,9 +554,7 @@ script.on_event(defines.events.on_gui_elem_changed, function(event)
       local remembered_order = record.config.remember_order and record.remembered_order or nil
       reset_all_modes(record)
       record.remembered_order = remembered_order
-      -- GUI 参数变更后立即用新机器重新查配方并覆盖代理输出，不必等待下一个 10 tick。
-      -- 若新机器不支持当前产品，calculate 返回空集合，旧输出也会立刻被清除。
-      write_outputs(record, calculate(record))
+      -- 参数和相关运行缓存已经立即更新；线路结果统一留到下一次全局刷新周期重算。
     end
   end
 end)
@@ -504,6 +587,24 @@ local function update_numeric_config(record, element_name, value)
   return false
 end
 
+---数值参数保存后，让依赖旧值的运行状态立即失效；线路计算仍由全局刷新统一执行。
+---@param record table 当前组合器记录。
+---@param element_name string 已更新的数值输入框名称。
+---@return nil
+local function invalidate_numeric_runtime_state(record, element_name)
+  if element_name == "bmsc-recursion-depth" then
+    -- 新深度可能产生完全不同的递归终点，旧 single 锁定不能继续覆盖新计算结果。
+    MODES[MODE_SUPERMARKET_ORDER].reset(record)
+  elseif element_name == "bmsc-production-timeout" then
+    -- 修改超时时间后从下个刷新周期重新计时，不能沿用旧参数下累计的静止时间。
+    record.production_order_output_count = nil
+    record.production_order_changed_tick = nil
+  elseif element_name == "bmsc-recursion-timeout" then
+    record.recursion_output_count = nil
+    record.recursion_output_changed_tick = nil
+  end
+end
+
 script.on_event(defines.events.on_gui_text_changed, function(event)
   local record = current_record(event.player_index)
   local value = tonumber(event.element.text)
@@ -521,7 +622,10 @@ script.on_event(defines.events.on_gui_text_changed, function(event)
   if not (value and value >= 0) then return end
   local accepted = update_numeric_config(record, event.element.name, value)
   -- 输入任意值时只移动滑块到最近档位，不改写玩家输入的精确数值。
-  if accepted then Gui.sync_numeric_slider(event.element, value) end
+  if accepted then
+    Gui.sync_numeric_slider(event.element, value)
+    invalidate_numeric_runtime_state(record, event.element.name)
+  end
 end)
 
 script.on_event(defines.events.on_gui_value_changed, function(event)
@@ -539,7 +643,8 @@ script.on_event(defines.events.on_gui_value_changed, function(event)
     end
     return
   end
-  update_numeric_config(record, textfield.name, value)
+  local accepted = update_numeric_config(record, textfield.name, value)
+  if accepted then invalidate_numeric_runtime_state(record, textfield.name) end
 end)
 script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   if event.element.name == "bmsc-mode" then
@@ -557,10 +662,9 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   if event.element.name == "bmsc-multiple-recipe-support" then
     local record = current_record(event.player_index)
     if not record then return end
-    -- 第一项为“否”、第二项为“是”；切换后立即重算，避免界面与线路短暂不一致。
+    -- 第一项为“否”、第二项为“是”；配置立即保存，线路在下一全局刷新周期更新。
     record.config.multiple_recipe_support = event.element.selected_index == 2
     MODES[MODE_RECIPE_QUERY].reset(record)
-    write_outputs(record, calculate(record))
     return
   end
   if event.element.name == "bmsc-remember-order" then
@@ -577,7 +681,16 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     record.config.recursion_output_mode = event.element.selected_index == 2 and "all" or "single"
     -- 改变输出策略时解除旧锁定，下一运算周期会按新策略重新选择结果。
     MODES[MODE_SUPERMARKET_ORDER].reset(record)
-    Gui.set_recursion_timeout_visible(event.element, record.config.recursion_output_mode == "single")
+    Gui.set_recursion_single_options_visible(event.element, record.config.recursion_output_mode == "single")
+    return
+  end
+  if event.element.name == "bmsc-sequential-production" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    record.config.sequential_production = event.element.selected_index == 1
+    -- 订单筛选方式变化后，旧的单信号锁定可能属于已经被忽略的另一个订单。
+    MODES[MODE_SUPERMARKET_ORDER].reset(record)
+    MODES[MODE_SUPERMARKET_ORDER].invalidate_plan(record)
     return
   end
   if event.element.name ~= "bmsc-output" then return end
@@ -590,6 +703,20 @@ end)
 script.on_event(defines.events.on_gui_click, function(event)
   local player = game.get_player(event.player_index)
   local record = current_record(event.player_index)
+
+  -- 仅处理主 GUI 输入/输出面板中的信号图标；不改变槽位控件和数字角标布局。
+  -- 普通 sprite-button 不会自动执行工厂百科快捷操作，因此显式补上原版 Alt+左键行为。
+  local tags = event.element.tags or {}
+  if tags.bmsc_signal_panel_icon then
+    if event.alt and event.button == defines.mouse_button_type.left then
+      local prototype_group = tags.bmsc_signal_type == "fluid" and prototypes.fluid
+        or tags.bmsc_signal_type == "virtual" and prototypes.virtual_signal
+        or prototypes.item
+      local prototype = prototype_group and prototype_group[tags.bmsc_signal_name]
+      if prototype then player.open_factoriopedia_gui(prototype) end
+    end
+    return
+  end
 
   if event.element.name == "bmsc-clear-order-memory" then
     if record then
@@ -642,7 +769,7 @@ script.on_event(defines.events.on_entity_settings_pasted, function(event)
     -- table.deepcopy 只在数据阶段（data.lua）由 Factorio 提供，运行阶段（control.lua）不存在。
     -- normalize_config 会创建一张全新的配置表，并逐项复制、校验来源配置，因此也能避免
     -- 两台运算器意外共用同一张 table；其效果等同于这里真正需要的“安全深拷贝”。
-    destination.config = normalize_config(source.config)
+    destination.config = normalize_runtime_config(source.config)
     sync_mode_visual(destination)
 
     -- 运行缓存不属于配置，粘贴后由各模式自己的 reset 接口统一清除。

@@ -3,9 +3,12 @@
 
 local Util = {}
 
--- 配方原型在一次 Factorio 运行期间不会变化，因此可以缓存“机器 + 目标信号”的候选列表。
--- 注意这里只缓存原型筛选和排序结果，不缓存某个势力是否已解锁配方；科技状态仍实时检查。
-local recipe_candidate_cache = {}
+-- Factorio 的 prototypes.recipe / prototypes.entity 是运行阶段只读原型；同一次游戏运行中
+-- 配方结构与机器制造类别不会变化。每台机器第一次使用时一次性构建完整的
+-- “产品 -> 候选配方 + 材料层级”索引，之后所有运算器共享并通过 key-value 查询。
+-- 这是 Lua 模块内存缓存，不写入 storage；加载存档或重载模组后会自然重新构建。
+-- 势力解锁状态会随研究变化，因此不能写进静态缓存，仍在 find_recipe 中实时检查。
+local machine_recipe_cache = {}
 
 ---把品质对象或名称统一为品质原型名。
 ---@param quality LuaQualityPrototype|string|nil Factorio API 返回的品质。
@@ -56,9 +59,9 @@ end
 ---@return table signals Factorio 返回的原始信号数组。
 function Util.read_network(entity, connector_id)
   local totals = {}
-  local signals = entity.get_signals(connector_id) or {}
+  local signals = entity and entity.valid ~= false and entity.get_signals(connector_id) or {}
   for _, entry in pairs(signals) do
-    if entry.signal and entry.signal.name then
+    if entry.signal and entry.signal.name and type(entry.count) == "number" then
       local key = Util.signal_key(entry.signal)
       totals[key] = (totals[key] or 0) + entry.count
     end
@@ -71,51 +74,119 @@ end
 ---@param recipe LuaRecipePrototype 配方原型。
 ---@return boolean supported 支持返回 true。
 function Util.machine_supports(machine_name, recipe)
-  local machine = prototypes.entity[machine_name]
-  if not (machine and machine.crafting_categories and recipe) then return false end
+  local machine = prototypes and prototypes.entity and prototypes.entity[machine_name]
+  if not (machine and machine.crafting_categories and recipe and type(recipe.categories) == "table") then
+    return false
+  end
   for _, category in pairs(recipe.categories) do
     if machine.crafting_categories[category] then return true end
   end
   return false
 end
 
----取得指定机器能够制造目标信号的稳定候选配方列表。
----候选配方按“主产品、同名配方、配方名称”排序，避免 pairs 顺序造成生产路线抖动。
----@param target_signal SignalID 目标物品或流体信号。
+---配方索引不区分品质，因为品质不会改变配方结构。
+---@param signal_type string|nil 信号类型。
+---@param name string 原型名称。
+---@return string key 索引键。
+local function recipe_product_key(signal_type, name)
+  return (signal_type or "item") .. ":" .. tostring(name or "")
+end
+
+---为一台机器一次性构建全部产品配方和结构层级。
 ---@param machine_name string 制造机实体原型名。
----@return table candidates 候选项数组，每项的 recipe 字段为配方原型。
-local function get_recipe_candidates(target_signal, machine_name)
-  if not Util.is_recipe_signal(target_signal) then return nil end
-  local target_type = target_signal.type or "item"
-  -- 品质不会改变配方原型；同名普通/高品质物品可共用候选列表，减少重复缓存。
-  local cache_key = machine_name .. "|" .. target_type .. "|" .. target_signal.name
-  local candidates = recipe_candidate_cache[cache_key]
-  if not candidates then
-    candidates = {}
-    for recipe_name, recipe in pairs(prototypes.recipe) do
-      if Util.machine_supports(machine_name, recipe)
-        and not string.find(recipe_name, "recycling", 1, true) then
-        for _, product in pairs(recipe.products) do
-          if product.type == target_type and product.name == target_signal.name then
-            local main_product = recipe.main_product
-            candidates[#candidates + 1] = {
-              recipe = recipe,
-              primary = main_product and main_product.type == target_type and main_product.name == target_signal.name,
-              same_name = recipe.name == target_signal.name
-            }
-            break
+---@return table cache 机器配方缓存。
+local function get_machine_recipe_cache(machine_name)
+  -- table 不能使用 nil 作为赋值键。旧蓝图引用已移除机器、或热加载留下空配置时，
+  -- 统一落入无制造能力的保底键，而不是在 machine_recipe_cache[nil] 处报错。
+  local cache_key = type(machine_name) == "string" and machine_name or "<invalid-machine>"
+  local cached = machine_recipe_cache[cache_key]
+  if cached then return cached end
+
+  cached = {candidates = {}, layers = {}}
+  -- prototypes.recipe 枚举当前模组组合下的全部配方原型。这里先用机器实体原型的
+  -- crafting_categories 筛掉机器无法执行的制造类别，再用 products 建立反向索引：
+  -- product type+name -> 能生产它的配方。ingredients 为空和 recycling 配方不参与递归。
+  for recipe_name, recipe in pairs((prototypes and prototypes.recipe) or {}) do
+    local ingredients = type(recipe.ingredients) == "table" and recipe.ingredients or {}
+    local products = type(recipe.products) == "table" and recipe.products or {}
+    if Util.machine_supports(machine_name, recipe) and #ingredients > 0
+      and not string.find(recipe_name, "recycling", 1, true) then
+      for _, product in pairs(products) do
+        if product and product.name then
+          local key = recipe_product_key(product.type, product.name)
+          local main_product = recipe.main_product
+          local primary = main_product and main_product.type == product.type and main_product.name == product.name
+          local same_name = recipe.name == product.name
+          -- 多产物配方的普通副产品不能证明机器能“以该物品为目标”继续生产。否则铁板等
+          -- 基础材料可能因为某个副产物配方被错误标记为可递归，并在下一深度展开为空。
+          -- 单产物配方即使名称不同、未显式声明 main_product，也仍是明确的生产路径。
+          if primary or same_name or #products == 1 then
+            local candidates = cached.candidates[key]
+            if not candidates then candidates = {}; cached.candidates[key] = candidates end
+            candidates[#candidates + 1] = {recipe = recipe, primary = primary, same_name = same_name}
           end
         end
       end
     end
+  end
+  for _, candidates in pairs(cached.candidates) do
     table.sort(candidates, function(a, b)
       if a.primary ~= b.primary then return a.primary end
       if a.same_name ~= b.same_name then return a.same_name end
       return a.recipe.name < b.recipe.name
     end)
-    recipe_candidate_cache[cache_key] = candidates
   end
-  return candidates
+
+  -- 层级只描述机器的静态制造结构：无配方为 1；可继续制造则至少为 2。
+  -- 循环边不再向下计层，并打 cyclic 标记，运行时仍由 ancestors 精确截断循环路径。
+  local visiting = {}
+  local function calculate_layer(key)
+    if cached.layers[key] then return cached.layers[key] end
+    if visiting[key] then return {level = 1, cyclic = true} end
+    local candidates = cached.candidates[key]
+    if not (candidates and candidates[1]) then
+      cached.layers[key] = {level = 1, cyclic = false}
+      return cached.layers[key]
+    end
+    visiting[key] = true
+    local maximum_child_level = 0
+    local cyclic = false
+    for _, ingredient in pairs(candidates[1].recipe.ingredients or {}) do
+      if ingredient and ingredient.name then
+        local child = calculate_layer(recipe_product_key(ingredient.type, ingredient.name))
+        maximum_child_level = math.max(maximum_child_level, child.level)
+        cyclic = cyclic or child.cyclic
+      end
+    end
+    visiting[key] = nil
+    cached.layers[key] = {level = math.max(2, maximum_child_level + 1), cyclic = cyclic}
+    return cached.layers[key]
+  end
+  for key in pairs(cached.candidates) do calculate_layer(key) end
+  machine_recipe_cache[cache_key] = cached
+  return cached
+end
+
+---取得指定机器能够制造目标信号的稳定候选配方列表。
+---@param target_signal SignalID 目标物品或流体信号。
+---@param machine_name string 制造机实体原型名。
+---@return table|nil candidates 候选项数组。
+local function get_recipe_candidates(target_signal, machine_name)
+  if not Util.is_recipe_signal(target_signal) then return nil end
+  local cache = get_machine_recipe_cache(machine_name)
+  return cache.candidates[recipe_product_key(target_signal.type, target_signal.name)]
+end
+
+---读取目标材料在指定机器制造图中的结构层级。
+---@param target_signal SignalID 目标物品或流体信号。
+---@param machine_name string 制造机实体原型名。
+---@return uint level 无配方为 1，可制造产品从 2 开始递增。
+function Util.machine_material_layer(target_signal, machine_name)
+  if not Util.is_recipe_signal(target_signal) then return 1 end
+  local cache = get_machine_recipe_cache(machine_name)
+  local key = recipe_product_key(target_signal.type, target_signal.name)
+  local layer = cache.layers[key]
+  return layer and layer.level or 1
 end
 
 ---查找势力已解锁且指定机器能够制造目标信号的配方。
@@ -125,7 +196,7 @@ end
 ---@return LuaRecipePrototype|nil recipe 找不到时返回 nil。
 function Util.find_recipe(force, target_signal, machine_name)
   local candidates = get_recipe_candidates(target_signal, machine_name)
-  if not candidates then return nil end
+  if not (candidates and force and force.recipes) then return nil end
   -- 势力配方的 enabled 会随研究进度变化，不能写进静态缓存；按稳定候选顺序实时选择。
   for _, candidate in ipairs(candidates) do
     local force_recipe = force.recipes[candidate.recipe.name]
@@ -149,6 +220,7 @@ end
 ---@param target_signal SignalID 目标物品或流体信号。
 ---@return number amount 固定产量，或随机范围与概率折算后的平均产量。
 function Util.recipe_product_amount(recipe, target_signal)
+  if not (recipe and type(recipe.products) == "table" and target_signal and target_signal.name) then return 0 end
   local target_type = target_signal.type or "item"
   for _, product in pairs(recipe.products) do
     if product.type == target_type and product.name == target_signal.name then
@@ -183,13 +255,23 @@ function Util.add_output(outputs, signal, count)
 end
 
 ---把以信号键索引的输出集合转换为稳定排序数组。
----为什么需要：Lua 的 pairs 遍历顺序不固定，排序可避免线路槽位和悬浮显示来回抖动。
+---业务模块可在条目上提供通用 sort_priority；数值越大越靠前。没有优先级的模式仍按
+---信号键排序。公共模块不解释优先级含义，从而与具体模式解耦。
 ---@param outputs table 各模式返回的标准输出集合。
 ---@return table entries 数组元素格式为 `{key=string, entry=table}`。
 function Util.sorted_outputs(outputs)
   local entries = {}
-  for key, entry in pairs(outputs) do entries[#entries + 1] = {key = key, entry = entry} end
-  table.sort(entries, function(a, b) return a.key < b.key end)
+  for key, entry in pairs(type(outputs) == "table" and outputs or {}) do
+    if type(entry) == "table" and entry.signal and entry.signal.name and type(entry.count) == "number" then
+      entries[#entries + 1] = {key = key, entry = entry}
+    end
+  end
+  table.sort(entries, function(a, b)
+    local a_priority = tonumber(a.entry.sort_priority) or 0
+    local b_priority = tonumber(b.entry.sort_priority) or 0
+    if a_priority ~= b_priority then return a_priority > b_priority end
+    return a.key < b.key
+  end)
   return entries
 end
 

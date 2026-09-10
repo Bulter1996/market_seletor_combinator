@@ -28,15 +28,16 @@ Gui.slider_profiles = {
 ---Factorio API：`get_wire_connector` 取得指定接线端，`connection_count` 是该端已有连线数量。
 ---@param entity LuaEntity 市场选择运算器实体。
 ---@param side string `input` 表示输入端，`output` 表示输出端。
+---@param include_internal boolean|nil 输出端是否包含只连接隐藏输出代理的内部网络。
 ---@return table networks 网络数组；每项包含颜色、网络编号和当前信号。
-local function get_side_networks(entity, side)
+local function get_side_networks(entity, side, include_internal)
   local red_id = side == "input" and defines.wire_connector_id.combinator_input_red
     or defines.wire_connector_id.combinator_output_red
   local green_id = side == "input" and defines.wire_connector_id.combinator_input_green
     or defines.wire_connector_id.combinator_output_green
   local red = entity.get_wire_connector(red_id, false)
   local green = entity.get_wire_connector(green_id, false)
-  local internal_connections = side == "output" and 1 or 0
+  local internal_connections = side == "output" and not include_internal and 1 or 0
   local result = {}
 
   -- get_circuit_network 返回连接器所在的电路网络；network_id 就是原版 GUI 展示的网络编号。
@@ -113,6 +114,162 @@ end
 local function signal_sprite_path(signal)
   local sprite_type = signal.type == "virtual" and "virtual-signal" or (signal.type or "item")
   return sprite_type .. "/" .. signal.name
+end
+
+---把电路 SignalID 转换为 GUI `elem_tooltip` 所需的 ElemID。
+---ElemID 固定使用 type="signal"，原信号类型必须放在 signal_type 字段，二者不能混用。
+---@param signal SignalID 电路信号。
+---@return table elem_id Factorio 原型悬浮信息标识。
+local function signal_elem_tooltip(signal)
+  local signal_type = signal.type or "item"
+  local elem_id = {type = "signal", name = signal.name, signal_type = signal_type}
+  local quality = type(signal.quality) == "string" and signal.quality
+    or (signal.quality and signal.quality.name)
+  if signal_type == "item" and quality then elem_id.quality = quality end
+  return elem_id
+end
+
+---把输入/输出两侧的红绿网络信号展开成稳定排序的槽位数组。
+---同一信号同时出现在红、绿网络时保留两个槽位，以不同线路底色明确区分来源。
+---@param networks table `get_side_networks` 返回的网络数组。
+---@return table entries 每项包含 color、signal、count、sprite 和稳定 key。
+local function collect_signal_entries(networks)
+  local entries = {}
+  for _, network in ipairs(networks) do
+    for _, value in pairs(network.signals) do
+      if value.signal and value.signal.name then
+        local quality = type(value.signal.quality) == "string" and value.signal.quality
+          or (value.signal.quality and value.signal.quality.name)
+        local sprite = signal_sprite_path(value.signal)
+        entries[#entries + 1] = {
+          color = network.color,
+          signal = value.signal,
+          count = value.count,
+          sprite = sprite,
+          key = network.color .. "|" .. sprite .. "|" .. (quality or "normal")
+        }
+      end
+    end
+  end
+  table.sort(entries, function(a, b) return a.key < b.key end)
+  return entries
+end
+
+---更新一个常驻信号子面板。
+---只有信号种类、品质或线路颜色变化时才重建槽位；通常的数值变化只写 `number`，
+---从而避免周期性 clear/destroy 带来的 GUI 分配、悬浮中断和额外 UPS 消耗。
+---@param section LuaGuiElement “输入信号”或“输出信号”的子 frame。
+---@param networks table 当前侧的红绿网络。
+---@return nil
+local function refresh_signal_section(section, networks)
+  local entries = collect_signal_entries(networks)
+  local by_color = {red = {}, green = {}}
+  local signature_parts = {}
+  for _, entry in ipairs(entries) do
+    signature_parts[#signature_parts + 1] = entry.key
+    by_color[entry.color][#by_color[entry.color] + 1] = entry
+  end
+  local signature = table.concat(signature_parts, "\n")
+  local scroll = section["bmsc-signal-scroll"]
+  if not (scroll and scroll.valid) then return end
+  local red_slots = scroll["bmsc-red-signal-slots"]
+  local green_slots = scroll["bmsc-green-signal-slots"]
+
+  local rows_intact = (#by_color.red == 0 or (red_slots and red_slots.valid))
+    and (#by_color.green == 0 or (green_slots and green_slots.valid))
+  if rows_intact and scroll.tags.bmsc_signal_signature == signature then
+    for _, color in ipairs({"red", "green"}) do
+      local slots = color == "red" and red_slots or green_slots
+      for index, entry in ipairs(by_color[color]) do
+        -- 每种颜色各自保持稳定排序，因此常规刷新只更新数字。
+        slots.children[index].number = entry.count
+      end
+    end
+    return
+  end
+
+  scroll.clear()
+  scroll.tags = {bmsc_signal_signature = signature}
+  if #entries == 0 then
+    scroll.add{type = "label", caption = {"bmsc.no-output"}}
+    return
+  end
+
+  for _, color in ipairs({"red", "green"}) do
+    if #by_color[color] > 0 then
+      -- 红色和绿色使用两个独立表格；即使上一色不足八格，下一色也一定从新行开始。
+      local slots = scroll.add{type = "table", name = "bmsc-" .. color .. "-signal-slots", column_count = 8}
+      slots.style.horizontally_stretchable = true
+      if color == "green" and #by_color.red > 0 then slots.style.top_margin = 4 end
+      for _, entry in ipairs(by_color[color]) do
+        -- elem_tooltip 提供完整悬浮信息，并让游戏接管 Q 键吸取/复制以及
+        -- Option(Alt)+左键打开工厂百科；槽位样式提供对应线路颜色遮罩。
+        local slot = slots.add{type = "sprite-button", sprite = entry.sprite, number = entry.count,
+          style = color .. "_circuit_network_content_slot", elem_tooltip = signal_elem_tooltip(entry.signal)}
+        local quality = type(entry.signal.quality) == "string" and entry.signal.quality
+          or (entry.signal.quality and entry.signal.quality.name)
+        if (entry.signal.type or "item") == "item" and quality and quality ~= "normal" then
+          slot.quality = quality
+        end
+      end
+    end
+  end
+end
+
+---创建一个有独立边界、内容可按需纵向滚动的信号子 GUI。
+---@param parent LuaGuiElement 信号公共 GUI。
+---@param name string 子 GUI 名称。
+---@param caption LocalisedString 子 GUI 标题。
+---@param maximum_content_height uint 滚动内容的最大高度。
+---@return LuaGuiElement section 创建出的子 GUI。
+local function add_signal_section(parent, name, caption, maximum_content_height)
+  local section = parent.add{type = "frame", name = name,
+    style = "inside_shallow_frame_with_padding", direction = "vertical"}
+  section.style.horizontally_stretchable = true
+  section.add{type = "label", caption = caption, style = "heading_2_label"}
+  local scroll = section.add{type = "scroll-pane", name = "bmsc-signal-scroll",
+    direction = "vertical", horizontal_scroll_policy = "never", vertical_scroll_policy = "auto"}
+  scroll.style.horizontally_stretchable = true
+  scroll.style.vertically_squashable = true
+  scroll.style.maximal_height = maximum_content_height
+  return section
+end
+
+---向指定模式详情容器添加一套公共信号 GUI。
+---本函数只依赖父 GUI 和玩家显示尺寸，不读取模式配置、实体或 storage；生产订单和
+---订单递归分别调用同一入口完成绑定，后续调整布局无需复制两套实现。
+---@param parent LuaGuiElement 生产订单或订单递归的详情容器。
+---@param player LuaPlayer 用于根据分辨率和 UI 缩放限制面板高度。
+---@return LuaGuiElement signals 创建出的信号公共面板。
+function Gui.add_signal_panel(parent, player)
+  local signals = parent.add{type = "frame", name = "bmsc-signals",
+    style = "inside_shallow_frame_with_padding", direction = "vertical"}
+  signals.style.horizontally_stretchable = true
+
+  -- GUI 尺寸使用缩放后的逻辑像素。信号公共区最高占半个屏幕；扣除标题、内边距和
+  -- 两个子面板标题后，剩余高度由输入、输出各自的滚动区均分。
+  local display_scale = player.display_scale > 0 and player.display_scale or 1
+  local signal_panel_height = math.floor(player.display_resolution.height / display_scale / 2)
+  local section_content_height = math.max(48, math.floor((signal_panel_height - 118) / 2))
+  signals.style.maximal_height = signal_panel_height
+  signals.add{type = "label", caption = {"bmsc.signal-panel-title"}, style = "heading_2_label"}
+  local input_signals = add_signal_section(
+    signals, "bmsc-input-signals", {"bmsc.input-signals"}, section_content_height)
+  input_signals.style.bottom_margin = 8
+  add_signal_section(signals, "bmsc-output-signals", {"bmsc.output-signals"}, section_content_height)
+  return signals
+end
+
+---刷新一套公共信号 GUI 的输入和输出槽位。
+---面板构建与数据刷新分离，使各模式只负责绑定容器，不需要了解红绿网络和增量刷新细节。
+---@param signals LuaGuiElement `Gui.add_signal_panel` 创建的面板。
+---@param input_networks table 输入端红绿网络数据。
+---@param output_networks table 输出端红绿网络数据。
+---@return nil
+function Gui.refresh_signal_panel(signals, input_networks, output_networks)
+  if not (signals and signals.valid) then return end
+  refresh_signal_section(signals["bmsc-input-signals"], input_networks)
+  refresh_signal_section(signals["bmsc-output-signals"], output_networks)
 end
 
 ---让一个 GUI 元素及其全部子元素不参与鼠标命中。
@@ -345,6 +502,16 @@ function Gui.refresh_connection_status(player, entity)
   local output_networks = get_side_networks(entity, "output")
   refresh_side_status(connections["bmsc-input-status"], input_networks)
   refresh_side_status(connections["bmsc-output-status"], output_networks)
+  -- 两个模式分别绑定公共面板；只刷新当前可见实例，避免为隐藏模式做重复 GUI 更新。
+  local signal_output_networks
+  for _, details_name in ipairs({"bmsc-production-details", "bmsc-recursion-details"}) do
+    local details = content[details_name]
+    if details and details.visible then
+      -- 即使输出端还没有接外部电线，也要展示隐藏代理当前正在发送的真实输出。
+      signal_output_networks = signal_output_networks or get_side_networks(entity, "output", true)
+      Gui.refresh_signal_panel(details["bmsc-signals"], input_networks, signal_output_networks)
+    end
+  end
 end
 
 ---根据操作模式切换对应的参数区。
@@ -506,6 +673,7 @@ function Gui.open(player, entity, config)
   mode_description.style.top_margin = 8
 
   local details = content.add{type = "flow", name = "bmsc-production-details", direction = "vertical"}
+  details.style.horizontally_stretchable = true
   details.visible = config.mode == Gui.production_order
   details.add{type = "line"}
   local settings = details.add{type = "frame", name = "bmsc-production-settings",
@@ -540,8 +708,11 @@ function Gui.open(player, entity, config)
   -- 订单记忆属于运行状态而非配置值，提供独立按钮让玩家随时放弃当前缓存订单。
   settings.add{type = "button", name = "bmsc-clear-order-memory",
     caption = {"bmsc.clear-order-memory"}, tooltip = {"bmsc.clear-order-memory-tooltip"}}
+  -- 生产订单模式绑定公共信号面板。
+  Gui.add_signal_panel(details, player)
 
   local recursion_details = content.add{type = "flow", name = "bmsc-recursion-details", direction = "vertical"}
+  recursion_details.style.horizontally_stretchable = true
   recursion_details.visible = config.mode == Gui.supermarket_order
   recursion_details.add{type = "line"}
   local recursion_settings = recursion_details.add{
@@ -580,6 +751,8 @@ function Gui.open(player, entity, config)
     tooltip = {"bmsc.recursion-timeout-tooltip"},
     tags = {bmsc_numeric_slider = "bmsc-recursion-timeout-slider"}}
   timeout_input.style.width = 64
+  -- 订单递归模式独立绑定同一个公共信号面板函数。
+  Gui.add_signal_panel(recursion_details, player)
 
   local recipe_query_details = content.add{type = "flow", name = "bmsc-recipe-query-details", direction = "vertical"}
   recipe_query_details.visible = config.mode == Gui.recipe_query

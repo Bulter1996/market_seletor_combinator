@@ -5,7 +5,8 @@ local Config = {}
 
 Config.mode = {
   production_order = "production_order",
-  order_recursion = "order_recursion"
+  order_recursion = "order_recursion",
+  recipe_query = "recipe_query"
 }
 
 ---判断材料启动倍率和停止倍率是否构成有效的迟滞区间。
@@ -24,7 +25,8 @@ end
 function Config.default()
   return {
     mode = Config.mode.production_order,          -- 参数：当前操作模式。
-    production_machine = "assembling-machine-1", -- 参数：两个模式查询配方时使用的制造机。
+    production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
+    multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
     additional_production_rate = 1,              -- 参数：生产订单的产品库存停止倍率。
     material_demand_rate = 10,                   -- 参数：生产订单启动所需原料倍率。
     material_retention_rate = 1,                 -- 参数：生产订单运行后的原料停止倍率。
@@ -45,10 +47,14 @@ end
 function Config.normalize(source)
   local config = Config.default()
   if type(source) ~= "table" then return config end
-  if source.mode == Config.mode.production_order or source.mode == Config.mode.order_recursion then
+  if source.mode == Config.mode.production_order or source.mode == Config.mode.order_recursion
+    or source.mode == Config.mode.recipe_query then
     config.mode = source.mode
   end
   if type(source.production_machine) == "string" then config.production_machine = source.production_machine end
+  if type(source.multiple_recipe_support) == "boolean" then
+    config.multiple_recipe_support = source.multiple_recipe_support
+  end
   if type(source.additional_production_rate) == "number" then
     config.additional_production_rate = math.max(0, source.additional_production_rate)
   end

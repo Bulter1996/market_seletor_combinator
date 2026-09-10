@@ -79,13 +79,12 @@ function Util.machine_supports(machine_name, recipe)
   return false
 end
 
----查找势力已解锁且指定机器能够制造目标信号的配方。
+---取得指定机器能够制造目标信号的稳定候选配方列表。
 ---候选配方按“主产品、同名配方、配方名称”排序，避免 pairs 顺序造成生产路线抖动。
----@param force LuaForce 实体所属势力，用于读取科技解锁状态。
 ---@param target_signal SignalID 目标物品或流体信号。
 ---@param machine_name string 制造机实体原型名。
----@return LuaRecipePrototype|nil recipe 找不到时返回 nil。
-function Util.find_recipe(force, target_signal, machine_name)
+---@return table candidates 候选项数组，每项的 recipe 字段为配方原型。
+local function get_recipe_candidates(target_signal, machine_name)
   if not Util.is_recipe_signal(target_signal) then return nil end
   local target_type = target_signal.type or "item"
   -- 品质不会改变配方原型；同名普通/高品质物品可共用候选列表，减少重复缓存。
@@ -116,12 +115,33 @@ function Util.find_recipe(force, target_signal, machine_name)
     end)
     recipe_candidate_cache[cache_key] = candidates
   end
+  return candidates
+end
+
+---查找势力已解锁且指定机器能够制造目标信号的配方。
+---@param force LuaForce 实体所属势力，用于读取科技解锁状态。
+---@param target_signal SignalID 目标物品或流体信号。
+---@param machine_name string 制造机实体原型名。
+---@return LuaRecipePrototype|nil recipe 找不到时返回 nil。
+function Util.find_recipe(force, target_signal, machine_name)
+  local candidates = get_recipe_candidates(target_signal, machine_name)
+  if not candidates then return nil end
   -- 势力配方的 enabled 会随研究进度变化，不能写进静态缓存；按稳定候选顺序实时选择。
   for _, candidate in ipairs(candidates) do
     local force_recipe = force.recipes[candidate.recipe.name]
     if force_recipe and force_recipe.enabled then return candidate.recipe end
   end
   return nil
+end
+
+---查找指定机器能够制造目标信号的配方，不检查当前势力的科技解锁状态。
+---用于“配方查询”这类知识查询功能；生产订单仍应调用 find_recipe 遵守科技限制。
+---@param target_signal SignalID 目标物品或流体信号。
+---@param machine_name string 制造机实体原型名。
+---@return LuaRecipePrototype|nil recipe 找不到时返回 nil。
+function Util.find_recipe_ignoring_research(target_signal, machine_name)
+  local candidates = get_recipe_candidates(target_signal, machine_name)
+  return candidates and candidates[1] and candidates[1].recipe or nil
 end
 
 ---取得配方一次制造对目标信号的平均产量。

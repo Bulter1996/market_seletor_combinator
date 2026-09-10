@@ -1,16 +1,17 @@
--- “订单递归”模式。
+-- “超市订单”模式。
 -- 本文件封装递归展开、single 锁定、目标库存迟滞以及超时轮换，不依赖 GUI。
 
 local Util = require("scripts.common_util")
 local Mode = {
-  name = "order_recursion",                          -- 模式注册名，必须与 config.lua 的值一致。
-  -- Factorio 没有 operation="max"：最大值外观是 select 操作配合 select_max=true。
-  -- 该组合会读取原型的 max_symbol_sprites，即我们定义的“递归节点”素材。
-  -- 这些参数仅选择实体外观；真实递归计算和线路输出仍全部由本模块完成。
-  visual_parameters = {operation = "select", select_max = true}
+  name = "supermarket_order",                        -- 模式注册名，必须与 config.lua 的值一致。
+  -- 原生 select/max 即使关闭 output_networks，仍会计算输入并把结果显示在实体信息的
+  -- 原生“输出信号”字段中。把选择索引固定为 int32 最大值，使任何实际输入集合都没有
+  -- 对应项，从计算源头得到空结果，同时继续使用 max_symbol_sprites 显示递归图标。
+  -- 真实递归计算和线路输出仍全部由本模块及隐藏代理完成。
+  visual_parameters = {operation = "select", select_max = true, index_constant = 2147483647}
 }
 
----清除订单递归模式的运行缓存，但保留玩家设置的深度、输出模式和超时。
+---清除超市订单模式的运行缓存，但保留玩家设置的深度、输出模式和超时。
 ---@param record table control.lua 保存的组合器记录。
 ---@return nil
 function Mode.reset(record)
@@ -21,7 +22,7 @@ function Mode.reset(record)
   record.recursion_output_changed_tick = nil
 end
 
----导出订单递归的锁定与超时状态，供 control.lua 重建实体代理时暂存。
+---导出超市订单的锁定与超时状态，供 control.lua 重建实体代理时暂存。
 ---@param record table 组合器记录。
 ---@return table state 可写入 storage 的纯 Lua 数据。
 function Mode.save_state(record)
@@ -47,7 +48,7 @@ function Mode.restore_state(record, saved)
   record.recursion_output_changed_tick = saved.changed_tick
 end
 
----执行订单递归计算。
+---执行超市订单递归计算。
 ---all 返回全部递归终点；single 锁定一个结果到目标库存满足，避免机械臂抓取原料时
 ---在父产品和原料之间振荡。timeout 可在输出数量长期不变时轮换到下一个结果。
 ---@param record table 组合器记录，必须包含 entity、config 和本模式运行状态。
@@ -118,7 +119,7 @@ function Mode.calculate(record)
 
   for _, demand in ipairs(demands) do
     local signal = demand.signal
-    -- 根订单允许物品和流体；虚拟信号没有生产配方，因此不进入订单递归。
+    -- 根订单允许物品和流体；虚拟信号没有生产配方，因此不进入超市订单递归。
     if Util.is_recipe_signal(signal) and demand.count > 0 then
       resolve(signal, demand.count, 0, {})
     end

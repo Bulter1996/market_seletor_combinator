@@ -9,7 +9,8 @@ local ModeSymbols = require("prototypes.mode_symbols")
 local EntityGraphics = require("prototypes.entity_graphics")
 
 -- 背包、配方和实体信息界面共同使用的自定义图标。
-local ENTITY_ICON = "__market-selector-combinator__/graphics/icons/market-selector-combinator.png"
+-- 背包、配方与百科使用横向放大的专用图标；世界实体仍由 EntityGraphics 独立控制。
+local ENTITY_ICON = "__market-selector-combinator__/graphics/icons/market-selector-combinator-horizontal.png"
 
 -- 复制选择器组合器的原型作为基础，然后修改为我们需要的实体
 local entity = table.deepcopy(data.raw["selector-combinator"]["selector-combinator"])
@@ -49,24 +50,30 @@ local item = {
   stack_size = 50
 }
 
--- 定义市场选择器组合器的配方
-local recipe = {
-  -- 配方类型
+-- 直接复制“判断运算器”配方，而不是在本模组中重复写死材料。这样基础游戏或其他模组
+-- 调整 decider-combinator 的材料、制造时间、制造类别等字段后，本配方仍会保持一致。
+-- base 2.1 必定提供该配方；保底分支仅用于开发期数据阶段热加载或异常测试环境。
+local decider_recipe = data.raw.recipe["decider-combinator"]
+local recipe = decider_recipe and table.deepcopy(decider_recipe) or {
   type = "recipe",
-  -- 配方名称
-  name = "b-market-selector-combinator",
-  -- 默认禁用，需要技术解锁
   enabled = false,
-  -- 配方所需材料
   ingredients = {
-    -- 电子电路：5个
-    {type = "item", name = "electronic-circuit", amount = 5},
-    -- 高级电路：2个
-    {type = "item", name = "advanced-circuit", amount = 2}
-  },
-  -- 配方结果：1个市场选择器组合器
-  results = {{type = "item", name = "b-market-selector-combinator", amount = 1}}
+    {type = "item", name = "copper-cable", amount = 5},
+    {type = "item", name = "electronic-circuit", amount = 5}
+  }
 }
+recipe.name = "b-market-selector-combinator"
+-- 只替换产物；ingredients、energy_required、category 和 enabled 等制造规则继承判断运算器。
+recipe.results = {{type = "item", name = "b-market-selector-combinator", amount = 1}}
+-- 清除旧式单产物字段和可能由其他模组写入的判断运算器专用图标，避免覆盖本物品图标。
+recipe.result = nil
+recipe.result_count = nil
+recipe.main_product = "b-market-selector-combinator"
+recipe.icon = ENTITY_ICON
+recipe.icons = nil
+recipe.icon_size = 64
+recipe.localised_name = nil
+recipe.localised_description = nil
 
 -- 定义输出代理实体（隐藏实体，用于信号传递）
 local proxy = table.deepcopy(data.raw["constant-combinator"]["constant-combinator"])
@@ -110,18 +117,23 @@ end
 -- 将所有定义的数据扩展到游戏中：实体、物品、配方及两类代理
 data:extend({entity, item, recipe, proxy, detail_proxy})
 
--- 为相关技术添加解锁效果
--- 遍历电路网络和高级组合器技术
-for _, technology_name in pairs({"circuit-network", "advanced-combinators"}) do
-  -- 获取技术原型
-  local technology = data.raw.technology[technology_name]
-  -- 如果技术存在，添加解锁效果
-  if technology then
-    -- 确保技术效果表存在
+-- 不猜测科技原型名称，而是查找实际解锁“判断运算器”配方的科技。这样科技树被其他模组
+-- 重排或重命名后，市场选择运算器仍与判断运算器同步解锁；若多个科技都提供该解锁，
+-- 则逐一加入。插入前检查重复项，避免其他兼容补丁已经添加过相同效果。
+for _, technology in pairs(data.raw.technology or {}) do
+  local unlocks_decider = false
+  local already_unlocks_market_selector = false
+  for _, effect in pairs(technology.effects or {}) do
+    if effect.type == "unlock-recipe" then
+      if effect.recipe == "decider-combinator" then unlocks_decider = true end
+      if effect.recipe == "b-market-selector-combinator" then already_unlocks_market_selector = true end
+    end
+  end
+  if unlocks_decider and not already_unlocks_market_selector then
     technology.effects = technology.effects or {}
-    -- 添加解锁配方的效果
-    table.insert(technology.effects, {type = "unlock-recipe", recipe = "b-market-selector-combinator"})
-    -- 找到一个技术后即可停止（避免重复添加）
-    break
+    technology.effects[#technology.effects + 1] = {
+      type = "unlock-recipe",
+      recipe = "b-market-selector-combinator"
+    }
   end
 end

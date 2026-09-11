@@ -15,6 +15,7 @@ function Mode.reset(record)
   record.remembered_order = nil
   record.production_order_output_count = nil
   record.production_order_changed_tick = nil
+  record.production_order_diagnostics = nil
   record.detail_outputs = nil
 end
 
@@ -42,28 +43,29 @@ function Mode.restore_state(record, saved)
   record.production_order_changed_tick = saved.changed_tick
 end
 
----检查每种配方原料是否达到当前阶段的阈值。
+---收集尚未达到当前阶段阈值的配方原料及缺口。
 ---@param recipe LuaRecipePrototype 待生产配方。
 ---@param inventory table 红线库存汇总。
 ---@param multiplier number 启动倍率或保留倍率。
 ---@param locked boolean true 表示订单已锁定，应采用保留阶段的停止边界。
----@return boolean enough 所有原料均满足时返回 true。
-local function recipe_has_materials(recipe, inventory, multiplier, locked)
+---@return table shortages 每项包含原料 signal 和达到阈值仍缺少的 count。
+local function recipe_material_shortages(recipe, inventory, multiplier, locked)
+  local shortages = {}
   for _, ingredient in pairs(recipe.ingredients) do
     local signal = Util.make_signal(ingredient.type, ingredient.name, "normal")
     -- 红线中不存在对应信号时按库存 0 处理。因此只接绿色订单线不会绕过原料条件；
     -- 必须让配方的每一种原料都通过红线提供足够库存，当前订单才有资格输出。
     local stock = inventory[Util.signal_key(signal)] or 0
     local threshold = ingredient.amount * multiplier
-    if locked then
-      -- 停止边界是严格小于：库存恰好等于保留阈值时仍允许当前订单运行。
-      if stock < threshold then return false end
-    else
-      -- 启动边界是严格大于：库存恰好等于需求阈值时不能启动新订单。
-      if stock <= threshold then return false end
+    local insufficient = locked and stock < threshold or not locked and stock <= threshold
+    if insufficient then
+      -- 启动边界要求严格大于阈值；恰好相等时仍显示至少缺少 1。
+      local missing = locked and math.ceil(threshold - stock)
+        or math.max(1, math.ceil(threshold - stock))
+      shortages[#shortages + 1] = {signal = signal, count = missing}
     end
   end
-  return true
+  return shortages
 end
 
 ---计算有限缓存最多能容纳多少个完整配方批次，并同比限制固体原料输出。
@@ -154,25 +156,32 @@ function Mode.calculate(record)
   ---@param demand Signal 当前需求信号及数量。
   ---@param locked boolean 是否为已经启动的订单。
   ---@return LuaRecipePrototype|nil recipe 满足时返回配方，否则返回 nil。
+  ---@return table|nil diagnostic 不满足时返回结构化原因，供绿色输入信号悬浮提示复用。
   local function eligible(demand, locked)
     local signal = demand.signal
-    if not ((signal.type == nil or signal.type == "item") and demand.count > 0) then return nil end
+    -- 与公共配方索引保持一致：物品和流体都可作为产品，虚拟信号仍直接忽略。
+    if not Util.is_recipe_signal(signal) then return nil, {kind = "unsupported_signal"} end
+    if demand.count <= 0 then return nil, {kind = "non_positive_order"} end
     local stock = inventory[Util.signal_key(signal)] or 0
     if locked then
       -- 停止条件：订单一旦启动，就忽略基础订单阈值，继续保持锁定直到扩展目标。
       -- 这样库存处于 [订单量, 扩展目标) 时不会关闭输出后又立刻重新启动。
       -- 达到目标上限时缺口已经为 0，应立即完成当前订单；若仍使用严格大于，
       -- 下游收到 0 后不会继续生产，组合器也就永远无法靠库存增长解除锁定。
-      if stock >= demand.count * (1 + config.additional_production_rate) then return nil end
+      if stock >= demand.count * (1 + config.additional_production_rate) then
+        return nil, {kind = "stock_sufficient", stock = stock}
+      end
     elseif demand.count <= stock then
       -- 启动条件：只有库存严格小于基础订单量才能选中新订单。
       -- 此处不能使用扩展目标，否则迟滞区间内会反复重新启动，失去防频闪作用。
-      return nil
+      return nil, {kind = "stock_sufficient", stock = stock}
     end
     local recipe = Util.find_recipe(record.entity.force, signal, config.production_machine)
+    if not recipe then return nil, {kind = "no_recipe"} end
     local material_rate = locked and (config.material_retention_rate or 1) or config.material_demand_rate
-    if recipe and recipe_has_materials(recipe, inventory, material_rate, locked) then return recipe end
-    return nil
+    local shortages = recipe_material_shortages(recipe, inventory, material_rate, locked)
+    if #shortages > 0 then return nil, {kind = "materials", shortages = shortages} end
+    return recipe, nil
   end
 
   ---计算产品线路当前应输出的实时生产缺口。
@@ -292,6 +301,26 @@ function Mode.calculate(record)
       end
     end
   end
+
+  -- 诊断每个绿色订单信号为什么没有作为产品输出。资格检查与实际选单共用 eligible，
+  -- 因此材料阈值、科技和机器限制变化时，悬浮原因不会与线路行为产生两套口径。
+  local diagnostics = {}
+  local selected_key = selected_demand and Util.signal_key(selected_demand.signal) or nil
+  for _, demand in ipairs(demands) do
+    local key = Util.signal_key(demand.signal)
+    if config.output_mode == "only_material" then
+      diagnostics[key] = {kind = "only_material"}
+    elseif key ~= selected_key then
+      local _, diagnostic = eligible(demand, false)
+      diagnostics[key] = diagnostic or {
+        kind = "waiting_for_order",
+        signal = selected_demand and Util.make_signal(
+          selected_demand.signal.type, selected_demand.signal.name, selected_demand.signal.quality) or nil
+      }
+    end
+  end
+  record.production_order_diagnostics = diagnostics
+
   if config.output_mode == "all_separate_signal" then
     -- 分离模式约定：红线只发送配方原料，绿线只发送当前订单商品。
     local limited_materials = limit_materials_by_cache(

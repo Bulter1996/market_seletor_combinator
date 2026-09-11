@@ -432,7 +432,8 @@ local function update_all()
     local player = game.get_player(player_index)
     local record = state().combinators[unit]
     if player and record then
-      Gui.refresh_connection_status(player, record.entity, record.gui_output_networks)
+      Gui.refresh_connection_status(
+        player, record.entity, record.gui_output_networks, record.production_order_diagnostics)
     end
   end
 end
@@ -509,7 +510,8 @@ script.on_event(defines.events.on_gui_opened, function(event)
     -- 热加载可能保留旧 schema 的 record；GUI 创建会直接读取全部字段，因此打开前也要
     -- 做一次迁移，不能只依赖下一次定时计算来修复配置。
     record.config = normalize_runtime_config(record.config)
-    Gui.open(player, event.entity, record.config, record.gui_output_networks)
+    Gui.open(
+      player, event.entity, record.config, record.gui_output_networks, record.production_order_diagnostics)
     state().player_gui[player.index] = event.entity.unit_number
   end
 end)

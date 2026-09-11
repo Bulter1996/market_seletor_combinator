@@ -4,6 +4,7 @@
 
 local Gui = {}
 local Config = require("scripts.config")               -- 只读取模式常量，避免 GUI 重复维护内部字符串。
+local Util = require("scripts.common_util")            -- 复用稳定信号键，将生产诊断绑定到对应绿色输入。
 
 Gui.name = "bmsc-window"                              -- 参数：窗口唯一名称，供 control.lua 识别事件来源。
 Gui.network_info_name = "bmsc-network-info"           -- 参数：网络信息图标名称前缀；实际名称会追加颜色和网络编号。
@@ -132,6 +133,45 @@ local function signal_elem_tooltip(signal)
   return {type = "signal", name = signal.name, signal_type = signal_type}
 end
 
+---把信号格式化为“图标 + 本地化名称”，供生产订单诊断提示复用。
+---@param signal SignalID 信号标识。
+---@return LocalisedString label 本地化信号标签。
+local function signal_localised_label(signal)
+  local signal_type = signal.type or "item"
+  local prototype_group = signal_type == "fluid" and prototypes.fluid or prototypes.item
+  local prototype = prototype_group and prototype_group[signal.name]
+  return {"", "[img=" .. signal_sprite_path(signal) .. "] ", prototype and prototype.localised_name or signal.name}
+end
+
+---把生产订单模块给出的结构化原因转换为附加在原型详情下方的本地化提示。
+---@param diagnostic table|nil 生产订单诊断。
+---@return LocalisedString|nil tooltip 没有诊断时不追加提示。
+local function production_diagnostic_tooltip(diagnostic)
+  if not diagnostic then return nil end
+  local reason
+  if diagnostic.kind == "only_material" then
+    reason = {"bmsc.production-reason-only-material"}
+  elseif diagnostic.kind == "materials" then
+    local shortages
+    for index, shortage in ipairs(diagnostic.shortages or {}) do
+      local item = {"", signal_localised_label(shortage.signal), " × ", tostring(shortage.count)}
+      shortages = index == 1 and item or {"bmsc.production-reason-join", shortages, item}
+    end
+    reason = shortages and {"bmsc.production-reason-materials", shortages} or nil
+  elseif diagnostic.kind == "stock_sufficient" then
+    reason = {"bmsc.production-reason-stock-sufficient", diagnostic.stock}
+  elseif diagnostic.kind == "no_recipe" then
+    reason = {"bmsc.production-reason-no-recipe"}
+  elseif diagnostic.kind == "unsupported_signal" then
+    reason = {"bmsc.production-reason-unsupported-signal"}
+  elseif diagnostic.kind == "non_positive_order" then
+    reason = {"bmsc.production-reason-non-positive-order"}
+  elseif diagnostic.kind == "waiting_for_order" and diagnostic.signal then
+    reason = {"bmsc.production-reason-waiting", signal_localised_label(diagnostic.signal)}
+  end
+  return reason and {"bmsc.production-no-output-reason", reason} or nil
+end
+
 ---把输入/输出两侧的红绿网络信号展开成稳定排序的槽位数组。
 ---同一信号同时出现在红、绿网络时保留两个槽位，以不同线路底色明确区分来源。
 ---@param networks table `get_side_networks` 返回的网络数组。
@@ -167,8 +207,9 @@ end
 ---从而避免周期性 clear/destroy 带来的 GUI 分配、悬浮中断和额外 UPS 消耗。
 ---@param section LuaGuiElement “输入信号”或“输出信号”的子 frame。
 ---@param networks table 当前侧的红绿网络。
+---@param diagnostics table|nil 以 Util.signal_key 为键的绿色输入诊断。
 ---@return nil
-local function refresh_signal_section(section, networks)
+local function refresh_signal_section(section, networks, diagnostics)
   local entries = collect_signal_entries(networks)
   local by_color = {red = {}, green = {}}
   local signature_parts = {}
@@ -190,7 +231,10 @@ local function refresh_signal_section(section, networks)
       local slots = color == "red" and red_slots or green_slots
       for index, entry in ipairs(by_color[color]) do
         -- 每种颜色各自保持稳定排序，因此常规刷新只更新数字。
-        slots.children[index].number = entry.count
+        local slot = slots.children[index]
+        slot.number = entry.count
+        slot.tooltip = color == "green"
+          and production_diagnostic_tooltip(diagnostics and diagnostics[Util.signal_key(entry.signal)]) or nil
       end
     end
     return
@@ -213,6 +257,8 @@ local function refresh_signal_section(section, networks)
         -- 保持原版电路槽位的图标与数字角标布局，仅附加原型交互信息。
         local slot = slots.add{type = "sprite-button", sprite = entry.sprite, number = entry.count,
           style = color .. "_circuit_network_content_slot", elem_tooltip = signal_elem_tooltip(entry.signal),
+          tooltip = color == "green"
+            and production_diagnostic_tooltip(diagnostics and diagnostics[Util.signal_key(entry.signal)]) or nil,
           tags = {
             bmsc_signal_panel_icon = true,
             bmsc_signal_type = entry.signal.type or "item",
@@ -277,10 +323,11 @@ end
 ---@param signals LuaGuiElement `Gui.add_signal_panel` 创建的面板。
 ---@param input_networks table 输入端红绿网络数据。
 ---@param output_networks table 输出端红绿网络数据。
+---@param input_diagnostics table|nil 生产订单绿色输入信号的未输出原因。
 ---@return nil
-function Gui.refresh_signal_panel(signals, input_networks, output_networks)
+function Gui.refresh_signal_panel(signals, input_networks, output_networks, input_diagnostics)
   if not (signals and signals.valid) then return end
-  refresh_signal_section(signals["bmsc-input-signals"], input_networks)
+  refresh_signal_section(signals["bmsc-input-signals"], input_networks, input_diagnostics)
   refresh_signal_section(signals["bmsc-output-signals"], output_networks)
 end
 
@@ -504,8 +551,9 @@ end
 ---@param player LuaPlayer 拥有此 GUI 的玩家。
 ---@param entity LuaEntity|nil 正在查看的市场选择运算器。
 ---@param current_output_networks table|nil control.lua 本轮实际写入输出代理的信号快照。
+---@param input_diagnostics table|nil 生产订单绿色输入信号的未输出原因。
 ---@return nil
-function Gui.refresh_connection_status(player, entity, current_output_networks)
+function Gui.refresh_connection_status(player, entity, current_output_networks, input_diagnostics)
   local frame = player.gui.screen[Gui.name]
   if not (frame and frame.valid and entity and entity.valid) then return end
   local content = frame["bmsc-content"]
@@ -527,7 +575,7 @@ function Gui.refresh_connection_status(player, entity, current_output_networks)
       -- 打开窗口后的首次刷新还没有传入快照，此时才从代理线路读取已有信号。
       signal_output_networks = signal_output_networks or current_output_networks
         or get_side_networks(entity, "output", true)
-      Gui.refresh_signal_panel(details["bmsc-signals"], input_networks, signal_output_networks)
+      Gui.refresh_signal_panel(details["bmsc-signals"], input_networks, signal_output_networks, input_diagnostics)
     end
   end
 end
@@ -621,8 +669,9 @@ end
 ---@param entity LuaEntity 用于 entity-preview 的实际实体。
 ---@param config table 已由业务层校验过的实体配置。
 ---@param current_output_networks table|nil control.lua 最近一次写入代理的输出快照。
+---@param input_diagnostics table|nil 生产订单绿色输入信号的未输出原因。
 ---@return LuaGuiElement frame 新创建的主窗口。
-function Gui.open(player, entity, config, current_output_networks)
+function Gui.open(player, entity, config, current_output_networks, input_diagnostics)
   Gui.hide_network_popup(player)
   local old = player.gui.screen[Gui.name]
   if old then old.destroy() end
@@ -861,7 +910,7 @@ function Gui.open(player, entity, config, current_output_networks)
   actions.add{type = "button", name = "bmsc-description-cancel", caption = {"gui.cancel"}}
 
   player.opened = frame
-  Gui.refresh_connection_status(player, entity, current_output_networks)
+  Gui.refresh_connection_status(player, entity, current_output_networks, input_diagnostics)
   return frame
 end
 

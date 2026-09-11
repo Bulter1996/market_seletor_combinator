@@ -2,12 +2,19 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 2
+Config.schema_revision = 4
 
 Config.mode = {
   production_order = "production_order",
   supermarket_order = "supermarket_order",
-  recipe_query = "recipe_query"
+  recipe_query = "recipe_query",
+  inventory_query = "inventory_query"
+}
+
+Config.query_type = {
+  fluid = "fluid",
+  item = "item",
+  all = "all"
 }
 
 -- 旧版存档和蓝图使用的模式值；只用于迁移，规范化后统一写为 supermarket_order。
@@ -32,6 +39,8 @@ function Config.default()
     mode = Config.mode.supermarket_order,          -- 参数：当前操作模式。
     production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
     multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
+    query_type = Config.query_type.all,            -- 参数：共享库存查询包含流体、物品或两者。
+    query_all = false,                            -- 参数：查询模式是否输出共享区的全部非零库存。
     additional_production_rate = 1,              -- 参数：生产订单的产品库存停止倍率。
     material_demand_rate = 10,                   -- 参数：生产订单启动所需原料倍率。
     material_retention_rate = 1,                 -- 参数：生产订单运行后的原料停止倍率。
@@ -54,7 +63,7 @@ function Config.normalize(source)
   local config = Config.default()
   if type(source) ~= "table" then return config end
   if source.mode == Config.mode.production_order or source.mode == Config.mode.supermarket_order
-    or source.mode == Config.mode.recipe_query then
+    or source.mode == Config.mode.recipe_query or source.mode == Config.mode.inventory_query then
     config.mode = source.mode
   elseif source.mode == LEGACY_ORDER_RECURSION then
     config.mode = Config.mode.supermarket_order
@@ -63,6 +72,11 @@ function Config.normalize(source)
   if type(source.multiple_recipe_support) == "boolean" then
     config.multiple_recipe_support = source.multiple_recipe_support
   end
+  if source.query_type == Config.query_type.fluid or source.query_type == Config.query_type.item
+    or source.query_type == Config.query_type.all then
+    config.query_type = source.query_type
+  end
+  if type(source.query_all) == "boolean" then config.query_all = source.query_all end
   if type(source.additional_production_rate) == "number" then
     config.additional_production_rate = math.max(0, source.additional_production_rate)
   end

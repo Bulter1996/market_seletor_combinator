@@ -14,6 +14,8 @@ local MODES = require("scripts.mode_registry")          -- 模式注册表：统
 local MODE_PRODUCTION_ORDER = Config.mode.production_order
 local MODE_SUPERMARKET_ORDER = Config.mode.supermarket_order
 local MODE_RECIPE_QUERY = Config.mode.recipe_query
+local MODE_INVENTORY_QUERY = Config.mode.inventory_query
+local MAX_PROXY_SIGNALS = 65535                    -- Factorio 常量运算器筛选索引的 uint16 上限。
 
 
 ---取得并初始化本模组的持久状态。
@@ -271,7 +273,7 @@ local function update_hover_tooltip(record, outputs)
 end
 
 ---把输出集合整理为实际可写入代理的稳定数组和签名。
----签名只包含最终会上线路的前 100 个非零信号；同一集合无论 pairs 遍历顺序如何，
+---签名只包含最终会上线路的非零信号；同一集合无论 pairs 遍历顺序如何，
 ---都会得到相同字符串，因此可以安全判断“本轮输出是否真的发生变化”。
 ---@param outputs table 当前线路的输出集合。
 ---@return table entries 按信号键排序、过滤后的输出数组。
@@ -280,7 +282,7 @@ local function prepare_proxy_outputs(outputs)
   local entries = {}
   local signature_parts = {}
   for _, value in ipairs(Util.sorted_outputs(outputs)) do
-    if value.entry.count ~= 0 and #entries < 100 then
+    if value.entry.count ~= 0 and #entries < MAX_PROXY_SIGNALS then
       entries[#entries + 1] = value.entry
       signature_parts[#signature_parts + 1] = tostring(value.entry.sort_priority or 0) .. ":"
         .. value.key .. "=" .. tostring(value.entry.count)
@@ -290,7 +292,7 @@ local function prepare_proxy_outputs(outputs)
 end
 
 ---把一组结果写入指定隐藏代理的常量运算器槽位。
----输出签名未变化时不访问 Factorio 槽位 API；发生变化时只清理上一轮多出来的槽位。
+---输出签名未变化时不访问 Factorio 槽位 API；发生变化时一次替换完整筛选列表。
 ---@param proxy LuaEntity 隐藏常量运算器。
 ---@param outputs table 当前线路的输出集合。
 ---@param cache table|nil 上一轮缓存，格式为 `{signature=string, slot_count=integer}`。
@@ -309,19 +311,18 @@ local function write_proxy_outputs(proxy, outputs, cache)
     behavior.remove_section(section_index)
   end
   local section = behavior.get_section(1) or behavior.add_section()
+  local filters = {}
   for index, entry in ipairs(entries) do
-    -- set_slot 的 value 是 SignalFilter，而不只是普通 SignalID。当 min 非零时，
-    -- Factorio 2.1 要求 quality 明确指定且 comparator 必须为“=”。
+    -- filters 的 value 是 SignalFilter，而不只是普通 SignalID。当 min 非零时，
+    -- Factorio 2.1 要求 quality 明确指定且 comparator 必须为“=”。完整替换列表既支持
+    -- 查询模式的全量信号，也能在切回普通模式时一次清除所有旧槽位。
     local signal = entry.signal
     local safe_signal = Util.make_signal(signal.type, signal.name, signal.quality)
     safe_signal.quality = Util.quality_name(signal.quality)
     safe_signal.comparator = "="
-    section.set_slot(index, {value = safe_signal, min = entry.count})
+    filters[index] = {value = safe_signal, min = entry.count}
   end
-  -- 新建或从旧版本接管的代理没有可信缓存，首次最多清理 100 格；之后只清理
-  -- “新槽位数 + 1”到“旧槽位数”，避免每轮固定执行 100 次 clear_slot。
-  local previous_slot_count = cache and cache.slot_count or 100
-  for slot_index = #entries + 1, previous_slot_count do section.clear_slot(slot_index) end
+  section.filters = filters
   return {signature = signature, slot_count = #entries}, entries
 end
 
@@ -411,6 +412,11 @@ end
 ---定时更新所有市场选择运算器，并清除已经失效的实体记录。
 ---@return nil
 local function update_all()
+  -- 需要跨实体协作的模式可在 calculate 前统一准备势力级状态；普通模式没有此钩子。
+  -- 查询模式借此合并同一势力的查询信号，只维护一个 LinkedChestAndPipe 探针。
+  for _, mode in pairs(MODES) do
+    if mode.prepare then mode.prepare(state().combinators) end
+  end
   for unit, record in pairs(state().combinators) do
     if record.entity and record.entity.valid then
       -- 原生 select/max 在超市订单模式下本身会产生一个最大值信号；必须先重新屏蔽，
@@ -652,7 +658,8 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   if event.element.name == "bmsc-mode" then
     local record = current_record(event.player_index)
     if not record then return end
-    record.config.mode = ({MODE_PRODUCTION_ORDER, MODE_SUPERMARKET_ORDER, MODE_RECIPE_QUERY})
+    record.config.mode = ({MODE_PRODUCTION_ORDER, MODE_SUPERMARKET_ORDER, MODE_RECIPE_QUERY,
+      MODE_INVENTORY_QUERY})
       [event.element.selected_index] or MODE_PRODUCTION_ORDER
     reset_all_modes(record)
     sync_mode_visual(record)
@@ -667,6 +674,21 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     -- 第一项为“否”、第二项为“是”；配置立即保存，线路在下一全局刷新周期更新。
     record.config.multiple_recipe_support = event.element.selected_index == 2
     MODES[MODE_RECIPE_QUERY].reset(record)
+    return
+  end
+  if event.element.name == "bmsc-query-all" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    -- 第一项为“否”、第二项为“是”；切换后下一轮会重配共享探针并等待对方模组刷新。
+    record.config.query_all = event.element.selected_index == 2
+    return
+  end
+  if event.element.name == "bmsc-query-type" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    -- 显示顺序为仅流体、仅物体、不限制；查询全部和按输入查询共用同一过滤配置。
+    record.config.query_type = ({Config.query_type.fluid, Config.query_type.item, Config.query_type.all})
+      [event.element.selected_index] or Config.query_type.all
     return
   end
   if event.element.name == "bmsc-remember-order" then

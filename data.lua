@@ -93,8 +93,8 @@ proxy.collision_mask = {layers = {}}
 proxy.collision_box = {{0, 0}, {0, 0}}
 -- 选择盒子大小为0，不可点击选择
 proxy.selection_box = {{0, 0}, {0, 0}}
--- 设置100个物品槽位（用于存储信号）
-proxy.item_slot_count = 100
+-- 查询全部可能同时输出大量物品品质与流体；使用运行时筛选索引允许的最大槽位数。
+proxy.item_slot_count = 65535
 -- 创建空白精灵图（因为实体是隐藏的，不需要图形）
 local empty_sprite = {filename = "__core__/graphics/empty.png", size = 1}
 proxy.sprites = {

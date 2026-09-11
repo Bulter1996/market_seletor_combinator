@@ -1,9 +1,12 @@
 {
-  "name": "market-selector-combinator",
-  "version": "1.0.0",
-  "title": "Market Selector Combinator",
-  "author": "Bulter",
-  "factorio_version": "2.1",
-  "dependencies": ["base >= 2.1", "? LinkedChestAndPipe >= 1.2.96"],
-  "description": "A scripted selector combinator that turns demand and inventory signals into production and material requests. Compatible with Factorio 2.1."
+    "name": "market-selector-combinator",
+    "version": "1.0.1",
+    "title": "Market Selector Combinator",
+    "author": "Bulter",
+    "factorio_version": "2.1",
+    "dependencies": [
+        "base >= 2.1",
+        "? LinkedChestAndPipe >= 1.2.96"
+    ],
+    "description": "A scripted selector combinator that turns demand and inventory signals into production and material requests. Compatible with Factorio 2.1."
 }

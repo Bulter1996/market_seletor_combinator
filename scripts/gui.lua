@@ -11,6 +11,7 @@ Gui.network_popup_name = "bmsc-network-popup"         -- 参数：仿原版网�
 Gui.production_order = Config.mode.production_order    -- 参数：生产订单模式标识，只用于决定参数区是否可见。
 Gui.supermarket_order = Config.mode.supermarket_order  -- 参数：超市订单模式标识，只用于决定参数区是否可见。
 Gui.recipe_query = Config.mode.recipe_query            -- 参数：配方查询模式标识，只用于决定参数区是否可见。
+Gui.inventory_query = Config.mode.inventory_query      -- 参数：共享库存查询模式标识，只用于决定参数区是否可见。
 -- 参数：每一种数值参数自己的吸附档位。
 -- Factorio 原生离散滑块只能等距吸附，因此滑块内部仍使用 1~6 的索引，再由这里映射实际值。
 -- 后续新增参数时，只需在本表增加“输入框名称 → 档位数组”，无需修改通用滑块函数。
@@ -517,7 +518,8 @@ function Gui.refresh_connection_status(player, entity, current_output_networks)
   -- 各模式分别绑定公共面板；只刷新当前可见实例，避免为隐藏模式做重复 GUI 更新。
   local signal_output_networks
   for _, details_name in ipairs({
-    "bmsc-production-details", "bmsc-recursion-details", "bmsc-recipe-query-details"
+    "bmsc-production-details", "bmsc-recursion-details", "bmsc-recipe-query-details",
+    "bmsc-inventory-query-details"
   }) do
     local details = content[details_name]
     if details and details.visible then
@@ -541,9 +543,11 @@ function Gui.show_mode_details(source_element, mode)
   local production_details = content["bmsc-production-details"]
   local recursion_details = content["bmsc-recursion-details"]
   local recipe_query_details = content["bmsc-recipe-query-details"]
+  local inventory_query_details = content["bmsc-inventory-query-details"]
   if production_details then production_details.visible = mode == Gui.production_order end
   if recursion_details then recursion_details.visible = mode == Gui.supermarket_order end
   if recipe_query_details then recipe_query_details.visible = mode == Gui.recipe_query end
+  if inventory_query_details then inventory_query_details.visible = mode == Gui.inventory_query end
 
 end
 
@@ -684,8 +688,10 @@ function Gui.open(player, entity, config, current_output_networks)
   -- 原版选择运算器使用醒目的“操作模式”标题；直接复用原版粗体标题样式。
   mode_fields.add{type = "label", caption = {"bmsc.mode"}, style = "heading_2_label"}
   mode_fields.add{type = "drop-down", name = "bmsc-mode",
-    items = {{"bmsc.production-order"}, {"bmsc.supermarket-order"}, {"bmsc.recipe-query"}},
-    selected_index = ({[Gui.production_order] = 1, [Gui.supermarket_order] = 2, [Gui.recipe_query] = 3})[config.mode] or 1,
+    items = {{"bmsc.production-order"}, {"bmsc.supermarket-order"}, {"bmsc.recipe-query"},
+      {"bmsc.inventory-query"}},
+    selected_index = ({[Gui.production_order] = 1, [Gui.supermarket_order] = 2,
+      [Gui.recipe_query] = 3, [Gui.inventory_query] = 4})[config.mode] or 1,
 
     tooltip = {"bmsc.mode-tooltip"}}
 
@@ -801,6 +807,33 @@ function Gui.open(player, entity, config, current_output_networks)
     tooltip = {"bmsc.multiple-recipe-support-tooltip"}})
   -- 配方查询模式也展示输入产品及查询得到的直接原料信号。
   Gui.add_signal_panel(recipe_query_details, player)
+
+  local inventory_query_details = content.add{
+    type = "flow", name = "bmsc-inventory-query-details", direction = "vertical"}
+  inventory_query_details.visible = config.mode == Gui.inventory_query
+  inventory_query_details.add{type = "line"}
+  local inventory_query_settings = inventory_query_details.add{
+    type = "frame", name = "bmsc-inventory-query-settings",
+    style = "inside_shallow_frame_with_padding", direction = "vertical"}
+  inventory_query_settings.add{
+    type = "label", caption = {"bmsc.inventory-query-settings"}, style = "heading_2_label"}
+  local inventory_query_fields = inventory_query_settings.add{
+    type = "table", name = "bmsc-inventory-query-fields", column_count = 2}
+  add_labeled(inventory_query_fields, {"bmsc.query-type"}, {
+    type = "drop-down", name = "bmsc-query-type",
+    items = {{"bmsc.query-only-fluid"}, {"bmsc.query-only-item"}, {"bmsc.query-unrestricted"}},
+    selected_index = ({
+      [Config.query_type.fluid] = 1,
+      [Config.query_type.item] = 2,
+      [Config.query_type.all] = 3
+    })[config.query_type] or 3,
+    tooltip = {"bmsc.query-type-tooltip"}})
+  add_labeled(inventory_query_fields, {"bmsc.query-all"}, {
+    type = "drop-down", name = "bmsc-query-all",
+    items = {{"bmsc.no"}, {"bmsc.yes"}}, selected_index = config.query_all and 2 or 1,
+    tooltip = {"bmsc.query-all-tooltip"}})
+  -- 查询模式复用公共信号面板，展示作为查询条件的输入和共享区库存输出。
+  Gui.add_signal_panel(inventory_query_details, player)
 
   -- 已保存的说明直接显示在配置界面内；内容支持 Factorio 富文本图标。
   local saved_description = content.add{type = "flow", name = "bmsc-saved-description", direction = "vertical"}

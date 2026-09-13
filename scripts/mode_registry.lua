@@ -10,10 +10,12 @@ local production_order = require("scripts.modes.production_order")
 local supermarket_order = require("scripts.modes.supermarket_order")
 local recipe_query = require("scripts.modes.recipe_query")
 local inventory_query = require("scripts.modes.inventory_query")
+local swap_order = require("scripts.modes.swap_order")
 
 return {
   [production_order.name] = production_order,
   [supermarket_order.name] = supermarket_order,
   [recipe_query.name] = recipe_query,
-  [inventory_query.name] = inventory_query
+  [inventory_query.name] = inventory_query,
+  [swap_order.name] = swap_order
 }

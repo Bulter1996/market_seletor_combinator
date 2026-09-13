@@ -21,6 +21,22 @@ Config.query_type = {
 -- 旧版存档和蓝图使用的模式值；只用于迁移，规范化后统一写为 supermarket_order。
 local LEGACY_ORDER_RECURSION = "order_recursion"
 
+---把 GUI、蓝图或旧存档中的信号配置收敛为可持久化的 SignalID。
+---@param signal table|nil 外部信号值。
+---@return table|nil normalized 仅保留 type、name 和字符串品质。
+function Config.normalize_signal(signal)
+  if type(signal) ~= "table" or type(signal.name) ~= "string"
+    or (signal.type ~= nil and type(signal.type) ~= "string") then
+    return nil
+  end
+  local normalized = {type = signal.type or "item", name = signal.name}
+  local quality_type = type(signal.quality)
+  local quality = quality_type == "string" and signal.quality
+    or (quality_type == "table" or quality_type == "userdata") and signal.quality.name
+  if type(quality) == "string" then normalized.quality = quality end
+  return normalized
+end
+
 ---判断材料启动倍率和停止倍率是否构成有效的迟滞区间。
 ---只有“启动阈值 > 停止阈值”时，机器才可能先启动、再在较低库存处停止。
 ---@param demand_rate number 材料需求倍率（启动阈值）。
@@ -47,12 +63,14 @@ function Config.default()
     material_retention_rate = 1,                 -- 参数：生产订单运行后的原料停止倍率。
     remember_order = true,                       -- 参数：是否记住已启动但从绿线消失的订单。
     production_timeout = 0,                     -- 参数：生产订单库存无变化时的轮换秒数；0 表示禁用。
+    production_timeout_reset_signal = nil,      -- 参数：绿线中为正数时重置生产订单超时。
     output_mode = "all",                         -- 参数：生产订单输出产品、原料或两者。
     cache_grid_number = 0,                      -- 参数：分离模式可占用的固体原料格数；0 表示不限制。
     recurise_depth = 0,                          -- 参数：超市订单最大递归深度；0 表示不限制。
     recursion_output_mode = "single",            -- 参数：超市订单输出单项或全部结果。
     sequential_production = true,                -- 参数：single 模式是否按订单顺序逐个完成。
     recursion_timeout = 0,                       -- 参数：single 无变化轮换秒数；0 表示禁用。
+    recursion_timeout_reset_signal = nil,        -- 参数：绿线中为正数时重置超市订单超时。
     swap_output_mode = "fluid",                 -- 参数：切换订单输出的信号类型。
     swap_timeout = 0,                            -- 参数：条件持续满足多久后切换排列；0 表示直通。
     swap_conditions = {{                         -- 参数：切换计时条件；relation 表示与前一条的关系。
@@ -105,6 +123,7 @@ function Config.normalize(source)
   if type(source.production_timeout) == "number" then
     config.production_timeout = math.max(0, source.production_timeout)
   end
+  config.production_timeout_reset_signal = Config.normalize_signal(source.production_timeout_reset_signal)
   if source.output_mode == "only_item" or source.output_mode == "only_material" or source.output_mode == "all"
     or source.output_mode == "all_separate_signal" then
     config.output_mode = source.output_mode
@@ -124,6 +143,7 @@ function Config.normalize(source)
   if type(source.recursion_timeout) == "number" then
     config.recursion_timeout = math.max(0, source.recursion_timeout)
   end
+  config.recursion_timeout_reset_signal = Config.normalize_signal(source.recursion_timeout_reset_signal)
   if source.swap_output_mode == "fluid" or source.swap_output_mode == "item"
     or source.swap_output_mode == "all" or source.swap_output_mode == "all_with_signals" then
     config.swap_output_mode = source.swap_output_mode

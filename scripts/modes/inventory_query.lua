@@ -47,9 +47,10 @@ end
 ---@param signal SignalID|nil 输入信号。
 ---@param query_type string 查询类型限制。
 ---@return nil
-local function add_query_signal(signals, signal, query_type)
-  if not Util.is_recipe_signal(signal) or not matches_query_type(signal, query_type) then return end
-  local safe_signal = Util.make_signal(signal.type, signal.name, signal.quality)
+local function add_query_signal(signals, signal, query_type, machine_name)
+  local product_signal = Util.resolve_recipe_input(signal, machine_name)
+  if not product_signal or not matches_query_type(product_signal, query_type) then return end
+  local safe_signal = Util.make_signal(product_signal.type, product_signal.name, product_signal.quality)
   signals[Util.signal_key(safe_signal)] = safe_signal
 end
 
@@ -64,7 +65,9 @@ local function add_record_inputs(signals, record, query_type)
     defines.wire_connector_id.combinator_input_green
   }) do
     local _, entries = Util.read_network(record.entity, connector_id)
-    for _, entry in pairs(entries) do add_query_signal(signals, entry.signal, query_type) end
+    for _, entry in pairs(entries) do
+      add_query_signal(signals, entry.signal, query_type, record.config.production_machine)
+    end
   end
 end
 

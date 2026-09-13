@@ -57,7 +57,7 @@ function Mode.calculate(record)
   for _, connector_id in ipairs(connector_ids) do
     local _, signals = Util.read_network(record.entity, connector_id)
     for _, entry in pairs(signals) do
-      if Util.is_recipe_signal(entry.signal) and entry.count > 0 then
+      if Util.is_recipe_input(entry.signal) and entry.count > 0 then
         Util.add_output(queries, entry.signal, entry.count)
       end
     end
@@ -68,14 +68,19 @@ function Mode.calculate(record)
   if not record.config.multiple_recipe_support then
     local first = sorted_queries[1]
     if not first then return outputs end
-    local recipe = Util.find_recipe_ignoring_research(first.entry.signal, record.config.production_machine)
+    local signal, specified_recipe = Util.resolve_recipe_input(
+      first.entry.signal, record.config.production_machine)
+    local recipe = signal and Util.find_recipe_ignoring_research(
+      signal, record.config.production_machine, specified_recipe)
     if recipe then add_recipe_ingredients(outputs, recipe, 1) end
     return outputs
   end
 
   for _, query in ipairs(sorted_queries) do
-    local signal = query.entry.signal
-    local recipe = Util.find_recipe_ignoring_research(signal, record.config.production_machine)
+    local signal, specified_recipe = Util.resolve_recipe_input(
+      query.entry.signal, record.config.production_machine)
+    local recipe = signal and Util.find_recipe_ignoring_research(
+      signal, record.config.production_machine, specified_recipe)
     if recipe then
       local product_amount = Util.recipe_product_amount(recipe, signal)
       if product_amount > 0 then

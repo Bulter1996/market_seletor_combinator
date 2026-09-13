@@ -85,6 +85,15 @@ local function restore_mode_states(record, states)
   for name, mode in pairs(MODES) do mode.restore_state(record, states[name]) end
 end
 
+---取得当前模式写给绿色输入槽位的诊断，避免其他模式显示残留原因。
+---@param record table 组合器记录。
+---@return table|nil diagnostics 当前模式诊断。
+local function current_input_diagnostics(record)
+  if record.config.mode == MODE_PRODUCTION_ORDER then return record.production_order_diagnostics end
+  if record.config.mode == MODE_SUPERMARKET_ORDER then return record.supermarket_order_diagnostics end
+  return nil
+end
+
 ---销毁某条记录的全部隐藏输出代理。
 ---record.proxy 是 v0.1.0 的单代理字段，保留清理逻辑以兼容旧存档升级。
 ---@param record table|nil 组合器运行记录。
@@ -461,7 +470,7 @@ local function update_all()
     local record = state().combinators[unit]
     if player and record then
       Gui.refresh_connection_status(
-        player, record.entity, record.gui_output_networks, record.production_order_diagnostics)
+        player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
       Gui.refresh_swap_condition_states(player.gui.screen[Gui.name], record.swap_condition_results)
     end
   end
@@ -540,7 +549,7 @@ script.on_event(defines.events.on_gui_opened, function(event)
     -- 做一次迁移，不能只依赖下一次定时计算来修复配置。
     record.config = normalize_runtime_config(record.config)
     Gui.open(
-      player, event.entity, record.config, record.gui_output_networks, record.production_order_diagnostics)
+      player, event.entity, record.config, record.gui_output_networks, current_input_diagnostics(record))
     Gui.refresh_swap_condition_states(player.gui.screen[Gui.name], record.swap_condition_results)
     refresh_timeout_display(player, record)
     state().player_gui[player.index] = event.entity.unit_number
@@ -580,6 +589,22 @@ script.on_event(defines.events.on_gui_leave, function(event)
 end)
 
 script.on_event(defines.events.on_gui_elem_changed, function(event)
+  local reset_signal_field = ({
+    ["bmsc-production-timeout-reset-signal"] = "production_timeout_reset_signal",
+    ["bmsc-recursion-timeout-reset-signal"] = "recursion_timeout_reset_signal"
+  })[event.element.name]
+  if reset_signal_field then
+    local record = current_record(event.player_index)
+    if record then
+      record.config[reset_signal_field] = Config.normalize_signal(event.element.elem_value)
+      if reset_signal_field == "production_timeout_reset_signal" then
+        record.production_order_changed_tick = game.tick
+      else
+        record.recursion_output_changed_tick = game.tick
+      end
+    end
+    return
+  end
   if event.element.name ~= "bmsc-production-machine" and event.element.name ~= "bmsc-recursion-machine"
     and event.element.name ~= "bmsc-recipe-query-machine" then return end
   local record = current_record(event.player_index)
@@ -779,6 +804,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     -- 订单筛选方式变化后，旧的单信号锁定可能属于已经被忽略的另一个订单。
     MODES[MODE_SUPERMARKET_ORDER].reset(record)
     MODES[MODE_SUPERMARKET_ORDER].invalidate_plan(record)
+    Gui.set_sequence_restart_visible(event.element, record.config.sequential_production)
     return
   end
   if event.element.name ~= "bmsc-output" then return end
@@ -853,6 +879,13 @@ script.on_event(defines.events.on_gui_click, function(event)
   if event.element.name == "bmsc-clear-order-memory" then
     if record then
       MODES[MODE_PRODUCTION_ORDER].reset(record)
+      write_outputs(record, {})
+    end
+    return
+  end
+  if event.element.name == "bmsc-restart-sequence" then
+    if record then
+      MODES[MODE_SUPERMARKET_ORDER].restart_sequence(record)
       write_outputs(record, {})
     end
     return

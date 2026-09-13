@@ -143,8 +143,8 @@ local function signal_localised_label(signal)
   return {"", "[img=" .. signal_sprite_path(signal) .. "] ", prototype and prototype.localised_name or signal.name}
 end
 
----把生产订单模块给出的结构化原因转换为附加在原型详情下方的本地化提示。
----@param diagnostic table|nil 生产订单诊断。
+---把订单模式给出的结构化原因转换为附加在原型详情下方的本地化提示。
+---@param diagnostic table|nil 绿色输入诊断。
 ---@return LocalisedString|nil tooltip 没有诊断时不追加提示。
 local function production_diagnostic_tooltip(diagnostic)
   if not diagnostic then return nil end
@@ -168,6 +168,10 @@ local function production_diagnostic_tooltip(diagnostic)
     reason = {"bmsc.production-reason-non-positive-order"}
   elseif diagnostic.kind == "waiting_for_order" and diagnostic.signal then
     reason = {"bmsc.production-reason-waiting", signal_localised_label(diagnostic.signal)}
+  elseif diagnostic.kind == "supermarket_completed" then
+    reason = {"bmsc.supermarket-reason-completed"}
+  elseif diagnostic.kind == "supermarket_expanding" then
+    reason = {"bmsc.supermarket-reason-expanding"}
   end
   return reason and {"bmsc.production-no-output-reason", reason} or nil
 end
@@ -227,7 +231,7 @@ local function refresh_signal_section(section, networks, diagnostics)
   local rows_intact = (#by_color.red == 0 or (red_slots and red_slots.valid))
     and (#by_color.green == 0 or (green_slots and green_slots.valid))
   if rows_intact and scroll.tags.bmsc_signal_signature == signature then
-    for _, color in ipairs({"red", "green"}) do
+    for _, color in ipairs({"green", "red"}) do
       local slots = color == "red" and red_slots or green_slots
       for index, entry in ipairs(by_color[color]) do
         -- 每种颜色各自保持稳定排序，因此常规刷新只更新数字。
@@ -247,12 +251,12 @@ local function refresh_signal_section(section, networks, diagnostics)
     return
   end
 
-  for _, color in ipairs({"red", "green"}) do
+  for _, color in ipairs({"green", "red"}) do
     if #by_color[color] > 0 then
       -- 红色和绿色使用两个独立表格；即使上一色不足八格，下一色也一定从新行开始。
       local slots = scroll.add{type = "table", name = "bmsc-" .. color .. "-signal-slots", column_count = 8}
       slots.style.horizontally_stretchable = true
-      if color == "green" and #by_color.red > 0 then slots.style.top_margin = 4 end
+      if color == "red" and #by_color.green > 0 then slots.style.top_margin = 4 end
       for _, entry in ipairs(by_color[color]) do
         -- 保持原版电路槽位的图标与数字角标布局，仅附加原型交互信息。
         local slot = slots.add{type = "sprite-button", sprite = entry.sprite, number = entry.count,
@@ -612,8 +616,28 @@ function Gui.set_recursion_single_options_visible(source_element, visible)
   if not fields then return end
   for _, name in ipairs({
     "bmsc-sequential-production-label", "bmsc-sequential-production",
-    "bmsc-recursion-timeout-label", "bmsc-recursion-timeout-controls"
+    "bmsc-recursion-timeout-label", "bmsc-recursion-timeout-controls",
+    "bmsc-recursion-timeout-reset-signal-label", "bmsc-recursion-timeout-reset-signal"
   }) do
+    local element = fields[name]
+    if element then element.visible = visible end
+  end
+  local sequential = fields["bmsc-sequential-production"]
+  Gui.set_sequence_restart_visible(source_element, visible and sequential and sequential.selected_index == 1)
+end
+
+---只在启用顺序制作时显示“从头开始”按钮。
+---@param source_element LuaGuiElement 超市订单参数区内的任意控件。
+---@param visible boolean 是否显示。
+---@return nil
+function Gui.set_sequence_restart_visible(source_element, visible)
+  local window = Gui.containing_window(source_element)
+  local content = window and window["bmsc-content"]
+  local details = content and content["bmsc-recursion-details"]
+  local settings = details and details["bmsc-recursion-settings"]
+  local fields = settings and settings["bmsc-recursion-fields"]
+  if not fields then return end
+  for _, name in ipairs({"bmsc-restart-sequence-spacer", "bmsc-restart-sequence"}) do
     local element = fields[name]
     if element then element.visible = visible end
   end
@@ -770,6 +794,10 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     config.material_retention_rate or 1, true, {"bmsc.material-retention-rate-tooltip"})
   add_numeric_slider(fields, {"bmsc.production-timeout"}, "bmsc-production-timeout",
     config.production_timeout or 0, true, {"bmsc.production-timeout-tooltip"})
+  local production_reset_signal = add_labeled(fields, {"bmsc.timeout-reset-signal"}, {
+    type = "choose-elem-button", name = "bmsc-production-timeout-reset-signal", elem_type = "signal",
+    elem_value = config.production_timeout_reset_signal, tooltip = {"bmsc.timeout-reset-signal-tooltip"}})
+  production_reset_signal.style.size = 40
   add_labeled(fields, {"bmsc.output-mode"}, {type = "drop-down", name = "bmsc-output",
     items = {{"bmsc.only-item"}, {"bmsc.only-material"}, {"bmsc.all"}, {"bmsc.all-separate-signal"}},
     selected_index = ({only_item = 1, only_material = 2, all = 3, all_separate_signal = 4})[config.output_mode] or 3,
@@ -813,6 +841,12 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   recursion_fields.add{type = "drop-down", name = "bmsc-sequential-production",
     items = {{"bmsc.yes"}, {"bmsc.no"}}, selected_index = config.sequential_production ~= false and 1 or 2,
     tooltip = {"bmsc.sequential-production-tooltip"}, visible = timeout_visible}
+  local restart_visible = timeout_visible and config.sequential_production ~= false
+  recursion_fields.add{type = "empty-widget", name = "bmsc-restart-sequence-spacer",
+    visible = restart_visible}
+  recursion_fields.add{type = "button", name = "bmsc-restart-sequence",
+    caption = {"bmsc.restart-sequence"}, tooltip = {"bmsc.restart-sequence-tooltip"},
+    visible = restart_visible}
   -- 超时只属于 single 模式；为标签和输入框命名，切换输出模式时可以同时显隐。
   recursion_fields.add{type = "label", name = "bmsc-recursion-timeout-label",
     caption = {"bmsc.recursion-timeout"}, visible = timeout_visible}
@@ -834,6 +868,13 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     tooltip = {"bmsc.recursion-timeout-tooltip"},
     tags = {bmsc_numeric_slider = "bmsc-recursion-timeout-slider"}}
   timeout_input.style.width = 64
+  recursion_fields.add{type = "label", name = "bmsc-recursion-timeout-reset-signal-label",
+    caption = {"bmsc.timeout-reset-signal"}, visible = timeout_visible}
+  local recursion_reset_signal = recursion_fields.add{
+    type = "choose-elem-button", name = "bmsc-recursion-timeout-reset-signal", elem_type = "signal",
+    elem_value = config.recursion_timeout_reset_signal, tooltip = {"bmsc.timeout-reset-signal-tooltip"},
+    visible = timeout_visible}
+  recursion_reset_signal.style.size = 40
   -- 订单递归模式独立绑定同一个公共信号面板函数。
   Gui.add_signal_panel(recursion_details, player)
 

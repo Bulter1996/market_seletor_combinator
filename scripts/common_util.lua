@@ -28,9 +28,18 @@ function Util.is_recipe_signal(signal)
   return signal_type == "item" or signal_type == "fluid"
 end
 
----构造规范化的物品或流体 SignalID。
----品质只属于物品；流体不写 quality，避免向 Factorio API 传入无意义字段。
----@param signal_type string|nil `item`、`fluid`，nil 按 `item` 处理。
+---判断信号是否可以作为生产输入；配方信号会在后续解析为其主产物。
+---@param signal SignalID|nil 待检查信号。
+---@return boolean supported 物品、流体或配方信号返回 true。
+function Util.is_recipe_input(signal)
+  if not (signal and signal.name) then return false end
+  local signal_type = signal.type or "item"
+  return signal_type == "item" or signal_type == "fluid" or signal_type == "recipe"
+end
+
+---构造规范化的 SignalID。
+---品质只属于物品；其他类型不写 quality，避免向 Factorio API 传入无意义字段。
+---@param signal_type string|nil 信号类型；nil 按 `item` 处理。
 ---@param name string 原型名称。
 ---@param quality LuaQualityPrototype|string|nil 物品品质；流体会忽略此参数。
 ---@return SignalID signal 可用于电路输出和 signal_key 的信号。
@@ -39,6 +48,23 @@ function Util.make_signal(signal_type, name, quality)
   local signal = {type = normalized_type, name = name}
   if normalized_type == "item" then signal.quality = Util.quality_name(quality) end
   return signal
+end
+
+---把物品、流体或配方输入解析为实际产品；配方输入同时返回指定配方。
+---@param signal SignalID 输入信号。
+---@param machine_name string 当前生产机器实体原型名。
+---@return SignalID|nil product_signal 产品信号；配方无产物或机器不支持时为 nil。
+---@return LuaRecipePrototype|nil specified_recipe 配方输入指定的配方；普通产品输入为 nil。
+function Util.resolve_recipe_input(signal, machine_name)
+  if Util.is_recipe_signal(signal) then
+    return Util.make_signal(signal.type, signal.name, signal.quality), nil
+  end
+  if not (signal and signal.type == "recipe") then return nil, nil end
+  local recipe = prototypes and prototypes.recipe and prototypes.recipe[signal.name]
+  if not (recipe and Util.machine_supports(machine_name, recipe)) then return nil, nil end
+  local product = recipe.main_product or (recipe.products and recipe.products[1])
+  if not (product and product.name) then return nil, nil end
+  return Util.make_signal(product.type, product.name, signal.quality), recipe
 end
 
 ---为信号生成稳定且唯一的 table 键。
@@ -50,6 +76,20 @@ function Util.signal_key(signal)
     return signal_type .. ":" .. signal.name .. ":" .. Util.quality_name(signal.quality)
   end
   return signal_type .. ":" .. signal.name
+end
+
+---读取信号数组中指定信号的合计值。
+---@param entries table Factorio 返回的信号条目数组。
+---@param wanted SignalID|nil 需要匹配的信号。
+---@return number count 同类型、名称和品质信号的数量合计。
+function Util.signal_count(entries, wanted)
+  if not (wanted and wanted.name) then return 0 end
+  local wanted_key = Util.signal_key(wanted)
+  local count = 0
+  for _, entry in pairs(entries or {}) do
+    if entry.signal and Util.signal_key(entry.signal) == wanted_key then count = count + (entry.count or 0) end
+  end
+  return count
 end
 
 ---读取指定连接器的信号，并合并重复信号。
@@ -170,6 +210,7 @@ end
 ---取得指定机器能够制造目标信号的稳定候选配方列表。
 ---@param target_signal SignalID 目标物品或流体信号。
 ---@param machine_name string 制造机实体原型名。
+---@param specified_recipe LuaRecipePrototype|nil 配方信号明确指定的配方。
 ---@return table|nil candidates 候选项数组。
 local function get_recipe_candidates(target_signal, machine_name)
   if not Util.is_recipe_signal(target_signal) then return nil end
@@ -180,6 +221,7 @@ end
 ---读取目标材料在指定机器制造图中的结构层级。
 ---@param target_signal SignalID 目标物品或流体信号。
 ---@param machine_name string 制造机实体原型名。
+---@param specified_recipe LuaRecipePrototype|nil 配方信号明确指定的配方。
 ---@return uint level 无配方为 1，可制造产品从 2 开始递增。
 function Util.machine_material_layer(target_signal, machine_name)
   if not Util.is_recipe_signal(target_signal) then return 1 end
@@ -194,7 +236,15 @@ end
 ---@param target_signal SignalID 目标物品或流体信号。
 ---@param machine_name string 制造机实体原型名。
 ---@return LuaRecipePrototype|nil recipe 找不到时返回 nil。
-function Util.find_recipe(force, target_signal, machine_name)
+function Util.find_recipe(force, target_signal, machine_name, specified_recipe)
+  if specified_recipe then
+    local force_recipe = force and force.recipes and force.recipes[specified_recipe.name]
+    if force_recipe and force_recipe.enabled and Util.machine_supports(machine_name, specified_recipe)
+      and Util.recipe_product_amount(specified_recipe, target_signal) > 0 then
+      return specified_recipe
+    end
+    return nil
+  end
   local candidates = get_recipe_candidates(target_signal, machine_name)
   if not (candidates and force and force.recipes) then return nil end
   -- 势力配方的 enabled 会随研究进度变化，不能写进静态缓存；按稳定候选顺序实时选择。
@@ -210,7 +260,14 @@ end
 ---@param target_signal SignalID 目标物品或流体信号。
 ---@param machine_name string 制造机实体原型名。
 ---@return LuaRecipePrototype|nil recipe 找不到时返回 nil。
-function Util.find_recipe_ignoring_research(target_signal, machine_name)
+function Util.find_recipe_ignoring_research(target_signal, machine_name, specified_recipe)
+  if specified_recipe then
+    if Util.machine_supports(machine_name, specified_recipe)
+      and Util.recipe_product_amount(specified_recipe, target_signal) > 0 then
+      return specified_recipe
+    end
+    return nil
+  end
   local candidates = get_recipe_candidates(target_signal, machine_name)
   return candidates and candidates[1] and candidates[1].recipe or nil
 end

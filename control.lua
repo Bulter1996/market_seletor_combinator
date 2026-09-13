@@ -8,6 +8,7 @@ local OUTPUT_PROXY_REVISION = 2                       -- 修改代理连接/写�
 local TICK_INTERVAL = settings.startup["bmsc-update-interval"].value
                                                           -- 参数：玩家配置的刷新间隔，默认 30 tick。
 local Gui = require("scripts.gui")                     -- GUI 模块：只负责界面，不参与生产计算。
+local SignalPicker = require("scripts.signal_picker") -- 条件信号与常量共用的原版风格选择器。
 local Config = require("scripts.config")               -- 配置模块：默认值、模式常量和外部数据校验。
 local Util = require("scripts.common_util")            -- 通用工具：输出排序等无状态功能。
 local MODES = require("scripts.mode_registry")          -- 模式注册表：统一调度彼此独立的算法模块。
@@ -15,6 +16,7 @@ local MODE_PRODUCTION_ORDER = Config.mode.production_order
 local MODE_SUPERMARKET_ORDER = Config.mode.supermarket_order
 local MODE_RECIPE_QUERY = Config.mode.recipe_query
 local MODE_INVENTORY_QUERY = Config.mode.inventory_query
+local MODE_SWAP_ORDER = Config.mode.swap_order
 local MAX_PROXY_SIGNALS = 65535                    -- Factorio 常量运算器筛选索引的 uint16 上限。
 
 
@@ -418,6 +420,32 @@ local function write_outputs(record, outputs)
   update_hover_tooltip(record, tooltip_outputs)
 end
 
+local function timeout_elapsed_seconds(start_tick, timeout, active)
+  timeout = tonumber(timeout) or 0
+  if not (active and start_tick and timeout > 0) then return 0 end
+  return math.min(timeout, math.max(0, (game.tick - start_tick) / 60))
+end
+
+local function refresh_timeout_display(player, record)
+  local mode = record.config.mode
+  Gui.refresh_timeout_elapsed(
+    player.gui.screen[Gui.name],
+    timeout_elapsed_seconds(record.production_order_changed_tick, record.config.production_timeout,
+      mode == MODE_PRODUCTION_ORDER and record.production_order_output_count ~= nil),
+    timeout_elapsed_seconds(record.recursion_output_changed_tick, record.config.recursion_timeout,
+      mode == MODE_SUPERMARKET_ORDER and record.recursion_output_count ~= nil),
+    timeout_elapsed_seconds(record.swap_condition_tick, record.config.swap_timeout,
+      mode == MODE_SWAP_ORDER))
+end
+
+local function refresh_open_timeout_displays()
+  for player_index, unit in pairs(state().player_gui) do
+    local player = game.get_player(player_index)
+    local record = state().combinators[unit]
+    if player and record then refresh_timeout_display(player, record) end
+  end
+end
+
 ---定时更新所有市场选择运算器，并清除已经失效的实体记录。
 ---@return nil
 local function update_all()
@@ -443,6 +471,7 @@ local function update_all()
     if player and record then
       Gui.refresh_connection_status(
         player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+      Gui.refresh_swap_condition_states(player.gui.screen[Gui.name], record.swap_condition_results)
     end
   end
 end
@@ -521,11 +550,17 @@ script.on_event(defines.events.on_gui_opened, function(event)
     record.config = normalize_runtime_config(record.config)
     Gui.open(
       player, event.entity, record.config, record.gui_output_networks, current_input_diagnostics(record))
+    Gui.refresh_swap_condition_states(player.gui.screen[Gui.name], record.swap_condition_results)
+    refresh_timeout_display(player, record)
     state().player_gui[player.index] = event.entity.unit_number
   end
 end)
 script.on_event(defines.events.on_gui_closed, function(event)
+  if SignalPicker.on_closed(event) then return end
   if not (event.element and event.element.valid and event.element.name == Gui.name) then return end
+
+  -- 打开条件选择器会暂时替换 player.opened；主窗口留在后方，选择结束后继续编辑。
+  if SignalPicker.is_open(game.get_player(event.player_index)) then return end
 
   -- player.opened 使 E、Esc、打开其他实体等操作都会进入这里，行为与原版实体窗口一致。
   state().player_gui[event.player_index] = nil
@@ -591,6 +626,11 @@ script.on_event(defines.events.on_gui_elem_changed, function(event)
     end
   end
 end)
+
+local function reset_swap_timer(record)
+  record.swap_condition_tick = nil
+end
+
 ---把一个已经校验的数值写入其对应配置字段。
 ---文本框和滑块共用这个入口，避免两类 GUI 事件分别维护一套参数名称映射。
 ---@param record table 当前组合器记录。
@@ -610,6 +650,7 @@ local function update_numeric_config(record, element_name, value)
     return true
   end
   if element_name == "bmsc-production-timeout" then record.config.production_timeout = value; return true end
+  if element_name == "bmsc-swap-timeout" then record.config.swap_timeout = value; return true end
   if element_name == "bmsc-cache-grid-number" then
     -- 缓存格数必须是非负整数；即使未来有调用方绕过 GUI，也不能写入负值或小数。
     record.config.cache_grid_number = math.max(0, math.floor(value))
@@ -635,10 +676,13 @@ local function invalidate_numeric_runtime_state(record, element_name)
   elseif element_name == "bmsc-recursion-timeout" then
     record.recursion_output_count = nil
     record.recursion_output_changed_tick = nil
+  elseif element_name == "bmsc-swap-timeout" then
+    reset_swap_timer(record)
   end
 end
 
 script.on_event(defines.events.on_gui_text_changed, function(event)
+  if SignalPicker.on_text_changed(event) then return end
   local record = current_record(event.player_index)
   local value = tonumber(event.element.text)
   if not record then return end
@@ -662,6 +706,7 @@ script.on_event(defines.events.on_gui_text_changed, function(event)
 end)
 
 script.on_event(defines.events.on_gui_value_changed, function(event)
+  if SignalPicker.on_value_changed(event) then return end
   if not event.element.tags.bmsc_numeric_input then return end
   local record = current_record(event.player_index)
   if not record then return end
@@ -680,11 +725,21 @@ script.on_event(defines.events.on_gui_value_changed, function(event)
   if accepted then invalidate_numeric_runtime_state(record, textfield.name) end
 end)
 script.on_event(defines.events.on_gui_selection_state_changed, function(event)
+  local event_tags = event.element.tags or {}
+  if event_tags.bmsc_swap_comparator then
+    local record = current_record(event.player_index)
+    local condition = record and record.config.swap_conditions[event_tags.bmsc_swap_comparator]
+    if condition then
+      condition.comparator = ({"<", ">", "=", "<=", ">=", "~="})[event.element.selected_index] or "<"
+      reset_swap_timer(record)
+    end
+    return
+  end
   if event.element.name == "bmsc-mode" then
     local record = current_record(event.player_index)
     if not record then return end
     record.config.mode = ({MODE_PRODUCTION_ORDER, MODE_SUPERMARKET_ORDER, MODE_RECIPE_QUERY,
-      MODE_INVENTORY_QUERY})
+      MODE_INVENTORY_QUERY, MODE_SWAP_ORDER})
       [event.element.selected_index] or MODE_PRODUCTION_ORDER
     reset_all_modes(record)
     sync_mode_visual(record)
@@ -714,6 +769,15 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     -- 显示顺序为仅流体、仅物体、不限制；查询全部和按输入查询共用同一过滤配置。
     record.config.query_type = ({Config.query_type.fluid, Config.query_type.item, Config.query_type.all})
       [event.element.selected_index] or Config.query_type.all
+    return
+  end
+  if event.element.name == "bmsc-swap-output-mode" then
+    local record = current_record(event.player_index)
+    if record then
+      record.config.swap_output_mode = ({"fluid", "item", "all", "all_with_signals"})
+        [event.element.selected_index] or "fluid"
+      reset_swap_timer(record)
+    end
     return
   end
   if event.element.name == "bmsc-remember-order" then
@@ -754,9 +818,53 @@ script.on_event(defines.events.on_gui_click, function(event)
   local player = game.get_player(event.player_index)
   local record = current_record(event.player_index)
 
+  local picker_consumed, picker_result = SignalPicker.on_click(event)
+  if picker_consumed then
+    if picker_result and record then
+      local target = picker_result.target
+      local condition = target and record.config.swap_conditions[target.condition]
+      local operand = condition and condition[target.side]
+      if operand then
+        if picker_result.signal then
+          operand.signal = picker_result.signal
+        else
+          operand.signal = nil
+          operand.constant = picker_result.constant or 0
+        end
+        Gui.rebuild_swap_conditions(player.gui.screen[Gui.name], record.config.swap_conditions)
+        reset_swap_timer(record)
+      end
+    end
+    return
+  end
+
   -- 仅处理主 GUI 输入/输出面板中的信号图标；不改变槽位控件和数字角标布局。
   -- 普通 sprite-button 不会自动执行工厂百科快捷操作，因此显式补上原版 Alt+左键行为。
   local tags = event.element.tags or {}
+  if tags.bmsc_swap_operand and record then
+    local condition = record.config.swap_conditions[tags.bmsc_swap_condition]
+    local operand = condition and condition[tags.bmsc_swap_side]
+    if operand then
+      SignalPicker.open(player,
+        {condition = tags.bmsc_swap_condition, side = tags.bmsc_swap_side}, operand)
+    end
+    return
+  end
+  if tags.bmsc_swap_relation and record then
+    local condition = record.config.swap_conditions[tags.bmsc_swap_relation]
+    if condition then condition.relation = condition.relation == "and" and "or" or "and" end
+    Gui.rebuild_swap_conditions(event.element, record.config.swap_conditions)
+    reset_swap_timer(record)
+    return
+  end
+  if tags.bmsc_swap_delete and record then
+    if #record.config.swap_conditions > 1 then
+      table.remove(record.config.swap_conditions, tags.bmsc_swap_delete)
+      Gui.rebuild_swap_conditions(event.element, record.config.swap_conditions)
+      reset_swap_timer(record)
+    end
+    return
+  end
   if tags.bmsc_signal_panel_icon then
     if event.alt and event.button == defines.mouse_button_type.left then
       local prototype_group = tags.bmsc_signal_type == "fluid" and prototypes.fluid
@@ -782,6 +890,19 @@ script.on_event(defines.events.on_gui_click, function(event)
     end
     return
   end
+  if event.element.name == "bmsc-swap-add-condition" and record then
+    record.config.swap_conditions[#record.config.swap_conditions + 1] = {
+      relation = "or", first = {red = true, green = true, constant = 0}, comparator = "<",
+      second = {red = true, green = true, constant = 0}}
+    Gui.rebuild_swap_conditions(event.element, record.config.swap_conditions)
+    reset_swap_timer(record)
+    return
+  end
+  if event.element.name == "bmsc-clear-swap" and record then
+    MODES[MODE_SWAP_ORDER].clear(record)
+    write_outputs(record, MODES[MODE_SWAP_ORDER].calculate(record))
+    return
+  end
   if event.element.name == "bmsc-description-toggle" then
     if record and record.entity.valid then
       -- combinator_description 是 Factorio 为组合器提供的原生说明字段，会显示并随蓝图保存。
@@ -804,6 +925,18 @@ script.on_event(defines.events.on_gui_click, function(event)
   if event.element.name == "bmsc-close" then
     Gui.close(player)
     state().player_gui[event.player_index] = nil
+  end
+end)
+
+script.on_event(defines.events.on_gui_checked_state_changed, function(event)
+  local tags = event.element.tags or {}
+  if not tags.bmsc_swap_condition then return end
+  local record = current_record(event.player_index)
+  local condition = record and record.config.swap_conditions[tags.bmsc_swap_condition]
+  local operand = condition and condition[tags.bmsc_swap_side]
+  if operand and (tags.bmsc_swap_color == "red" or tags.bmsc_swap_color == "green") then
+    operand[tags.bmsc_swap_color] = event.element.state
+    reset_swap_timer(record)
   end
 end)
 
@@ -837,4 +970,13 @@ script.on_event(defines.events.on_entity_settings_pasted, function(event)
   end
 end)
 
-script.on_nth_tick(TICK_INTERVAL, update_all)
+-- 运算间隔也是 30 时用同一个处理器顺序刷新，避免为同一周期重复注册。
+if TICK_INTERVAL == 30 then
+  script.on_nth_tick(30, function()
+    update_all()
+    refresh_open_timeout_displays()
+  end)
+else
+  script.on_nth_tick(TICK_INTERVAL, update_all)
+  script.on_nth_tick(30, refresh_open_timeout_displays)
+end

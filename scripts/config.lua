@@ -8,7 +8,8 @@ Config.mode = {
   production_order = "production_order",
   supermarket_order = "supermarket_order",
   recipe_query = "recipe_query",
-  inventory_query = "inventory_query"
+  inventory_query = "inventory_query",
+  swap_order = "swap_order"
 }
 
 Config.query_type = {
@@ -69,7 +70,15 @@ function Config.default()
     recursion_output_mode = "single",            -- 参数：超市订单输出单项或全部结果。
     sequential_production = true,                -- 参数：single 模式是否按订单顺序逐个完成。
     recursion_timeout = 0,                       -- 参数：single 无变化轮换秒数；0 表示禁用。
-    recursion_timeout_reset_signal = nil         -- 参数：绿线中为正数时重置超市订单超时。
+    recursion_timeout_reset_signal = nil,        -- 参数：绿线中为正数时重置超市订单超时。
+    swap_output_mode = "fluid",                 -- 参数：切换订单输出的信号类型。
+    swap_timeout = 0,                            -- 参数：条件持续满足多久后切换排列；0 表示直通。
+    swap_conditions = {{                         -- 参数：切换计时条件；relation 表示与前一条的关系。
+      relation = "or",
+      first = {red = true, green = true, constant = 0},
+      comparator = "<",
+      second = {red = true, green = true, constant = 0}
+    }}
   }
 end
 
@@ -81,7 +90,8 @@ function Config.normalize(source)
   local config = Config.default()
   if type(source) ~= "table" then return config end
   if source.mode == Config.mode.production_order or source.mode == Config.mode.supermarket_order
-    or source.mode == Config.mode.recipe_query or source.mode == Config.mode.inventory_query then
+    or source.mode == Config.mode.recipe_query or source.mode == Config.mode.inventory_query
+    or source.mode == Config.mode.swap_order then
     config.mode = source.mode
   elseif source.mode == LEGACY_ORDER_RECURSION then
     config.mode = Config.mode.supermarket_order
@@ -134,6 +144,32 @@ function Config.normalize(source)
     config.recursion_timeout = math.max(0, source.recursion_timeout)
   end
   config.recursion_timeout_reset_signal = Config.normalize_signal(source.recursion_timeout_reset_signal)
+  if source.swap_output_mode == "fluid" or source.swap_output_mode == "item"
+    or source.swap_output_mode == "all" or source.swap_output_mode == "all_with_signals" then
+    config.swap_output_mode = source.swap_output_mode
+  end
+  if type(source.swap_timeout) == "number" then config.swap_timeout = math.max(0, source.swap_timeout) end
+  if type(source.swap_conditions) == "table" then
+    config.swap_conditions = {}
+    for _, condition in ipairs(source.swap_conditions) do
+      if type(condition) == "table" then
+        local first = type(condition.first) == "table" and condition.first or {}
+        local second = type(condition.second) == "table" and condition.second or {}
+        local comparators = {['<']=true, ['>']=true, ['=']=true, ['<=']=true, ['>=']=true, ['~=']=true}
+        config.swap_conditions[#config.swap_conditions + 1] = {
+          relation = condition.relation == "and" and "and" or "or",
+          first = {signal = type(first.signal) == "table" and first.signal or nil,
+            red = first.red ~= false, green = first.green ~= false,
+            constant = tonumber(first.constant) or 0},
+          comparator = comparators[condition.comparator] and condition.comparator or "<",
+          second = {signal = type(second.signal) == "table" and second.signal or nil,
+            red = second.red ~= false, green = second.green ~= false,
+            constant = tonumber(second.constant) or 0}
+        }
+      end
+    end
+    if #config.swap_conditions == 0 then config.swap_conditions = Config.default().swap_conditions end
+  end
   return config
 end
 

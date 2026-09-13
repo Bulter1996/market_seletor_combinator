@@ -83,6 +83,24 @@ local function overlay_four_way(background, foreground)
   return result
 end
 
+---把原版 signal-X 虚拟信号缩放到小屏幕中央，并染成与其他自定义模式一致的蓝色。
+local function four_way_cross_signal()
+  local signal = data.raw["virtual-signal"]["signal-X"]
+  local function sprite(shift)
+    return util.draw_as_glow{
+      filename = signal.icon,
+      size = signal.icon_size or 64,
+      scale = 0.18,
+      shift = shift,
+      tint = {r = 0.15, g = 0.85, b = 1, a = 1}
+    }
+  end
+  return {
+    north = sprite(util.by_pixel(0, -4.5)), east = sprite(util.by_pixel(0, -10.5)),
+    south = sprite(util.by_pixel(0, -4.5)), west = sprite(util.by_pixel(0, -10.5))
+  }
+end
+
 ---把自定义模式外观安装到复制出来的选择运算器原型。
 ---`count_symbol_sprites` 对应生产订单模式使用的 operation="count"；
 ---`max_symbol_sprites` 对应超市订单模式使用的最大值选择；`min_symbol_sprites` 则供
@@ -94,6 +112,7 @@ function ModeSymbols.apply(entity)
   entity.max_symbol_sprites = overlay_four_way(
     four_way_base_screen(), four_way_symbol("supermarket-order.png"))
   entity.min_symbol_sprites = four_way_symbol("recipe-query.png")
+  entity.random_symbol_sprites = overlay_four_way(four_way_base_screen(), four_way_cross_signal())
 end
 
 return ModeSymbols

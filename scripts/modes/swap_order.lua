@@ -88,14 +88,12 @@ function Mode.reset(record)
   -- 模式暂时失活时只停止计时；排列只允许由输入变化或玩家清空恢复。
   record.swap_condition_tick = nil
   record.swap_condition_results = nil
-  record.swap_elapsed_seconds = 0
 end
 
 function Mode.clear(record)
   record.swap_signature = nil
   record.swap_permutation = nil
   record.swap_condition_tick = nil
-  record.swap_elapsed_seconds = 0
 end
 
 function Mode.save_state(record)
@@ -108,7 +106,6 @@ function Mode.restore_state(record, saved)
   record.swap_signature = saved.signature
   record.swap_permutation = saved.permutation
   record.swap_condition_tick = saved.condition_tick
-  record.swap_elapsed_seconds = 0
 end
 
 function Mode.calculate(record)
@@ -131,11 +128,9 @@ function Mode.calculate(record)
   local timeout = tonumber(record.config.swap_timeout) or 0
   local all_conditions_met, condition_results = conditions_met(record.config.swap_conditions, inputs)
   record.swap_condition_results = condition_results
-  local elapsed_seconds = 0
   if timeout > 0 and #entries > 1 and all_conditions_met then
     record.swap_condition_tick = record.swap_condition_tick or game.tick
     local elapsed_ticks = game.tick - record.swap_condition_tick
-    elapsed_seconds = math.min(timeout, elapsed_ticks / 60)
     if elapsed_ticks >= timeout * 60 then
       next_permutation(record.swap_permutation)
       record.swap_condition_tick = game.tick
@@ -143,7 +138,6 @@ function Mode.calculate(record)
   else
     record.swap_condition_tick = nil
   end
-  record.swap_elapsed_seconds = elapsed_seconds
 
   local outputs = {}
   for output_index, source_index in ipairs(record.swap_permutation or {}) do

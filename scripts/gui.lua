@@ -479,6 +479,18 @@ local function add_numeric_slider(parent, caption, name, value, allow_decimal, t
   return textfield
 end
 
+---在超时输入框右侧追加同尺寸的只读计时框，三个模式共用同一布局。
+local function add_timeout_slider(parent, caption, name, value, allow_decimal, tooltip, visible, label_name)
+  local input = add_numeric_slider(
+    parent, caption, name, value, allow_decimal, tooltip, visible, label_name)
+  local elapsed = input.parent.add{
+    type = "textfield", name = name .. "-elapsed", style = "short_slider_value_textfield",
+    text = "0.0", enabled = false, tooltip = {"bmsc.timeout-elapsed"}
+  }
+  elapsed.style.width = 64
+  return input
+end
+
 ---校验生产订单界面中的两个材料倍率，并同步输入框的红色错误背景。
 ---无效时保留玩家输入，便于继续编辑；本函数只负责界面状态，不写入实体配置。
 ---@param source_element LuaGuiElement 任意一个材料倍率输入框或对应滑块。
@@ -697,22 +709,41 @@ local function update_condition_operand_styles(parent, fulfilled)
   end
 end
 
----刷新蓝色条件满足态和当前计时；数据完全由模式层提供，GUI 不重复执行线路判断。
-function Gui.refresh_swap_runtime_state(source_element, fulfilled_conditions, elapsed_seconds)
+local function refresh_elapsed(fields, timeout_name, elapsed_seconds)
+  local controls = fields and fields[timeout_name .. "-controls"]
+  local elapsed = controls and controls[timeout_name .. "-elapsed"]
+  if not elapsed then return end
+  local text = string.format("%.1f", math.max(0, tonumber(elapsed_seconds) or 0))
+  if elapsed.text ~= text then elapsed.text = text end
+end
+
+---刷新三个模式的只读计时框；调用方只传秒数，GUI 不读取任何运行记录。
+function Gui.refresh_timeout_elapsed(source_element, production_elapsed, recursion_elapsed, swap_elapsed)
+  local window = Gui.containing_window(source_element)
+  local content = window and window["bmsc-content"]
+  if not content then return end
+  local production = content["bmsc-production-details"]
+  local production_settings = production and production["bmsc-production-settings"]
+  refresh_elapsed(production_settings and production_settings["bmsc-production-fields"],
+    "bmsc-production-timeout", production_elapsed)
+  local recursion = content["bmsc-recursion-details"]
+  local recursion_settings = recursion and recursion["bmsc-recursion-settings"]
+  refresh_elapsed(recursion_settings and recursion_settings["bmsc-recursion-fields"],
+    "bmsc-recursion-timeout", recursion_elapsed)
+  local swap = content["bmsc-swap-details"]
+  local swap_settings = swap and swap["bmsc-swap-settings"]
+  refresh_elapsed(swap_settings and swap_settings["bmsc-swap-fields"],
+    "bmsc-swap-timeout", swap_elapsed)
+end
+
+---刷新切换订单的蓝色条件满足态，不重建玩家正在操作的条件列表。
+function Gui.refresh_swap_condition_states(source_element, fulfilled_conditions)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
   local details = content and content["bmsc-swap-details"]
   local settings = details and details["bmsc-swap-settings"]
   local list = settings and settings["bmsc-swap-conditions"]
   if not (list and details.visible) then return end
-  local fields = settings["bmsc-swap-fields"]
-  local elapsed = fields and fields["bmsc-swap-elapsed"]
-  if elapsed then
-    local text = string.format("%.3f", math.max(0, tonumber(elapsed_seconds) or 0))
-    text = text:gsub("0+$", "")
-    text = text:gsub("%.$", "")
-    if elapsed.text ~= text then elapsed.text = text end
-  end
   for _, row in ipairs(list.children) do
     local index = (row.tags or {}).bmsc_swap_condition_row
     if index then
@@ -893,7 +924,7 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     config.material_demand_rate, true, {"bmsc.material-rate-tooltip"})
   add_numeric_slider(fields, {"bmsc.material-retention-rate"}, "bmsc-material-retention",
     config.material_retention_rate or 1, true, {"bmsc.material-retention-rate-tooltip"})
-  add_numeric_slider(fields, {"bmsc.production-timeout"}, "bmsc-production-timeout",
+  add_timeout_slider(fields, {"bmsc.production-timeout"}, "bmsc-production-timeout",
     config.production_timeout or 0, true, {"bmsc.production-timeout-tooltip"})
   add_labeled(fields, {"bmsc.output-mode"}, {type = "drop-down", name = "bmsc-output",
     items = {{"bmsc.only-item"}, {"bmsc.only-material"}, {"bmsc.all"}, {"bmsc.all-separate-signal"}},
@@ -938,27 +969,10 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   recursion_fields.add{type = "drop-down", name = "bmsc-sequential-production",
     items = {{"bmsc.yes"}, {"bmsc.no"}}, selected_index = config.sequential_production ~= false and 1 or 2,
     tooltip = {"bmsc.sequential-production-tooltip"}, visible = timeout_visible}
-  -- 超时只属于 single 模式；为标签和输入框命名，切换输出模式时可以同时显隐。
-  recursion_fields.add{type = "label", name = "bmsc-recursion-timeout-label",
-    caption = {"bmsc.recursion-timeout"}, visible = timeout_visible}
-  -- 此参数需要随 single/all 模式显隐，因此保留带名称的标签，并将整个滑块控件 flow 命名。
-  local timeout_controls = recursion_fields.add{type = "flow", name = "bmsc-recursion-timeout-controls",
-    direction = "horizontal", visible = timeout_visible}
-  timeout_controls.style.vertical_align = "center"
-  timeout_controls.style.horizontal_spacing = 8
-  local timeout_slider = timeout_controls.add{type = "slider", name = "bmsc-recursion-timeout-slider",
-    style = "notched_slider", minimum_value = 1,
-    maximum_value = #Gui.slider_profiles["bmsc-recursion-timeout"],
-    value = nearest_slider_index(config.recursion_timeout or 0,
-      Gui.slider_profiles["bmsc-recursion-timeout"]), value_step = 1, discrete_values = true,
-    tooltip = {"bmsc.recursion-timeout-tooltip"}, tags = {bmsc_numeric_input = "bmsc-recursion-timeout"}}
-  timeout_slider.style.width = 150
-  local timeout_input = timeout_controls.add{type = "textfield", name = "bmsc-recursion-timeout",
-    style = "short_slider_value_textfield", text = tostring(config.recursion_timeout or 0),
-    numeric = true, allow_decimal = true, allow_negative = false,
-    tooltip = {"bmsc.recursion-timeout-tooltip"},
-    tags = {bmsc_numeric_slider = "bmsc-recursion-timeout-slider"}}
-  timeout_input.style.width = 64
+  -- 计时框位于超时输入框之后，并随 single/all 模式一起显隐。
+  add_timeout_slider(recursion_fields, {"bmsc.recursion-timeout"}, "bmsc-recursion-timeout",
+    config.recursion_timeout or 0, true, {"bmsc.recursion-timeout-tooltip"}, timeout_visible,
+    "bmsc-recursion-timeout-label")
   -- 订单递归模式独立绑定同一个公共信号面板函数。
   Gui.add_signal_panel(recursion_details, player)
 
@@ -1021,12 +1035,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     items = {{"bmsc.swap-only-fluid"}, {"bmsc.swap-only-item"}, {"bmsc.swap-all"},
       {"bmsc.swap-all-with-signals"}},
     selected_index = ({fluid = 1, item = 2, all = 3, all_with_signals = 4})[config.swap_output_mode] or 1})
-  add_numeric_slider(swap_fields, {"bmsc.swap-timeout"}, "bmsc-swap-timeout",
+  add_timeout_slider(swap_fields, {"bmsc.swap-timeout"}, "bmsc-swap-timeout",
     config.swap_timeout or 0, true, {"bmsc.swap-timeout-tooltip"})
-  local elapsed = add_labeled(swap_fields, {"bmsc.swap-elapsed"}, {
-    type = "textfield", name = "bmsc-swap-elapsed", style = "short_slider_value_textfield",
-    text = "0", enabled = false})
-  elapsed.style.width = 64
   swap_settings.add{type = "button", name = "bmsc-clear-swap", caption = {"bmsc.clear-swap"}}
   swap_settings.add{type = "label", caption = {"bmsc.conditions"}, style = "heading_2_label"}
   local conditions = swap_settings.add{type = "scroll-pane", name = "bmsc-swap-conditions",

@@ -411,6 +411,32 @@ local function write_outputs(record, outputs)
   update_hover_tooltip(record, tooltip_outputs)
 end
 
+local function timeout_elapsed_seconds(start_tick, timeout, active)
+  timeout = tonumber(timeout) or 0
+  if not (active and start_tick and timeout > 0) then return 0 end
+  return math.min(timeout, math.max(0, (game.tick - start_tick) / 60))
+end
+
+local function refresh_timeout_display(player, record)
+  local mode = record.config.mode
+  Gui.refresh_timeout_elapsed(
+    player.gui.screen[Gui.name],
+    timeout_elapsed_seconds(record.production_order_changed_tick, record.config.production_timeout,
+      mode == MODE_PRODUCTION_ORDER and record.production_order_output_count ~= nil),
+    timeout_elapsed_seconds(record.recursion_output_changed_tick, record.config.recursion_timeout,
+      mode == MODE_SUPERMARKET_ORDER and record.recursion_output_count ~= nil),
+    timeout_elapsed_seconds(record.swap_condition_tick, record.config.swap_timeout,
+      mode == MODE_SWAP_ORDER))
+end
+
+local function refresh_open_timeout_displays()
+  for player_index, unit in pairs(state().player_gui) do
+    local player = game.get_player(player_index)
+    local record = state().combinators[unit]
+    if player and record then refresh_timeout_display(player, record) end
+  end
+end
+
 ---定时更新所有市场选择运算器，并清除已经失效的实体记录。
 ---@return nil
 local function update_all()
@@ -436,8 +462,7 @@ local function update_all()
     if player and record then
       Gui.refresh_connection_status(
         player, record.entity, record.gui_output_networks, record.production_order_diagnostics)
-      Gui.refresh_swap_runtime_state(
-        player.gui.screen[Gui.name], record.swap_condition_results, record.swap_elapsed_seconds)
+      Gui.refresh_swap_condition_states(player.gui.screen[Gui.name], record.swap_condition_results)
     end
   end
 end
@@ -516,8 +541,8 @@ script.on_event(defines.events.on_gui_opened, function(event)
     record.config = normalize_runtime_config(record.config)
     Gui.open(
       player, event.entity, record.config, record.gui_output_networks, record.production_order_diagnostics)
-    Gui.refresh_swap_runtime_state(
-      player.gui.screen[Gui.name], record.swap_condition_results, record.swap_elapsed_seconds)
+    Gui.refresh_swap_condition_states(player.gui.screen[Gui.name], record.swap_condition_results)
+    refresh_timeout_display(player, record)
     state().player_gui[player.index] = event.entity.unit_number
   end
 end)
@@ -579,7 +604,6 @@ end)
 
 local function reset_swap_timer(record)
   record.swap_condition_tick = nil
-  record.swap_elapsed_seconds = 0
 end
 
 ---把一个已经校验的数值写入其对应配置字段。
@@ -913,4 +937,13 @@ script.on_event(defines.events.on_entity_settings_pasted, function(event)
   end
 end)
 
-script.on_nth_tick(TICK_INTERVAL, update_all)
+-- 运算间隔也是 30 时用同一个处理器顺序刷新，避免为同一周期重复注册。
+if TICK_INTERVAL == 30 then
+  script.on_nth_tick(30, function()
+    update_all()
+    refresh_open_timeout_displays()
+  end)
+else
+  script.on_nth_tick(TICK_INTERVAL, update_all)
+  script.on_nth_tick(30, refresh_open_timeout_displays)
+end

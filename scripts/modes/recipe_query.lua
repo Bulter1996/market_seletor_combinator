@@ -76,6 +76,7 @@ function Mode.calculate(record)
     return outputs
   end
 
+  local requirements = {}
   for _, query in ipairs(sorted_queries) do
     local signal, specified_recipe = Util.resolve_recipe_input(
       query.entry.signal, record.config.production_machine)
@@ -85,11 +86,12 @@ function Mode.calculate(record)
       local product_amount = Util.recipe_product_amount(recipe, signal)
       if product_amount > 0 then
         local crafts = math.ceil(query.entry.count / product_amount)
-        add_recipe_ingredients(outputs, recipe, crafts)
+        requirements[#requirements + 1] = {recipe = recipe, crafts = crafts}
       end
     end
   end
-  return outputs
+  return Util.limit_recipe_materials_by_cache(
+    requirements, record.config.recipe_query_cache_grid_number or 0)
 end
 
 return Mode

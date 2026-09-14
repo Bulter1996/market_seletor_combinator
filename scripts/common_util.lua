@@ -52,8 +52,8 @@ end
 
 ---把物品、流体或配方输入解析为实际产品；配方输入同时返回指定配方。
 ---@param signal SignalID 输入信号。
----@param machine_name string 当前生产机器实体原型名。
----@return SignalID|nil product_signal 产品信号；配方无产物或机器不支持时为 nil。
+---@param machine_name string|nil 当前生产机器实体原型名；省略时不限制制造类别。
+---@return SignalID|nil product_signal 产品信号；配方无产物或不受指定机器支持时为 nil。
 ---@return LuaRecipePrototype|nil specified_recipe 配方输入指定的配方；普通产品输入为 nil。
 function Util.resolve_recipe_input(signal, machine_name)
   if Util.is_recipe_signal(signal) then
@@ -61,7 +61,7 @@ function Util.resolve_recipe_input(signal, machine_name)
   end
   if not (signal and signal.type == "recipe") then return nil, nil end
   local recipe = prototypes and prototypes.recipe and prototypes.recipe[signal.name]
-  if not (recipe and Util.machine_supports(machine_name, recipe)) then return nil, nil end
+  if not recipe or (machine_name and not Util.machine_supports(machine_name, recipe)) then return nil, nil end
   local product = recipe.main_product or (recipe.products and recipe.products[1])
   if not (product and product.name) then return nil, nil end
   return Util.make_signal(product.type, product.name, signal.quality), recipe
@@ -309,6 +309,81 @@ function Util.add_output(outputs, signal, count)
     outputs[key] = {signal = Util.make_signal(signal.type, signal.name, signal.quality), count = 0}
   end
   outputs[key].count = Util.clamp_int32(outputs[key].count + count)
+end
+
+---按缓存格上限缩放一组配方需求；单个配方时与生产订单原有完整批次算法等价。
+---液体和不可装箱物品不占缓存格，始终保留完整需求；多个配方按各自制造次数同比缩放。
+---@param requirements table[] 每项包含 recipe 和正整数 crafts。
+---@param max_slots integer 允许使用的缓存格数；0 表示不限制。
+---@return table outputs 可写入线路的原料集合。
+function Util.limit_recipe_materials_by_cache(requirements, max_slots)
+  local full_outputs = {}
+  local maximum_crafts = 0
+  for _, requirement in ipairs(requirements or {}) do
+    local crafts = math.max(0, math.floor(tonumber(requirement.crafts) or 0))
+    local recipe = requirement.recipe
+    if crafts > 0 and recipe then
+      maximum_crafts = math.max(maximum_crafts, crafts)
+      for _, ingredient in pairs(recipe.ingredients or {}) do
+        Util.add_output(full_outputs,
+          Util.make_signal(ingredient.type, ingredient.name, "normal"), ingredient.amount * crafts)
+      end
+    end
+  end
+  max_slots = math.max(0, math.floor(tonumber(max_slots) or 0))
+  if max_slots == 0 then return full_outputs end
+
+  local outputs = {}
+  local cacheable, stack_sizes = {}, {}
+  for key, entry in pairs(full_outputs) do
+    local prototype = (entry.signal.type or "item") == "item"
+      and prototypes.item and prototypes.item[entry.signal.name] or nil
+    if prototype and not prototype.has_flag("only-in-cursor") then
+      cacheable[key] = true
+      stack_sizes[key] = prototype.stack_size or 1
+    else
+      Util.add_output(outputs, entry.signal, entry.count)
+    end
+  end
+  if not next(cacheable) or maximum_crafts == 0 then return outputs end
+
+  local function scaled_outputs(scale)
+    local scaled = {}
+    for _, requirement in ipairs(requirements or {}) do
+      local requested = math.max(0, math.floor(tonumber(requirement.crafts) or 0))
+      local crafts = requested > 0 and math.ceil(requested * scale / maximum_crafts) or 0
+      for _, ingredient in pairs(requirement.recipe and requirement.recipe.ingredients or {}) do
+        local signal = Util.make_signal(ingredient.type, ingredient.name, "normal")
+        if cacheable[Util.signal_key(signal)] then
+          Util.add_output(scaled, signal, ingredient.amount * crafts)
+        end
+      end
+    end
+    return scaled
+  end
+
+  local function slots_for(scale)
+    local slots = 0
+    for key, entry in pairs(scaled_outputs(scale)) do
+      slots = slots + math.ceil(entry.count / stack_sizes[key])
+    end
+    return slots
+  end
+
+  local low, high, fitted = 1, maximum_crafts, 0
+  while low <= high do
+    local middle = math.floor((low + high) / 2)
+    if slots_for(middle) <= max_slots then
+      fitted = middle
+      low = middle + 1
+    else
+      high = middle - 1
+    end
+  end
+  if fitted > 0 then
+    for _, entry in pairs(scaled_outputs(fitted)) do Util.add_output(outputs, entry.signal, entry.count) end
+  end
+  return outputs
 end
 
 ---把以信号键索引的输出集合转换为稳定排序数组。

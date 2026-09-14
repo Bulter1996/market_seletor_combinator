@@ -5,9 +5,9 @@ local Util = require("scripts.common_util")
 local Config = require("scripts.config")
 local Mode = {
   name = "inventory_query",                       -- 模式注册名，必须与 config.lua 的值一致。
-  -- 与配方查询共用问号屏幕；极大索引保证原生选择逻辑不产生额外线路输出。
-  visual_parameters = {operation = "select", select_max = false, index_constant = 2147483647},
-  visual_revision = 1
+  -- 借用未被其他模式使用的堆叠大小屏幕槽，显示带蓝色遮罩的铁箱图标。
+  visual_operation = "stack-size",
+  visual_revision = 2
 }
 
 local REQUIRED_MOD = "LinkedChestAndPipe"
@@ -47,8 +47,9 @@ end
 ---@param signal SignalID|nil 输入信号。
 ---@param query_type string 查询类型限制。
 ---@return nil
-local function add_query_signal(signals, signal, query_type, machine_name)
-  local product_signal = Util.resolve_recipe_input(signal, machine_name)
+local function add_query_signal(signals, signal, query_type)
+  -- 库存查询只需要配方产物，不应受其他模式的生产机器配置限制。
+  local product_signal = Util.resolve_recipe_input(signal)
   if not product_signal or not matches_query_type(product_signal, query_type) then return end
   local safe_signal = Util.make_signal(product_signal.type, product_signal.name, product_signal.quality)
   signals[Util.signal_key(safe_signal)] = safe_signal
@@ -66,7 +67,7 @@ local function add_record_inputs(signals, record, query_type)
   }) do
     local _, entries = Util.read_network(record.entity, connector_id)
     for _, entry in pairs(entries) do
-      add_query_signal(signals, entry.signal, query_type, record.config.production_machine)
+      add_query_signal(signals, entry.signal, query_type)
     end
   end
 end

@@ -2,6 +2,7 @@
 -- 本文件只实现该模式的选择、记忆与迟滞规则；线路和配方等通用操作来自 common_util。
 
 local Util = require("scripts.common_util")
+local Conditions = require("scripts.conditions")
 local Mode = {
   name = "production_order",                         -- 模式注册名，必须与 config.lua 的值一致。
   visual_operation = "count"                         -- 仅借用原版“输入计数”的 # 屏幕动画。
@@ -16,6 +17,7 @@ function Mode.reset(record)
   record.production_order_output_count = nil
   record.production_order_changed_tick = nil
   record.production_order_diagnostics = nil
+  record.production_timeout_condition_results = nil
   record.detail_outputs = nil
 end
 
@@ -68,73 +70,6 @@ local function recipe_material_shortages(recipe, inventory, multiplier, locked)
   return shortages
 end
 
----计算有限缓存最多能容纳多少个完整配方批次，并同比限制固体原料输出。
----所有固体原料共用同一个批次数，因此不会为了填满剩余格子而破坏配方比例。
----液体与 only-in-cursor 特殊物品不能放入普通箱子，不参与格数统计，始终保留完整需求量。
----@param outputs table 未限制的实际原料需求集合。
----@param minimum_outputs table 制造一份配方所需的最少原料集合。
----@param requested_crafts integer 当前商品缺口实际需要的制造次数。
----@param max_slots integer 可用缓存格数；0 表示不限制。
----@return table limited_outputs 应写入红线的原料需求集合。
-local function limit_materials_by_cache(outputs, minimum_outputs, requested_crafts, max_slots)
-  if max_slots <= 0 then return outputs end
-  local solids = {}
-  local limited_outputs = {}
-  for key, entry in pairs(outputs) do
-    local signal_type = entry.signal.type or "item"
-    local prototype = signal_type == "item" and prototypes.item[entry.signal.name] or nil
-    local cacheable = prototype and not prototype.has_flag("only-in-cursor")
-    if cacheable then
-      local stack_size = prototype and prototype.stack_size or 1
-      solids[#solids + 1] = {
-        key = key,
-        entry = entry,
-        stack_size = stack_size,
-        minimum = minimum_outputs[key]
-      }
-    else
-      Util.add_output(limited_outputs, entry.signal, entry.count)
-    end
-  end
-  table.sort(solids, function(a, b) return a.key < b.key end)
-  if #solids == 0 then return limited_outputs end
-
-  if max_slots < #solids then
-    -- 连“一种可缓存原料一格”都无法满足时，不输出任何可装箱原料，避免产生
-    -- 一个天然无法保持完整配方比例的缓存请求。液体等忽略项已保留在 limited_outputs。
-    return limited_outputs
-  end
-
-  ---计算指定完整制造次数所需占用的固体缓存格数。
-  ---@param crafts integer 待评估的完整制造次数。
-  ---@return integer slots 所有固体原料向上取整后的总格数。
-  local function slots_for_crafts(crafts)
-    local slots = 0
-    for _, solid in ipairs(solids) do
-      local per_craft = solid.minimum and solid.minimum.count or 0
-      slots = slots + math.ceil(per_craft * crafts / solid.stack_size)
-    end
-    return slots
-  end
-
-  -- 二分查找可容纳的最大完整批次数；无法组成下一批时，剩余格子按规则保持空闲。
-  local low, high, fitted_crafts = 1, requested_crafts, 0
-  while low <= high do
-    local middle = math.floor((low + high) / 2)
-    if slots_for_crafts(middle) <= max_slots then
-      fitted_crafts = middle
-      low = middle + 1
-    else
-      high = middle - 1
-    end
-  end
-  for _, solid in ipairs(solids) do
-    local count = solid.minimum and solid.minimum.count * fitted_crafts or 0
-    if count > 0 then Util.add_output(limited_outputs, solid.entry.signal, count) end
-  end
-  return limited_outputs
-end
-
 ---执行生产订单计算。
 ---新订单在商品库存低于订单量且原料达到需求阈值时启动；锁定后到商品达到上限或
 ---原料下降到保留阈值时结束。开启记忆后，绿色订单消失也不会立即取消当前订单；
@@ -143,21 +78,21 @@ end
 ---@return table outputs 标准输出集合，由 control.lua 统一写入隐藏代理。
 function Mode.calculate(record)
   local config = record.config
-  local inventory = Util.read_network(record.entity, defines.wire_connector_id.combinator_input_red)
-  local _, green_signals = Util.read_network(record.entity, defines.wire_connector_id.combinator_input_green)
+  local inputs = Conditions.read_inputs(record.entity)
+  local inventory = inputs.red
+  local green_signals = inputs.entries.green
   local timeout = tonumber(config.production_timeout) or 0
-  local reset_signal = config.production_timeout_reset_signal
-  local timeout_reset_active = timeout > 0 and Util.signal_count(green_signals, reset_signal) > 0
-  local reset_key = reset_signal and Util.signal_key(reset_signal)
+  local timeout_reset_active, condition_results = Conditions.evaluate(config.production_timeout_conditions, inputs)
+  record.production_timeout_condition_results = condition_results
+  timeout_reset_active = timeout > 0 and timeout_reset_active
+  local reset_keys = Conditions.signal_keys(config.production_timeout_conditions, "green")
   local demands = {}
-  -- 重置信号属于控制输入；即使玩家选择物品或配方信号，也不能同时生成一条生产订单。
+  -- 条件中启用绿色线路的信号属于控制输入，不能同时生成生产订单。
   for _, demand in pairs(green_signals) do
-    if not reset_key or Util.signal_key(demand.signal) ~= reset_key then demands[#demands + 1] = demand end
+    if not reset_keys[Util.signal_key(demand.signal)] then demands[#demands + 1] = demand end
   end
   local outputs = {}
   local product_outputs = {}
-  local material_outputs = {}
-  local minimum_material_outputs = {}
   local material_crafts = 0
   table.sort(demands, function(a, b) return Util.signal_key(a.signal) < Util.signal_key(b.signal) end)
 
@@ -295,9 +230,11 @@ function Mode.calculate(record)
   if selected_demand then
     local output_count = selected_output_count or product_output_count(selected_demand)
     if config.output_mode ~= "only_material" then
-      -- 产品信号表示“额外生产后的目标上限 - 当前库存”的实时缺口。
-      Util.add_output(outputs, selected_signal, output_count)
-      Util.add_output(product_outputs, selected_signal, output_count)
+      -- 配方订单内部仍按产品计算库存和缺口，但输出保留玩家输入的原配方信号。
+      local output_signal = selected_demand.signal.type == "recipe"
+        and Util.make_signal("recipe", selected_demand.signal.name) or selected_signal
+      Util.add_output(outputs, output_signal, output_count)
+      Util.add_output(product_outputs, output_signal, output_count)
     end
     if config.output_mode ~= "only_item" then
       -- 材料需求倍率只用于判断订单能否启动，不参与最终输出数量；这里按商品缺口
@@ -309,8 +246,6 @@ function Mode.calculate(record)
         local signal = Util.make_signal(ingredient.type, ingredient.name, "normal")
         local count = ingredient.amount * crafts
         Util.add_output(outputs, signal, count)
-        Util.add_output(material_outputs, signal, count)
-        Util.add_output(minimum_material_outputs, signal, ingredient.amount)
       end
     end
   end
@@ -321,9 +256,11 @@ function Mode.calculate(record)
   local selected_key = selected_demand and Util.signal_key(selected_demand.signal) or nil
   for _, demand in ipairs(demands) do
     local key = Util.signal_key(demand.signal)
-    if config.output_mode == "only_material" then
+    if key == selected_key then
+      diagnostics[key] = {kind = "active_output"}
+    elseif config.output_mode == "only_material" then
       diagnostics[key] = {kind = "only_material"}
-    elseif key ~= selected_key then
+    else
       local _, diagnostic = eligible(demand, false)
       diagnostics[key] = diagnostic or {
         kind = "waiting_for_order",
@@ -336,8 +273,9 @@ function Mode.calculate(record)
 
   if config.output_mode == "all_separate_signal" then
     -- 分离模式约定：红线只发送配方原料，绿线只发送当前订单商品。
-    local limited_materials = limit_materials_by_cache(
-      material_outputs, minimum_material_outputs, material_crafts, config.cache_grid_number or 0)
+    local requirements = selected_recipe and {{recipe = selected_recipe, crafts = material_crafts}} or {}
+    local limited_materials = Util.limit_recipe_materials_by_cache(
+      requirements, config.cache_grid_number or 0)
     record.detail_outputs = product_outputs
     return {separated = true, red = limited_materials, green = product_outputs}
   end

@@ -7,6 +7,10 @@
 local ModeSymbols = require("prototypes.mode_symbols")
 -- 主体外观也使用独立模块；data.lua 只负责组合各部分原型。
 local EntityGraphics = require("prototypes.entity_graphics")
+local GuiStyles = require("prototypes.gui_styles")
+
+-- 诊断色只扩展 GUI 样式，不参与实体或模式计算。
+GuiStyles.apply()
 
 -- 背包、配方和实体信息界面共同使用的自定义图标。
 -- 背包、配方与百科使用横向放大的专用图标；世界实体仍由 EntityGraphics 独立控制。

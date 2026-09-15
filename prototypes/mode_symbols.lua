@@ -101,10 +101,27 @@ local function four_way_cross_signal()
   }
 end
 
+---把原版铁箱图标缩放到小屏幕中央，并添加蓝色遮罩。
+local function four_way_inventory_chest()
+  local function sprite(shift)
+    return util.draw_as_glow{
+      filename = "__base__/graphics/icons/iron-chest.png",
+      size = 64,
+      scale = 0.17,
+      shift = shift,
+      tint = {r = 0.25, g = 0.7, b = 1, a = 1}
+    }
+  end
+  return {
+    north = sprite(util.by_pixel(0, -4.5)), east = sprite(util.by_pixel(0, -10.5)),
+    south = sprite(util.by_pixel(0, -4.5)), west = sprite(util.by_pixel(0, -10.5))
+  }
+end
+
 ---把自定义模式外观安装到复制出来的选择运算器原型。
 ---`count_symbol_sprites` 对应生产订单模式使用的 operation="count"；
----`max_symbol_sprites` 对应超市订单模式使用的最大值选择；`min_symbol_sprites` 则供
----配方查询和共享库存查询共用，使用蓝色的“?”素材。
+---`max_symbol_sprites` 对应超市订单模式使用的最大值选择；`min_symbol_sprites` 供
+---配方查询显示“?”，`time_symbol_sprites` 供共享库存查询显示蓝色铁箱。
 ---@param entity table 从原版 selector-combinator 深拷贝得到的实体原型。
 ---@return nil
 function ModeSymbols.apply(entity)
@@ -113,6 +130,11 @@ function ModeSymbols.apply(entity)
     four_way_base_screen(), four_way_symbol("supermarket-order.png"))
   entity.min_symbol_sprites = four_way_symbol("recipe-query.png")
   entity.random_symbol_sprites = overlay_four_way(four_way_base_screen(), four_way_cross_signal())
+  entity.time_symbol_sprites = overlay_four_way(four_way_base_screen(), four_way_inventory_chest())
+  -- 查询模式只借用时间操作的显示槽；清空默认信号，从源头禁止原版时间输出。
+  entity.default_game_tick_output_signal = nil
+  entity.default_day_tick_output_signal = nil
+  entity.default_day_length_output_signal = nil
 end
 
 return ModeSymbols

@@ -240,7 +240,9 @@ local function calculate(record)
   local machine = type(config) == "table" and prototypes.entity[config.production_machine]
   if type(config) ~= "table" or config.schema_revision ~= Config.schema_revision
     or not MODES[config.mode] or not (machine and machine.crafting_categories)
-    or not Config.material_rates_valid(config.material_demand_rate, config.material_retention_rate) then
+    or not Config.material_rates_valid(config.material_demand_rate, config.material_retention_rate)
+    or not Config.material_rates_valid(
+      config.recursion_material_demand_rate, config.recursion_material_retention_rate) then
     record.config = normalize_runtime_config(config)
   end
   -- 开发期热加载不一定触发实体重建；模式的安全显示参数发生变化后，在下一轮计算时
@@ -432,6 +434,8 @@ local function refresh_timeout_display(player, record)
     player.gui.screen[Gui.name],
     timeout_elapsed_seconds(record.production_order_changed_tick, record.config.production_timeout,
       mode == MODE_PRODUCTION_ORDER and record.production_order_output_count ~= nil),
+    timeout_elapsed_seconds(record.recursion_material_wait_tick, record.config.recursion_material_wait_time,
+      mode == MODE_SUPERMARKET_ORDER and record.recursion_material_wait_output ~= nil),
     timeout_elapsed_seconds(record.recursion_output_changed_tick, record.config.recursion_timeout,
       mode == MODE_SUPERMARKET_ORDER and record.recursion_output_count ~= nil),
     timeout_elapsed_seconds(record.swap_condition_tick, record.config.swap_timeout,
@@ -471,7 +475,11 @@ local function update_all()
     if player and record then
       Gui.refresh_connection_status(
         player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
-      Gui.refresh_swap_condition_states(player.gui.screen[Gui.name], record.swap_condition_results)
+      Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
+        record.production_timeout_condition_results)
+      Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
+        record.recursion_timeout_condition_results)
+      Gui.refresh_condition_states(player.gui.screen[Gui.name], "swap", record.swap_condition_results)
     end
   end
 end
@@ -550,7 +558,11 @@ script.on_event(defines.events.on_gui_opened, function(event)
     record.config = normalize_runtime_config(record.config)
     Gui.open(
       player, event.entity, record.config, record.gui_output_networks, current_input_diagnostics(record))
-    Gui.refresh_swap_condition_states(player.gui.screen[Gui.name], record.swap_condition_results)
+    Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
+      record.production_timeout_condition_results)
+    Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
+      record.recursion_timeout_condition_results)
+    Gui.refresh_condition_states(player.gui.screen[Gui.name], "swap", record.swap_condition_results)
     refresh_timeout_display(player, record)
     state().player_gui[player.index] = event.entity.unit_number
   end
@@ -589,22 +601,6 @@ script.on_event(defines.events.on_gui_leave, function(event)
 end)
 
 script.on_event(defines.events.on_gui_elem_changed, function(event)
-  local reset_signal_field = ({
-    ["bmsc-production-timeout-reset-signal"] = "production_timeout_reset_signal",
-    ["bmsc-recursion-timeout-reset-signal"] = "recursion_timeout_reset_signal"
-  })[event.element.name]
-  if reset_signal_field then
-    local record = current_record(event.player_index)
-    if record then
-      record.config[reset_signal_field] = Config.normalize_signal(event.element.elem_value)
-      if reset_signal_field == "production_timeout_reset_signal" then
-        record.production_order_changed_tick = game.tick
-      else
-        record.recursion_output_changed_tick = game.tick
-      end
-    end
-    return
-  end
   if event.element.name ~= "bmsc-production-machine" and event.element.name ~= "bmsc-recursion-machine"
     and event.element.name ~= "bmsc-recipe-query-machine" then return end
   local record = current_record(event.player_index)
@@ -631,6 +627,36 @@ local function reset_swap_timer(record)
   record.swap_condition_tick = nil
 end
 
+local condition_config_fields = {
+  ["production-timeout"] = "production_timeout_conditions",
+  ["recursion-timeout"] = "recursion_timeout_conditions",
+  swap = "swap_conditions"
+}
+
+local timeout_monitor_fields = {
+  ["bmsc-production-timeout-monitor-item-changes"] = {
+    config = "production_timeout_monitor_item_changes", condition_set = "production-timeout"},
+  ["bmsc-recursion-timeout-monitor-item-changes"] = {
+    config = "recursion_timeout_monitor_item_changes", condition_set = "recursion-timeout"}
+}
+
+local function conditions_for(record, set_name)
+  local field = condition_config_fields[set_name]
+  return field and record.config[field] or nil
+end
+
+local function reset_condition_timer(record, set_name)
+  if set_name == "production-timeout" then
+    record.production_order_output_count = nil
+    record.production_order_changed_tick = nil
+  elseif set_name == "recursion-timeout" then
+    record.recursion_output_count = nil
+    record.recursion_output_changed_tick = nil
+  else
+    reset_swap_timer(record)
+  end
+end
+
 ---把一个已经校验的数值写入其对应配置字段。
 ---文本框和滑块共用这个入口，避免两类 GUI 事件分别维护一套参数名称映射。
 ---@param record table 当前组合器记录。
@@ -649,11 +675,33 @@ local function update_numeric_config(record, element_name, value)
     record.config.material_retention_rate = value
     return true
   end
+  if element_name == "bmsc-recursion-additional" then
+    record.config.recursion_additional_production_rate = value
+    return true
+  end
+  if element_name == "bmsc-recursion-material" then
+    if not Config.material_rates_valid(value, record.config.recursion_material_retention_rate) then return false end
+    record.config.recursion_material_demand_rate = value
+    return true
+  end
+  if element_name == "bmsc-recursion-material-retention" then
+    if not Config.material_rates_valid(record.config.recursion_material_demand_rate, value) then return false end
+    record.config.recursion_material_retention_rate = value
+    return true
+  end
   if element_name == "bmsc-production-timeout" then record.config.production_timeout = value; return true end
   if element_name == "bmsc-swap-timeout" then record.config.swap_timeout = value; return true end
   if element_name == "bmsc-cache-grid-number" then
     -- 缓存格数必须是非负整数；即使未来有调用方绕过 GUI，也不能写入负值或小数。
     record.config.cache_grid_number = math.max(0, math.floor(value))
+    return true
+  end
+  if element_name == "bmsc-recipe-query-cache-grid-number" then
+    record.config.recipe_query_cache_grid_number = math.max(0, math.floor(value))
+    return true
+  end
+  if element_name == "bmsc-recursion-material-wait-time" then
+    record.config.recursion_material_wait_time = value
     return true
   end
   if element_name == "bmsc-recursion-depth" then record.config.recurise_depth = math.floor(value); return true end
@@ -666,8 +714,9 @@ end
 ---@param element_name string 已更新的数值输入框名称。
 ---@return nil
 local function invalidate_numeric_runtime_state(record, element_name)
-  if element_name == "bmsc-recursion-depth" then
-    -- 新深度可能产生完全不同的递归终点，旧 single 锁定不能继续覆盖新计算结果。
+  if element_name == "bmsc-recursion-depth" or element_name == "bmsc-recursion-additional"
+    or element_name == "bmsc-recursion-material" or element_name == "bmsc-recursion-material-retention" then
+    -- 深度或迟滞参数变化后重新选择递归层级，不能沿用旧阈值下的运行状态。
     MODES[MODE_SUPERMARKET_ORDER].reset(record)
   elseif element_name == "bmsc-production-timeout" then
     -- 修改超时时间后从下个刷新周期重新计时，不能沿用旧参数下累计的静止时间。
@@ -676,6 +725,9 @@ local function invalidate_numeric_runtime_state(record, element_name)
   elseif element_name == "bmsc-recursion-timeout" then
     record.recursion_output_count = nil
     record.recursion_output_changed_tick = nil
+  elseif element_name == "bmsc-recursion-material-wait-time" then
+    record.recursion_material_wait_tick = nil
+    record.recursion_material_wait_output = nil
   elseif element_name == "bmsc-swap-timeout" then
     reset_swap_timer(record)
   end
@@ -686,12 +738,20 @@ script.on_event(defines.events.on_gui_text_changed, function(event)
   local record = current_record(event.player_index)
   local value = tonumber(event.element.text)
   if not record then return end
-  if event.element.name == "bmsc-material" or event.element.name == "bmsc-material-retention" then
+  if event.element.name == "bmsc-material" or event.element.name == "bmsc-material-retention"
+    or event.element.name == "bmsc-recursion-material"
+    or event.element.name == "bmsc-recursion-material-retention" then
     local valid, demand, retention = Gui.validate_material_rate_inputs(event.element)
     if valid then
       -- 两个输入框作为一个参数组同时提交，避免修改顺序受到旧配置值影响。
-      record.config.material_demand_rate = demand
-      record.config.material_retention_rate = retention
+      if event.element.name:find("bmsc-recursion-", 1, true) == 1 then
+        record.config.recursion_material_demand_rate = demand
+        record.config.recursion_material_retention_rate = retention
+        invalidate_numeric_runtime_state(record, event.element.name)
+      else
+        record.config.material_demand_rate = demand
+        record.config.material_retention_rate = retention
+      end
       Gui.sync_numeric_slider(event.element, value)
     end
     return
@@ -713,11 +773,19 @@ script.on_event(defines.events.on_gui_value_changed, function(event)
   -- slider_value 是离散档位索引；GUI 模块根据具体参数映射为倍率、秒数或递归深度。
   local textfield, value = Gui.apply_numeric_slider(event.element)
   if not (textfield and value) then return end
-  if textfield.name == "bmsc-material" or textfield.name == "bmsc-material-retention" then
+  if textfield.name == "bmsc-material" or textfield.name == "bmsc-material-retention"
+    or textfield.name == "bmsc-recursion-material"
+    or textfield.name == "bmsc-recursion-material-retention" then
     local valid, demand, retention = Gui.validate_material_rate_inputs(textfield)
     if valid then
-      record.config.material_demand_rate = demand
-      record.config.material_retention_rate = retention
+      if textfield.name:find("bmsc-recursion-", 1, true) == 1 then
+        record.config.recursion_material_demand_rate = demand
+        record.config.recursion_material_retention_rate = retention
+        invalidate_numeric_runtime_state(record, textfield.name)
+      else
+        record.config.material_demand_rate = demand
+        record.config.material_retention_rate = retention
+      end
     end
     return
   end
@@ -726,12 +794,22 @@ script.on_event(defines.events.on_gui_value_changed, function(event)
 end)
 script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   local event_tags = event.element.tags or {}
-  if event_tags.bmsc_swap_comparator then
+  if event_tags.bmsc_swap_comparator and event_tags.bmsc_condition_set then
     local record = current_record(event.player_index)
-    local condition = record and record.config.swap_conditions[event_tags.bmsc_swap_comparator]
+    local conditions = record and conditions_for(record, event_tags.bmsc_condition_set)
+    local condition = conditions and conditions[event_tags.bmsc_swap_comparator]
     if condition then
       condition.comparator = ({"<", ">", "=", "<=", ">=", "~="})[event.element.selected_index] or "<"
-      reset_swap_timer(record)
+      reset_condition_timer(record, event_tags.bmsc_condition_set)
+    end
+    return
+  end
+  local timeout_monitor = timeout_monitor_fields[event.element.name]
+  if timeout_monitor then
+    local record = current_record(event.player_index)
+    if record then
+      record.config[timeout_monitor.config] = event.element.selected_index == 1
+      reset_condition_timer(record, timeout_monitor.condition_set)
     end
     return
   end
@@ -751,9 +829,10 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   if event.element.name == "bmsc-multiple-recipe-support" then
     local record = current_record(event.player_index)
     if not record then return end
-    -- 第一项为“否”、第二项为“是”；配置立即保存，线路在下一全局刷新周期更新。
+    -- 第一项为“单个”、第二项为“所有”；缓存格数只在所有模式下参与输出限制。
     record.config.multiple_recipe_support = event.element.selected_index == 2
     MODES[MODE_RECIPE_QUERY].reset(record)
+    Gui.set_recipe_query_cache_grid_visible(event.element, record.config.multiple_recipe_support)
     return
   end
   if event.element.name == "bmsc-query-all" then
@@ -822,7 +901,8 @@ script.on_event(defines.events.on_gui_click, function(event)
   if picker_consumed then
     if picker_result and record then
       local target = picker_result.target
-      local condition = target and record.config.swap_conditions[target.condition]
+      local conditions = target and conditions_for(record, target.set_name)
+      local condition = conditions and conditions[target.condition]
       local operand = condition and condition[target.side]
       if operand then
         if picker_result.signal then
@@ -831,8 +911,8 @@ script.on_event(defines.events.on_gui_click, function(event)
           operand.signal = nil
           operand.constant = picker_result.constant or 0
         end
-        Gui.rebuild_swap_conditions(player.gui.screen[Gui.name], record.config.swap_conditions)
-        reset_swap_timer(record)
+        Gui.rebuild_conditions(player.gui.screen[Gui.name], target.set_name, conditions)
+        reset_condition_timer(record, target.set_name)
       end
     end
     return
@@ -841,27 +921,31 @@ script.on_event(defines.events.on_gui_click, function(event)
   -- 仅处理主 GUI 输入/输出面板中的信号图标；不改变槽位控件和数字角标布局。
   -- 普通 sprite-button 不会自动执行工厂百科快捷操作，因此显式补上原版 Alt+左键行为。
   local tags = event.element.tags or {}
-  if tags.bmsc_swap_operand and record then
-    local condition = record.config.swap_conditions[tags.bmsc_swap_condition]
+  if tags.bmsc_swap_operand and tags.bmsc_condition_set and record then
+    local conditions = conditions_for(record, tags.bmsc_condition_set)
+    local condition = conditions and conditions[tags.bmsc_swap_condition]
     local operand = condition and condition[tags.bmsc_swap_side]
     if operand then
       SignalPicker.open(player,
-        {condition = tags.bmsc_swap_condition, side = tags.bmsc_swap_side}, operand)
+        {set_name = tags.bmsc_condition_set, condition = tags.bmsc_swap_condition,
+          side = tags.bmsc_swap_side}, operand)
     end
     return
   end
-  if tags.bmsc_swap_relation and record then
-    local condition = record.config.swap_conditions[tags.bmsc_swap_relation]
+  if tags.bmsc_swap_relation and tags.bmsc_condition_set and record then
+    local conditions = conditions_for(record, tags.bmsc_condition_set)
+    local condition = conditions and conditions[tags.bmsc_swap_relation]
     if condition then condition.relation = condition.relation == "and" and "or" or "and" end
-    Gui.rebuild_swap_conditions(event.element, record.config.swap_conditions)
-    reset_swap_timer(record)
+    Gui.rebuild_conditions(event.element, tags.bmsc_condition_set, conditions)
+    reset_condition_timer(record, tags.bmsc_condition_set)
     return
   end
-  if tags.bmsc_swap_delete and record then
-    if #record.config.swap_conditions > 1 then
-      table.remove(record.config.swap_conditions, tags.bmsc_swap_delete)
-      Gui.rebuild_swap_conditions(event.element, record.config.swap_conditions)
-      reset_swap_timer(record)
+  if tags.bmsc_swap_delete and tags.bmsc_condition_set and record then
+    local conditions = conditions_for(record, tags.bmsc_condition_set)
+    if conditions and #conditions > 1 then
+      table.remove(conditions, tags.bmsc_swap_delete)
+      Gui.rebuild_conditions(event.element, tags.bmsc_condition_set, conditions)
+      reset_condition_timer(record, tags.bmsc_condition_set)
     end
     return
   end
@@ -890,12 +974,13 @@ script.on_event(defines.events.on_gui_click, function(event)
     end
     return
   end
-  if event.element.name == "bmsc-swap-add-condition" and record then
-    record.config.swap_conditions[#record.config.swap_conditions + 1] = {
+  if tags.bmsc_add_condition and tags.bmsc_condition_set and record then
+    local conditions = conditions_for(record, tags.bmsc_condition_set)
+    conditions[#conditions + 1] = {
       relation = "or", first = {red = true, green = true, constant = 0}, comparator = "<",
       second = {red = true, green = true, constant = 0}}
-    Gui.rebuild_swap_conditions(event.element, record.config.swap_conditions)
-    reset_swap_timer(record)
+    Gui.rebuild_conditions(event.element, tags.bmsc_condition_set, conditions)
+    reset_condition_timer(record, tags.bmsc_condition_set)
     return
   end
   if event.element.name == "bmsc-clear-swap" and record then
@@ -929,28 +1014,74 @@ script.on_event(defines.events.on_gui_click, function(event)
 end)
 
 script.on_event(defines.events.on_gui_checked_state_changed, function(event)
+  if event.element.name == "bmsc-recursion-strict-validation" then
+    local record = current_record(event.player_index)
+    if record then
+      record.config.recursion_strict_validation = event.element.state
+      MODES[MODE_SUPERMARKET_ORDER].reset(record)
+      -- 严格校验会改变整张订单能否输出；立即清空旧代理，避免在下个刷新周期前继续发送旧信号。
+      write_outputs(record, {})
+    end
+    return
+  end
   local tags = event.element.tags or {}
-  if not tags.bmsc_swap_condition then return end
+  if not (tags.bmsc_swap_condition and tags.bmsc_condition_set) then return end
   local record = current_record(event.player_index)
-  local condition = record and record.config.swap_conditions[tags.bmsc_swap_condition]
+  local conditions = record and conditions_for(record, tags.bmsc_condition_set)
+  local condition = conditions and conditions[tags.bmsc_swap_condition]
   local operand = condition and condition[tags.bmsc_swap_side]
   if operand and (tags.bmsc_swap_color == "red" or tags.bmsc_swap_color == "green") then
     operand[tags.bmsc_swap_color] = event.element.state
-    reset_swap_timer(record)
+    reset_condition_timer(record, tags.bmsc_condition_set)
   end
 end)
 
 -- 蓝图和设置复制事件：保证配置能随蓝图以及 Shift+右键/左键复制。
 script.on_event(defines.events.on_player_setup_blueprint, function(event)
-  local blueprint = event.stack
-  if not (blueprint and blueprint.valid_for_read and blueprint.is_blueprint) then return end
+  -- Ctrl+C 使用临时蓝图时 event.stack 可以为空；此时配置应写入可写 record，最后才回退
+  -- 到玩家当前正在设置的蓝图栈。三者都提供相同的实体标签读写接口。
+  local blueprint
+  if event.stack and event.stack.valid_for_read and event.stack.is_blueprint then
+    blueprint = event.stack
+  elseif event.record and event.record.valid and event.record.type == "blueprint"
+    and event.record.valid_for_write then
+    blueprint = event.record
+  else
+    local player = game.get_player(event.player_index)
+    local pending = player and player.blueprint_to_setup
+    if pending and pending.valid_for_read and pending.is_blueprint then blueprint = pending end
+  end
+  if not blueprint then return end
   for number, entity in pairs(event.mapping.get()) do
     if entity.valid and entity.name == ENTITY then
       local record = state().combinators[entity.unit_number]
-      if record then blueprint.set_blueprint_entity_tags(number, {bmsc = record.config}) end
+      if record then
+        local tags = blueprint.get_blueprint_entity_tags(number) or {}
+        tags.bmsc = normalize_runtime_config(record.config)
+        blueprint.set_blueprint_entity_tags(number, tags)
+      end
     end
   end
 end)
+
+local function apply_pasted_config(destination, source_config)
+  if not (destination and source_config) then return end
+  destination.config = normalize_runtime_config(source_config)
+  sync_mode_visual(destination)
+  reset_all_modes(destination)
+  write_outputs(destination, {})
+  -- 设置粘贴可以发生在目标窗口仍打开时；立即重建，避免界面继续显示旧参数。
+  for player_index, unit in pairs(state().player_gui) do
+    if unit == destination.entity.unit_number then
+      local player = game.get_player(player_index)
+      if player then
+        Gui.open(player, destination.entity, destination.config, {}, nil)
+        state().player_gui[player_index] = unit
+      end
+    end
+  end
+end
+
 script.on_event(defines.events.on_entity_settings_pasted, function(event)
   if event.destination.name ~= ENTITY then return end
   local destination = state().combinators[event.destination.unit_number]
@@ -959,16 +1090,18 @@ script.on_event(defines.events.on_entity_settings_pasted, function(event)
     -- table.deepcopy 只在数据阶段（data.lua）由 Factorio 提供，运行阶段（control.lua）不存在。
     -- normalize_config 会创建一张全新的配置表，并逐项复制、校验来源配置，因此也能避免
     -- 两台运算器意外共用同一张 table；其效果等同于这里真正需要的“安全深拷贝”。
-    destination.config = normalize_runtime_config(source.config)
-    sync_mode_visual(destination)
-
-    -- 运行缓存不属于配置，粘贴后由各模式自己的 reset 接口统一清除。
-    reset_all_modes(destination)
-    -- write_outputs 是上方定义的局部函数；传入空集合会清空代理槽位及悬浮信号。
-    -- 项目中并没有 clear_outputs，调用它时 Lua 会将其视为值为 nil 的全局变量。
-    write_outputs(destination, {})
+    apply_pasted_config(destination, source.config)
   end
 end)
+
+-- 把蓝图拖放到已经存在的实体上时不会触发建造事件，应直接应用蓝图携带的标签。
+if defines.events.on_blueprint_settings_pasted then
+  script.on_event(defines.events.on_blueprint_settings_pasted, function(event)
+    local entity = event.entity
+    if not (entity and entity.valid and entity.name == ENTITY and event.tags and event.tags.bmsc) then return end
+    apply_pasted_config(state().combinators[entity.unit_number], event.tags.bmsc)
+  end)
+end
 
 -- 运算间隔也是 30 时用同一个处理器顺序刷新，避免为同一周期重复注册。
 if TICK_INTERVAL == 30 then

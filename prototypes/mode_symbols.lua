@@ -121,7 +121,7 @@ end
 ---把自定义模式外观安装到复制出来的选择运算器原型。
 ---`count_symbol_sprites` 对应生产订单模式使用的 operation="count"；
 ---`max_symbol_sprites` 对应超市订单模式使用的最大值选择；`min_symbol_sprites` 供
----配方查询显示“?”，`stack_size_sprites` 供共享库存查询显示蓝色铁箱。
+---配方查询显示“?”，`time_symbol_sprites` 供共享库存查询显示蓝色铁箱。
 ---@param entity table 从原版 selector-combinator 深拷贝得到的实体原型。
 ---@return nil
 function ModeSymbols.apply(entity)
@@ -130,7 +130,11 @@ function ModeSymbols.apply(entity)
     four_way_base_screen(), four_way_symbol("supermarket-order.png"))
   entity.min_symbol_sprites = four_way_symbol("recipe-query.png")
   entity.random_symbol_sprites = overlay_four_way(four_way_base_screen(), four_way_cross_signal())
-  entity.stack_size_sprites = overlay_four_way(four_way_base_screen(), four_way_inventory_chest())
+  entity.time_symbol_sprites = overlay_four_way(four_way_base_screen(), four_way_inventory_chest())
+  -- 查询模式只借用时间操作的显示槽；清空默认信号，从源头禁止原版时间输出。
+  entity.default_game_tick_output_signal = nil
+  entity.default_day_tick_output_signal = nil
+  entity.default_day_length_output_signal = nil
 end
 
 return ModeSymbols

@@ -143,10 +143,12 @@ function Mode.calculate(record)
   end
 
   local selected_demand, selected_recipe, selected_signal
+  local selected_was_locked = false
   if config.remember_order and record.remembered_order then
     selected_recipe, _, selected_signal = eligible(record.remembered_order, true)
     if selected_recipe then
       selected_demand = record.remembered_order
+      selected_was_locked = true
     else
       Mode.reset(record)
     end
@@ -156,6 +158,7 @@ function Mode.calculate(record)
         selected_recipe, _, selected_signal = eligible(demand, true)
         if selected_recipe then
           selected_demand = demand
+          selected_was_locked = true
           if config.remember_order then
             record.remembered_order = {
               signal = Util.make_signal(demand.signal.type, demand.signal.name, demand.signal.quality),
@@ -168,15 +171,19 @@ function Mode.calculate(record)
     end
   end
 
-  -- 超时直接监控最终写入线路的产品数量。库存或订单变化只要让该值改变，就重新计时；
-  -- 只有输出数值连续 timeout 秒完全不变才释放当前订单并轮换。
+  -- 超时可选监控最终写入线路的产品数量；关闭后，数量变化只更新比较基准，不刷新计时。
   local timed_out_key
   local selected_output_count
   if selected_demand then
     local selected_key = Util.signal_key(selected_demand.signal)
     selected_output_count = product_output_count(selected_demand)
-    if record.production_order_output_count ~= selected_output_count then
+    local output_changed = record.production_order_output_count ~= selected_output_count
+    local reset_by_output = record.production_order_changed_tick == nil
+      or output_changed and config.production_timeout_monitor_item_changes ~= false
+    if output_changed then
       record.production_order_output_count = selected_output_count
+    end
+    if reset_by_output then
       record.production_order_changed_tick = game.tick
     elseif timeout > 0 then
       if timeout_reset_active then
@@ -212,6 +219,7 @@ function Mode.calculate(record)
       local recipe, _, signal = eligible(demand, false)
       if recipe then
         selected_demand, selected_recipe, selected_signal = demand, recipe, signal
+        selected_was_locked = false
         record.selected_request = Util.signal_key(demand.signal)
         selected_output_count = product_output_count(demand)
         record.production_order_output_count = selected_output_count
@@ -227,27 +235,109 @@ function Mode.calculate(record)
     end
   end
 
+  ---为有缺口且可制造的直接原料补充下一层配方明细；只展开一层，避免悬浮信息无限增长。
+  local function next_level_production(signal, shortage)
+    if shortage <= 0 then return nil end
+    local recipe = Util.find_recipe(record.entity.force, signal, config.production_machine)
+    local product_amount = recipe and Util.recipe_product_amount(recipe, signal) or 0
+    if product_amount <= 0 then return nil end
+    local crafts = math.ceil(shortage / product_amount)
+    local ingredients = {}
+    for _, ingredient in pairs(recipe.ingredients or {}) do
+      local child_signal = Util.make_signal(ingredient.type, ingredient.name, "normal")
+      local required = ingredient.amount * crafts
+      local stock = inventory[Util.signal_key(child_signal)] or 0
+      ingredients[#ingredients + 1] = {
+        signal = child_signal,
+        required = required,
+        stock = stock,
+        shortage = math.max(0, required - stock)
+      }
+    end
+    table.sort(ingredients, function(a, b)
+      return Util.signal_key(a.signal) < Util.signal_key(b.signal)
+    end)
+    return {
+      signal = Util.make_signal(signal.type, signal.name, signal.quality),
+      count = math.ceil(crafts * product_amount),
+      ingredients = ingredients
+    }
+  end
+
+  local selected_diagnostic
   if selected_demand then
     local output_count = selected_output_count or product_output_count(selected_demand)
+    local output_signal = selected_demand.signal.type == "recipe"
+      and Util.make_signal("recipe", selected_demand.signal.name) or selected_signal
     if config.output_mode ~= "only_material" then
       -- 配方订单内部仍按产品计算库存和缺口，但输出保留玩家输入的原配方信号。
-      local output_signal = selected_demand.signal.type == "recipe"
-        and Util.make_signal("recipe", selected_demand.signal.name) or selected_signal
       Util.add_output(outputs, output_signal, output_count)
       Util.add_output(product_outputs, output_signal, output_count)
     end
-    if config.output_mode ~= "only_item" then
-      -- 材料需求倍率只用于判断订单能否启动，不参与最终输出数量；这里按商品缺口
-      -- 向上取整到完整制造次数，保证缺口小于单次产量时仍至少请求一份配方原料。
-      local product_amount = Util.recipe_product_amount(selected_recipe, selected_signal)
-      local crafts = product_amount > 0 and math.ceil(output_count / product_amount) or 0
-      material_crafts = crafts
-      for _, ingredient in pairs(selected_recipe.ingredients) do
-        local signal = Util.make_signal(ingredient.type, ingredient.name, "normal")
-        local count = ingredient.amount * crafts
+    -- 诊断与线路输出共用同一制造次数，确保“本次需要”和实际材料信号口径一致。
+    -- 即使选择“仅产品”，悬浮信息仍展示完成当前缺口需要的全部直接原料。
+    local product_amount = Util.recipe_product_amount(selected_recipe, selected_signal)
+    local crafts = product_amount > 0 and math.ceil(output_count / product_amount) or 0
+    material_crafts = crafts
+    local ingredients = {}
+    local gate_rate = selected_was_locked and (config.material_retention_rate or 1)
+      or config.material_demand_rate
+    local gate_ready = true
+    for _, ingredient in pairs(selected_recipe.ingredients) do
+      local signal = Util.make_signal(ingredient.type, ingredient.name, "normal")
+      local count = ingredient.amount * crafts
+      local stock = inventory[Util.signal_key(signal)] or 0
+      local threshold = ingredient.amount * gate_rate
+      local ready = selected_was_locked and stock >= threshold or not selected_was_locked and stock > threshold
+      local shortage = math.max(0, count - stock)
+      ingredients[#ingredients + 1] = {
+        signal = signal,
+        required = count,
+        stock = stock,
+        shortage = shortage,
+        start_threshold = threshold,
+        threshold_comparator = selected_was_locked and ">=" or ">",
+        start_ready = ready,
+        production = next_level_production(signal, shortage)
+      }
+      gate_ready = gate_ready and ready
+      if config.output_mode ~= "only_item" then
         Util.add_output(outputs, signal, count)
       end
     end
+    table.sort(ingredients, function(a, b)
+      return Util.signal_key(a.signal) < Util.signal_key(b.signal)
+    end)
+
+    local product_stock = inventory[Util.signal_key(selected_signal)] or 0
+    local target = math.ceil(selected_demand.count * (1 + config.additional_production_rate))
+    selected_diagnostic = {
+      kind = "active_output",
+      order = {
+        signal = Util.make_signal(selected_demand.signal.type, selected_demand.signal.name,
+          selected_demand.signal.quality),
+        count = selected_demand.count
+      },
+      product = {
+        signal = Util.make_signal(selected_signal.type, selected_signal.name, selected_signal.quality),
+        target = target,
+        stock = product_stock,
+        remaining = output_count
+      },
+      stage = {
+        -- 订单行已经保留原始配方信号；“当前计划制作”应显示配方实际产出的产品。
+        signal = Util.make_signal(selected_signal.type, selected_signal.name, selected_signal.quality),
+        level = 1,
+        target = target,
+        stock = product_stock,
+        output_count = output_count,
+        ingredients = ingredients,
+        gate_kind = selected_was_locked and "retention" or "start",
+        start_ready = gate_ready,
+        product_output = config.output_mode ~= "only_material",
+        material_output = config.output_mode ~= "only_item"
+      }
+    }
   end
 
   -- 诊断每个绿色订单信号为什么没有作为产品输出。资格检查与实际选单共用 eligible，
@@ -257,7 +347,7 @@ function Mode.calculate(record)
   for _, demand in ipairs(demands) do
     local key = Util.signal_key(demand.signal)
     if key == selected_key then
-      diagnostics[key] = {kind = "active_output"}
+      diagnostics[key] = selected_diagnostic or {kind = "active_output"}
     elseif config.output_mode == "only_material" then
       diagnostics[key] = {kind = "only_material"}
     else

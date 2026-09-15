@@ -5,9 +5,9 @@ local Util = require("scripts.common_util")
 local Config = require("scripts.config")
 local Mode = {
   name = "inventory_query",                       -- 模式注册名，必须与 config.lua 的值一致。
-  -- 借用未被其他模式使用的堆叠大小屏幕槽，显示带蓝色遮罩的铁箱图标。
-  visual_operation = "stack-size",
-  visual_revision = 2
+  -- 借用已清空默认输出的时间屏幕槽，仅显示带蓝色遮罩的铁箱图标。
+  visual_operation = "time",
+  visual_revision = 3
 }
 
 local REQUIRED_MOD = "LinkedChestAndPipe"

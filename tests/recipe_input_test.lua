@@ -95,8 +95,10 @@ local separated = ProductionOrder.calculate({entity = entity, config = {
 assert(separated.separated and separated.red["item:copper:normal"].count == 2)
 assert(separated.green["recipe:widget-b"].count == 3)
 
+local supermarket_inventory = {}
 entity.get_signals = function(connector_id)
-  return connector_id == defines.wire_connector_id.combinator_input_green and recipe_entry or {}
+  return connector_id == defines.wire_connector_id.combinator_input_green and recipe_entry
+    or supermarket_inventory
 end
 local SupermarketOrder = require("scripts.modes.supermarket_order")
 local expanded = SupermarketOrder.calculate({entity = entity, config = {
@@ -104,5 +106,24 @@ local expanded = SupermarketOrder.calculate({entity = entity, config = {
   recurise_depth = 1
 }})
 assert(expanded["item:copper:normal"].count == 3 and expanded["item:iron:normal"] == nil)
+assert(expanded["recipe:widget-b"].count == 3 and expanded["item:widget:normal"] == nil)
+
+supermarket_inventory = {{signal = {type = "item", name = "copper", quality = "normal"}, count = 10}}
+local supermarket_record = {entity = entity, config = {
+  production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
+  recurise_depth = 0, recursion_timeout = 0
+}}
+local supermarket_recipe = SupermarketOrder.calculate(supermarket_record)
+assert(supermarket_recipe["recipe:widget-b"].count == 3)
+assert(supermarket_recipe["item:widget:normal"] == nil)
+assert(supermarket_record.detail_outputs["recipe:widget-b"].count == 3)
+local recipe_diagnostic = supermarket_record.supermarket_order_diagnostics["recipe:widget-b"]
+assert(recipe_diagnostic.kind == "active_output")
+assert(recipe_diagnostic.order.signal.type == "recipe"
+  and recipe_diagnostic.order.signal.name == "widget-b" and recipe_diagnostic.order.count == 3)
+assert(recipe_diagnostic.product.signal.type == "item"
+  and recipe_diagnostic.product.signal.name == "widget" and recipe_diagnostic.product.target == 3)
+assert(recipe_diagnostic.stage.signal.type == "item"
+  and recipe_diagnostic.stage.signal.name == "widget" and recipe_diagnostic.stage.output_count == 3)
 
 print("recipe input compatibility: ok")

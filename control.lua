@@ -434,6 +434,8 @@ local function refresh_timeout_display(player, record)
     player.gui.screen[Gui.name],
     timeout_elapsed_seconds(record.production_order_changed_tick, record.config.production_timeout,
       mode == MODE_PRODUCTION_ORDER and record.production_order_output_count ~= nil),
+    timeout_elapsed_seconds(record.recursion_material_wait_tick, record.config.recursion_material_wait_time,
+      mode == MODE_SUPERMARKET_ORDER and record.recursion_material_wait_output ~= nil),
     timeout_elapsed_seconds(record.recursion_output_changed_tick, record.config.recursion_timeout,
       mode == MODE_SUPERMARKET_ORDER and record.recursion_output_count ~= nil),
     timeout_elapsed_seconds(record.swap_condition_tick, record.config.swap_timeout,
@@ -631,6 +633,13 @@ local condition_config_fields = {
   swap = "swap_conditions"
 }
 
+local timeout_monitor_fields = {
+  ["bmsc-production-timeout-monitor-item-changes"] = {
+    config = "production_timeout_monitor_item_changes", condition_set = "production-timeout"},
+  ["bmsc-recursion-timeout-monitor-item-changes"] = {
+    config = "recursion_timeout_monitor_item_changes", condition_set = "recursion-timeout"}
+}
+
 local function conditions_for(record, set_name)
   local field = condition_config_fields[set_name]
   return field and record.config[field] or nil
@@ -691,6 +700,10 @@ local function update_numeric_config(record, element_name, value)
     record.config.recipe_query_cache_grid_number = math.max(0, math.floor(value))
     return true
   end
+  if element_name == "bmsc-recursion-material-wait-time" then
+    record.config.recursion_material_wait_time = value
+    return true
+  end
   if element_name == "bmsc-recursion-depth" then record.config.recurise_depth = math.floor(value); return true end
   if element_name == "bmsc-recursion-timeout" then record.config.recursion_timeout = value; return true end
   return false
@@ -712,6 +725,9 @@ local function invalidate_numeric_runtime_state(record, element_name)
   elseif element_name == "bmsc-recursion-timeout" then
     record.recursion_output_count = nil
     record.recursion_output_changed_tick = nil
+  elseif element_name == "bmsc-recursion-material-wait-time" then
+    record.recursion_material_wait_tick = nil
+    record.recursion_material_wait_output = nil
   elseif element_name == "bmsc-swap-timeout" then
     reset_swap_timer(record)
   end
@@ -785,6 +801,15 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     if condition then
       condition.comparator = ({"<", ">", "=", "<=", ">=", "~="})[event.element.selected_index] or "<"
       reset_condition_timer(record, event_tags.bmsc_condition_set)
+    end
+    return
+  end
+  local timeout_monitor = timeout_monitor_fields[event.element.name]
+  if timeout_monitor then
+    local record = current_record(event.player_index)
+    if record then
+      record.config[timeout_monitor.config] = event.element.selected_index == 1
+      reset_condition_timer(record, timeout_monitor.condition_set)
     end
     return
   end
@@ -989,6 +1014,16 @@ script.on_event(defines.events.on_gui_click, function(event)
 end)
 
 script.on_event(defines.events.on_gui_checked_state_changed, function(event)
+  if event.element.name == "bmsc-recursion-strict-validation" then
+    local record = current_record(event.player_index)
+    if record then
+      record.config.recursion_strict_validation = event.element.state
+      MODES[MODE_SUPERMARKET_ORDER].reset(record)
+      -- 严格校验会改变整张订单能否输出；立即清空旧代理，避免在下个刷新周期前继续发送旧信号。
+      write_outputs(record, {})
+    end
+    return
+  end
   local tags = event.element.tags or {}
   if not (tags.bmsc_swap_condition and tags.bmsc_condition_set) then return end
   local record = current_record(event.player_index)

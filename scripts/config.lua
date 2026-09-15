@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 8
+Config.schema_revision = 11
 
 Config.mode = {
   production_order = "production_order",
@@ -69,6 +69,7 @@ function Config.default()
     material_retention_rate = 1,                 -- 参数：生产订单运行后的原料停止倍率。
     remember_order = true,                       -- 参数：是否记住已启动但从绿线消失的订单。
     production_timeout = 0,                     -- 参数：生产订单库存无变化时的轮换秒数；0 表示禁用。
+    production_timeout_monitor_item_changes = true, -- 参数：产品输出数量变化时是否重置生产超时。
     production_timeout_conditions = default_conditions(), -- 参数：满足时重置生产订单超时。
     output_mode = "all",                         -- 参数：生产订单输出产品、原料或两者。
     cache_grid_number = 0,                      -- 参数：分离模式可占用的固体原料格数；0 表示不限制。
@@ -77,8 +78,11 @@ function Config.default()
     recursion_material_demand_rate = 10,         -- 参数：超市订单切入上层配方的原料启动倍率。
     recursion_material_retention_rate = 1,       -- 参数：超市订单当前配方的原料保留倍率。
     recursion_output_mode = "single",            -- 参数：超市订单输出单项或全部结果。
+    recursion_strict_validation = false,          -- 参数：是否跳过缺少机器无法制造原料的订单。
     sequential_production = true,                -- 参数：single 模式是否按订单顺序逐个完成。
+    recursion_material_wait_time = 0,            -- 参数：single 当前输出被撤销或切换前的保持秒数。
     recursion_timeout = 0,                       -- 参数：single 无变化轮换秒数；0 表示禁用。
+    recursion_timeout_monitor_item_changes = true, -- 参数：当前输出数量变化时是否重置超市超时。
     recursion_timeout_conditions = default_conditions(),  -- 参数：满足时重置超市订单超时。
     swap_output_mode = "fluid",                 -- 参数：切换订单输出的信号类型。
     swap_timeout = 0,                            -- 参数：条件持续满足多久后切换排列；0 表示直通。
@@ -159,6 +163,9 @@ function Config.normalize(source)
   if type(source.production_timeout) == "number" then
     config.production_timeout = math.max(0, source.production_timeout)
   end
+  if type(source.production_timeout_monitor_item_changes) == "boolean" then
+    config.production_timeout_monitor_item_changes = source.production_timeout_monitor_item_changes
+  end
   config.production_timeout_conditions = normalize_conditions(source.production_timeout_conditions
     or legacy_reset_conditions(source.production_timeout_reset_signal))
   if source.output_mode == "only_item" or source.output_mode == "only_material" or source.output_mode == "all"
@@ -187,11 +194,20 @@ function Config.normalize(source)
   if source.recursion_output_mode == "single" or source.recursion_output_mode == "all" then
     config.recursion_output_mode = source.recursion_output_mode
   end
+  if type(source.recursion_strict_validation) == "boolean" then
+    config.recursion_strict_validation = source.recursion_strict_validation
+  end
   if type(source.sequential_production) == "boolean" then
     config.sequential_production = source.sequential_production
   end
+  if type(source.recursion_material_wait_time) == "number" then
+    config.recursion_material_wait_time = math.max(0, source.recursion_material_wait_time)
+  end
   if type(source.recursion_timeout) == "number" then
     config.recursion_timeout = math.max(0, source.recursion_timeout)
+  end
+  if type(source.recursion_timeout_monitor_item_changes) == "boolean" then
+    config.recursion_timeout_monitor_item_changes = source.recursion_timeout_monitor_item_changes
   end
   config.recursion_timeout_conditions = normalize_conditions(source.recursion_timeout_conditions
     or legacy_reset_conditions(source.recursion_timeout_reset_signal))

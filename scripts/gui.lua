@@ -312,6 +312,8 @@ function Gui.production_diagnostic_tooltip(diagnostic)
     reason = {"bmsc.production-reason-stock-sufficient", diagnostic.stock}
   elseif diagnostic.kind == "no_recipe" then
     reason = {"bmsc.production-reason-no-recipe"}
+  elseif diagnostic.kind == "surface_conditions" then
+    reason = {"bmsc.supermarket-reason-surface-conditions"}
   elseif diagnostic.kind == "unsupported_signal" then
     reason = {"bmsc.production-reason-unsupported-signal"}
   elseif diagnostic.kind == "non_positive_order" then

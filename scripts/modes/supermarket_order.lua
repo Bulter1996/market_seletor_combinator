@@ -13,6 +13,18 @@ local Mode = {
   visual_parameters = {operation = "select", select_max = true, index_constant = 2147483647}
 }
 
+---判断机器或配方原型的地表条件是否全部满足。
+local function surface_conditions_met(surface, conditions)
+  if type(conditions) ~= "table" or not next(conditions) then return true end
+  if not (surface and surface.get_property) then return false end
+  for _, condition in pairs(conditions) do
+    local value = surface.get_property(condition.property)
+    if type(value) ~= "number" or condition.min and value < condition.min
+      or condition.max and value > condition.max then return false end
+  end
+  return true
+end
+
 ---只清除当前输出选择；订单迟滞状态由 Mode.reset 决定是否一并清除。
 local function reset_output_state(record)
   record.selected_recursion_output = nil
@@ -256,6 +268,12 @@ function Mode.calculate(record)
     if config.recursion_strict_validation ~= true then return nil end
     -- 订单物品本身无法由所选机器制造时也必须跳过，不能把它当作终端原料输出。
     if not root.recipe_name then return {kind = "no_recipe"} end
+    local machine = prototypes.entity[config.production_machine]
+    local root_recipe = prototypes.recipe[root.recipe_name]
+    if not surface_conditions_met(record.entity.surface, machine and machine.surface_conditions)
+      or not surface_conditions_met(record.entity.surface, root_recipe and root_recipe.surface_conditions) then
+      return {kind = "surface_conditions"}
+    end
     local shortages = {}
     local function add_shortage(signal, count)
       local key = Util.signal_key(signal)
@@ -273,7 +291,8 @@ function Mode.calculate(record)
         local stock = math.max(0, observed_inventory[Util.signal_key(child.signal)] or 0)
         local threshold = child.amount * material_demand_rate
         if stock <= threshold then
-          if child.recipe_name then
+          local recipe = child.recipe_name and prototypes.recipe[child.recipe_name]
+          if recipe and surface_conditions_met(record.entity.surface, recipe.surface_conditions) then
             visit(child)
           elseif not child.cyclic then
             -- 启动条件是严格大于；当库存恰好等于阈值时仍至少缺少 1。

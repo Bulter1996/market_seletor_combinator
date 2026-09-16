@@ -294,5 +294,8 @@ local function localised_depth(value)
   return depth + 1
 end
 assert(localised_depth(Gui.production_diagnostic_tooltip(deep_diagnostic)) <= 20)
+local surface_tooltip = Gui.production_diagnostic_tooltip{kind = "surface_conditions"}
+assert(surface_tooltip[1] == "bmsc.production-no-output-reason")
+assert(surface_tooltip[2][1] == "bmsc.supermarket-reason-surface-conditions")
 
 print("timeout reset signal: ok")

@@ -18,7 +18,9 @@ function Mode.reset(record)
   record.production_order_changed_tick = nil
   record.production_order_diagnostics = nil
   record.production_timeout_condition_results = nil
-  record.detail_outputs = nil
+  -- detail_outputs 是生产订单和超市订单共用的展示缓存。control.lua 每轮都会重置
+  -- 非当前模式，因此只有生产订单正在使用它时才能清空，不能抹掉超市订单的等待快照。
+  if record.config and record.config.mode == Mode.name then record.detail_outputs = nil end
 end
 
 ---导出需要随存档配置重建保留的模式运行状态。

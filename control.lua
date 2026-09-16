@@ -1014,6 +1014,14 @@ script.on_event(defines.events.on_gui_click, function(event)
 end)
 
 script.on_event(defines.events.on_gui_checked_state_changed, function(event)
+  if event.element.name == "bmsc-swap-loop" then
+    local record = current_record(event.player_index)
+    if record then
+      record.config.swap_loop = event.element.state
+      reset_swap_timer(record)
+    end
+    return
+  end
   if event.element.name == "bmsc-recursion-strict-validation" then
     local record = current_record(event.player_index)
     if record then

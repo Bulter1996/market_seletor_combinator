@@ -1376,6 +1376,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     selected_index = ({fluid = 1, item = 2, all = 3, all_with_signals = 4})[config.swap_output_mode] or 1})
   add_timeout_slider(swap_fields, {"bmsc.swap-timeout"}, "bmsc-swap-timeout",
     config.swap_timeout or 0, true, {"bmsc.swap-timeout-tooltip"})
+  add_labeled(swap_fields, {"bmsc.swap-loop"}, {type = "checkbox", name = "bmsc-swap-loop",
+    state = config.swap_loop == true, tooltip = {"bmsc.swap-loop-tooltip"}})
   swap_settings.add{type = "button", name = "bmsc-clear-swap", caption = {"bmsc.clear-swap"}}
   add_conditions_editor(swap_settings, "swap", {"bmsc.conditions"}, config.swap_conditions)
   Gui.add_signal_panel(swap_details, player)

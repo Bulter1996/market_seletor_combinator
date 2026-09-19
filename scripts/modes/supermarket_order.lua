@@ -58,6 +58,29 @@ function Mode.restart_sequence(record)
   record.supermarket_sequence_signature = nil
 end
 
+---把顺序制作中的当前订单移到循环队列末尾；调用方随后立即重算，因此不经过等待门。
+---@param record table 组合器记录。
+---@param source_key string 被右键点击的绿色订单信号键。
+---@return boolean deferred 当前订单确实被后移时返回 true。
+function Mode.defer_current_order(record, source_key)
+  local config = type(record.config) == "table" and record.config or {}
+  if config.recursion_output_mode ~= "single" or config.sequential_production == false
+    or record.recursion_order_key ~= source_key then return false end
+  local roots = record.supermarket_order_plan and record.supermarket_order_plan.roots or {}
+  for index, root in ipairs(roots) do
+    if root.source_key == source_key then
+      record.supermarket_sequence_index = index % #roots + 1
+      if type(record.supermarket_active_orders) == "table" then
+        record.supermarket_active_orders[source_key] = nil
+      end
+      reset_output_state(record)
+      record.recursion_order_key = nil
+      return true
+    end
+  end
+  return false
+end
+
 ---清除只属于当前机器和订单输入的配方树；机器或科技变化时调用。
 ---@param record table control.lua 保存的组合器记录。
 ---@return nil
@@ -309,8 +332,8 @@ function Mode.calculate(record)
     return result[1] and {kind = "strict_materials", shortages = result} or nil
   end
 
-  -- “顺序制作”仅在 single 输出模式生效。游标只向后推进；已完成订单即使随后被下一条
-  -- 配方消耗、库存再次下降，也不会重新进入队列。订单输入变化或手动重置才会回到开头。
+  -- “顺序制作”仅在 single 输出模式生效。游标从当前项向后扫描，到末尾后回到第一项；
+  -- 每轮最多检查一次完整队列，避免全部订单都已满足或校验失败时形成死循环。
   local sequential = config.recursion_output_mode == "single" and config.sequential_production ~= false
   local roots_to_resolve = {}
   local root_targets = {}
@@ -324,74 +347,55 @@ function Mode.calculate(record)
     if record.supermarket_sequence_signature ~= order_signature then
       record.supermarket_sequence_signature = order_signature
       record.supermarket_sequence_index = 1
-      record.supermarket_sequence_completed_orders = {}
       active_orders = {}
       record.supermarket_active_orders = active_orders
     end
-    local sequence_index = math.max(1, math.floor(tonumber(record.supermarket_sequence_index) or 1))
-    for index = 1, sequence_index - 1 do
-      local completed = plan.roots[index]
-      if completed then completed_order_keys[completed.source_key] = true end
-    end
+    record.supermarket_sequence_completed_orders = nil -- 旧版一次性顺序状态不再参与循环队列。
     if config.recursion_strict_validation == true then
-      -- 严格校验允许暂时跳过无法生产的订单，但不能把它当作已完成订单永久丢弃。
-      local completed_orders = type(record.supermarket_sequence_completed_orders) == "table"
-        and record.supermarket_sequence_completed_orders or {}
-      record.supermarket_sequence_completed_orders = completed_orders
-      for index = sequence_index, #plan.roots do
-        local root = plan.roots[index]
-        if completed_orders[root.source_key] then
-          completed_order_keys[root.source_key] = true
-        else
-          local stock = observed_inventory[Util.signal_key(root.signal)] or 0
-          local extended_target = root.amount * (1 + additional_rate)
-          local target = active_orders[root.source_key] and extended_target or root.amount
-          if stock >= target then
-            active_orders[root.source_key] = nil
-            completed_orders[root.source_key] = true
-            completed_order_keys[root.source_key] = true
-          else
-            local diagnostic = strict_order_diagnostic(root)
-            if diagnostic then
-              strict_order_diagnostics[root.source_key] = diagnostic
-            else
-              active_orders = {[root.source_key] = true}
-              record.supermarket_active_orders = active_orders
-              roots_to_resolve[1] = root
-              root_targets[root.source_key] = extended_target
-              active_order_key = root.source_key
-              active_order_keys[root.source_key] = true
-              break
-            end
-          end
+      -- 当前项运行时仍为队列中其他订单保留具体校验原因，避免输入悬浮框退化为“等待中”。
+      for _, root in ipairs(plan.roots) do
+        local stock = observed_inventory[Util.signal_key(root.signal)] or 0
+        local target = active_orders[root.source_key]
+          and root.amount * (1 + additional_rate) or root.amount
+        if stock < target then
+          strict_order_diagnostics[root.source_key] = strict_order_diagnostic(root)
         end
       end
-      while plan.roots[sequence_index]
-        and completed_orders[plan.roots[sequence_index].source_key] do
-        sequence_index = sequence_index + 1
-      end
-    else
-      while plan.roots[sequence_index] do
-        local root = plan.roots[sequence_index]
-        local root_key = Util.signal_key(root.signal)
-        local stock = observed_inventory[root_key] or 0
-        local extended_target = root.amount * (1 + additional_rate)
-        local target = active_orders[root.source_key] and extended_target or root.amount
-        if stock < target then
+    end
+    local root_count = #plan.roots
+    local sequence_index = root_count > 0
+      and (math.max(1, math.floor(tonumber(record.supermarket_sequence_index) or 1)) - 1) % root_count + 1
+      or 1
+    local scan_start_index = sequence_index
+    local selected
+    for _ = 1, root_count do
+      local root = plan.roots[sequence_index]
+      local stock = observed_inventory[Util.signal_key(root.signal)] or 0
+      local extended_target = root.amount * (1 + additional_rate)
+      local target = active_orders[root.source_key] and extended_target or root.amount
+      if stock < target then
+        local diagnostic = strict_order_diagnostics[root.source_key]
+        if diagnostic then
+          active_orders[root.source_key] = nil
+          strict_order_diagnostics[root.source_key] = diagnostic
+        else
           active_orders = {[root.source_key] = true}
           record.supermarket_active_orders = active_orders
           roots_to_resolve[1] = root
           root_targets[root.source_key] = extended_target
           active_order_key = root.source_key
           active_order_keys[root.source_key] = true
+          selected = true
           break
         end
+      else
         active_orders[root.source_key] = nil
         completed_order_keys[root.source_key] = true
-        sequence_index = sequence_index + 1
       end
+      sequence_index = sequence_index % root_count + 1
     end
-    record.supermarket_sequence_index = sequence_index
+    record.supermarket_sequence_index = selected
+      and (config.recursion_strict_validation == true and scan_start_index or sequence_index) or 1
   else
     -- 非顺序模式允许多个订单同时处于迟滞区间：库存低于基础目标时启动，达到扩展目标后退出。
     for _, root in ipairs(plan.roots) do

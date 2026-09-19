@@ -475,6 +475,9 @@ local function refresh_signal_section(section, networks, diagnostics)
           tooltip = Gui.production_diagnostic_tooltip(diagnostic),
           tags = {
             bmsc_signal_panel_icon = true,
+            bmsc_signal_side = section.name == "bmsc-input-signals" and "input" or "output",
+            bmsc_signal_color = color,
+            bmsc_signal_key = Util.signal_key(entry.signal),
             bmsc_signal_type = entry.signal.type or "item",
             bmsc_signal_name = entry.signal.name
           }}

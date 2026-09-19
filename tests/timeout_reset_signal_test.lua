@@ -189,6 +189,47 @@ game.tick = 40
 ProductionOrder.calculate(unmonitored_production)
 assert(unmonitored_production.production_order_changed_tick == 40)
 
+-- 生产订单超时后移到持久队尾；下一个订单完成后继续第三项，不会立刻回到超时项。
+force.recipes["make-iron"] = {enabled = true}
+local queue_green = {
+  {signal = {type = "item", name = "batch-product", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "iron", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "product", quality = "normal"}, count = 10}
+}
+local queue_inventory = {
+  {signal = {type = "item", name = "iron", quality = "normal"}, count = 4},
+  {signal = {type = "item", name = "copper", quality = "normal"}, count = 3},
+  {signal = {type = "item", name = "ore", quality = "normal"}, count = 3}
+}
+local queue_entity = {force = force, get_signals = function(connector_id)
+  return connector_id == defines.wire_connector_id.combinator_input_green
+    and queue_green or queue_inventory
+end}
+local queue_record = {entity = queue_entity, config = {
+  production_machine = "assembler", remember_order = false, production_timeout = 1,
+  production_timeout_monitor_item_changes = false, production_timeout_conditions = reset_conditions,
+  additional_production_rate = 0, material_demand_rate = 1, material_retention_rate = 0,
+  output_mode = "all", cache_grid_number = 0
+}}
+game.tick = 0
+ProductionOrder.calculate(queue_record)
+assert(queue_record.selected_request == "item:batch-product:normal")
+game.tick = 60
+ProductionOrder.calculate(queue_record)
+assert(queue_record.selected_request == "item:iron:normal")
+assert(table.concat(queue_record.production_order_queue, ",")
+  == "item:iron:normal,item:product:normal,item:batch-product:normal")
+queue_inventory[1].count = 10
+game.tick = 61
+ProductionOrder.calculate(queue_record)
+assert(queue_record.selected_request == "item:product:normal")
+queue_inventory[#queue_inventory + 1] = {
+  signal = {type = "item", name = "product", quality = "normal"}, count = 10}
+game.tick = 62
+ProductionOrder.calculate(queue_record)
+assert(queue_record.selected_request == "item:batch-product:normal")
+force.recipes["make-iron"] = nil
+
 green[2].count = 0
 red = {}
 game.tick = 0

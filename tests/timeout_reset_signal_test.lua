@@ -39,10 +39,11 @@ assert(normalized.production_timeout_monitor_item_changes == true)
 assert(normalized.recursion_timeout_monitor_item_changes == true)
 assert(normalized.recursion_material_wait_time == 0)
 assert(normalized.recursion_strict_validation == false)
+assert(normalized.swap_loop == false)
 assert(normalized.swap_conditions[1].first.signal.name == "signal-R")
 assert(normalized.swap_conditions[1].second.signal.type == "item")
 assert(normalized.swap_conditions[1].first.signal ~= reset)
-local copied = Config.normalize{mode = Config.mode.swap_order, swap_timeout = 12,
+local copied = Config.normalize{mode = Config.mode.swap_order, swap_timeout = 12, swap_loop = true,
   recipe_query_cache_grid_number = 7,
   recursion_material_wait_time = 7,
   recursion_strict_validation = true,
@@ -54,6 +55,7 @@ local copied = Config.normalize{mode = Config.mode.swap_order, swap_timeout = 12
   recursion_timeout_conditions = normalized.recursion_timeout_conditions,
   swap_conditions = normalized.swap_conditions}
 assert(copied.mode == Config.mode.swap_order and copied.swap_timeout == 12)
+assert(copied.swap_loop == true)
 assert(copied.recipe_query_cache_grid_number == 7)
 assert(copied.recursion_material_wait_time == 7)
 assert(copied.recursion_strict_validation == true)
@@ -187,6 +189,47 @@ game.tick = 40
 ProductionOrder.calculate(unmonitored_production)
 assert(unmonitored_production.production_order_changed_tick == 40)
 
+-- 生产订单超时后移到持久队尾；下一个订单完成后继续第三项，不会立刻回到超时项。
+force.recipes["make-iron"] = {enabled = true}
+local queue_green = {
+  {signal = {type = "item", name = "batch-product", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "iron", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "product", quality = "normal"}, count = 10}
+}
+local queue_inventory = {
+  {signal = {type = "item", name = "iron", quality = "normal"}, count = 4},
+  {signal = {type = "item", name = "copper", quality = "normal"}, count = 3},
+  {signal = {type = "item", name = "ore", quality = "normal"}, count = 3}
+}
+local queue_entity = {force = force, get_signals = function(connector_id)
+  return connector_id == defines.wire_connector_id.combinator_input_green
+    and queue_green or queue_inventory
+end}
+local queue_record = {entity = queue_entity, config = {
+  production_machine = "assembler", remember_order = false, production_timeout = 1,
+  production_timeout_monitor_item_changes = false, production_timeout_conditions = reset_conditions,
+  additional_production_rate = 0, material_demand_rate = 1, material_retention_rate = 0,
+  output_mode = "all", cache_grid_number = 0
+}}
+game.tick = 0
+ProductionOrder.calculate(queue_record)
+assert(queue_record.selected_request == "item:batch-product:normal")
+game.tick = 60
+ProductionOrder.calculate(queue_record)
+assert(queue_record.selected_request == "item:iron:normal")
+assert(table.concat(queue_record.production_order_queue, ",")
+  == "item:iron:normal,item:product:normal,item:batch-product:normal")
+queue_inventory[1].count = 10
+game.tick = 61
+ProductionOrder.calculate(queue_record)
+assert(queue_record.selected_request == "item:product:normal")
+queue_inventory[#queue_inventory + 1] = {
+  signal = {type = "item", name = "product", quality = "normal"}, count = 10}
+game.tick = 62
+ProductionOrder.calculate(queue_record)
+assert(queue_record.selected_request == "item:batch-product:normal")
+force.recipes["make-iron"] = nil
+
 green[2].count = 0
 red = {}
 game.tick = 0
@@ -294,5 +337,57 @@ local function localised_depth(value)
   return depth + 1
 end
 assert(localised_depth(Gui.production_diagnostic_tooltip(deep_diagnostic)) <= 20)
+local surface_tooltip = Gui.production_diagnostic_tooltip{kind = "surface_conditions"}
+assert(surface_tooltip[1] == "bmsc.production-no-output-reason")
+assert(surface_tooltip[2][1] == "bmsc.supermarket-reason-surface-conditions")
+
+-- 切换订单默认在最后一个排列停止；输入变化后从头开始，显式开启循环才会折回第一项。
+local swap_inputs = {
+  {signal = {type = "fluid", name = "water"}, count = 20},
+  {signal = {type = "fluid", name = "steam"}, count = 10},
+  {signal = reset, count = 1}
+}
+local swap_entity = {get_signals = function(connector_id)
+  return connector_id == defines.wire_connector_id.combinator_input_green and swap_inputs or {}
+end}
+local SwapOrder = require("scripts.modes.swap_order")
+local swap_record = {entity = swap_entity, config = {
+  swap_output_mode = "fluid", swap_timeout = 1, swap_loop = false,
+  swap_conditions = reset_conditions
+}}
+game.tick = 0
+local initial_swap = SwapOrder.calculate(swap_record)
+assert(swap_record.swap_permutation[1] == 1 and swap_record.swap_permutation[2] == 2)
+assert(initial_swap["fluid:water"].count == 101 and initial_swap["fluid:steam"].count == 102)
+game.tick = 60
+local reversed_swap = SwapOrder.calculate(swap_record)
+assert(swap_record.swap_permutation[1] == 2 and swap_record.swap_permutation[2] == 1)
+assert(reversed_swap["fluid:steam"].count == 101 and reversed_swap["fluid:water"].count == 102)
+game.tick = 120
+SwapOrder.calculate(swap_record)
+assert(swap_record.swap_permutation[1] == 2 and swap_record.swap_permutation[2] == 1)
+assert(swap_record.swap_condition_tick == nil)
+swap_inputs[1].count = 21
+game.tick = 150
+SwapOrder.calculate(swap_record)
+assert(swap_record.swap_permutation[1] == 1 and swap_record.swap_permutation[2] == 2)
+swap_inputs[1].count = 10
+game.tick = 180
+local tied_swap = SwapOrder.calculate(swap_record)
+assert(tied_swap["fluid:steam"].count == 101 and tied_swap["fluid:water"].count == 102)
+assert(tied_swap["fluid:steam"].count ~= tied_swap["fluid:water"].count)
+
+local looping_swap_record = {entity = swap_entity, config = {
+  swap_output_mode = "fluid", swap_timeout = 1, swap_loop = true,
+  swap_conditions = reset_conditions
+}}
+game.tick = 0
+SwapOrder.calculate(looping_swap_record)
+game.tick = 60
+SwapOrder.calculate(looping_swap_record)
+game.tick = 120
+SwapOrder.calculate(looping_swap_record)
+assert(looping_swap_record.swap_permutation[1] == 1
+  and looping_swap_record.swap_permutation[2] == 2)
 
 print("timeout reset signal: ok")

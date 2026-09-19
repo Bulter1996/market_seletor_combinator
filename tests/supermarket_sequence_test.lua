@@ -64,7 +64,13 @@ assert(record.supermarket_order_diagnostics["item:a:normal"].kind == "supermarke
 inventory = {}
 Mode.calculate(record)
 assert(record.supermarket_sequence_index == 2)
-assert(record.supermarket_order_diagnostics["item:a:normal"].kind == "supermarket_completed")
+assert(record.supermarket_order_diagnostics["item:a:normal"].kind == "waiting_for_order")
+
+-- 最后一项完成后立即绕回第一项重新检查；第一项库存已下降时会重新进入制作队列。
+inventory = {{signal = {type = "item", name = "b", quality = "normal"}, count = 10}}
+local cycled = Mode.calculate(record)
+assert(record.supermarket_sequence_index == 1)
+assert(cycled["item:iron:normal"].count == 10)
 
 Mode.restart_sequence(record)
 local restarted = Mode.calculate(record)
@@ -72,6 +78,31 @@ assert(record.supermarket_sequence_index == 1)
 assert(restarted["item:iron:normal"].count == 10)
 assert(record.supermarket_order_diagnostics["item:b:normal"].kind == "waiting_for_order")
 
+-- 右键后移当前订单会直接选择下一项，即使配置了原料等待时间也不会保留旧输出。
+orders = {
+  {signal = {type = "item", name = "a", quality = "normal"}, count = 20},
+  {signal = {type = "item", name = "b", quality = "normal"}, count = 20}
+}
+inventory = {
+  {signal = {type = "item", name = "a", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "iron", quality = "normal"}, count = 10}
+}
+local deferred_record = {entity = entity, config = {
+  production_machine = "assembler", recursion_output_mode = "single",
+  sequential_production = true, recurise_depth = 0, recursion_timeout = 0,
+  recursion_material_wait_time = 10
+}}
+assert(Mode.calculate(deferred_record)["item:a:normal"].count == 10)
+assert(Mode.defer_current_order(deferred_record, "item:a:normal"))
+local deferred = Mode.calculate(deferred_record)
+assert(deferred_record.recursion_order_key == "item:b:normal")
+assert(deferred["item:b:normal"].count == 20)
+assert(deferred_record.recursion_material_wait_tick == nil)
+
+orders = {
+  {signal = {type = "item", name = "a", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "b", quality = "normal"}, count = 10}
+}
 inventory = {{signal = {type = "item", name = "a", quality = "normal"}, count = 10}}
 Mode.calculate(record)
 inventory = {}
@@ -442,6 +473,7 @@ inventory = {
   {signal = {type = "item", name = "iron", quality = "normal"}, count = 11}
 }
 local strict_large_ingredient_record = {entity = entity, config = {
+  mode = "supermarket_order",
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
   recursion_strict_validation = true, recurise_depth = 0, recursion_timeout = 0,
   recursion_material_wait_time = 2,
@@ -452,6 +484,8 @@ local strict_large_ingredient = Mode.calculate(strict_large_ingredient_record)
 assert(strict_large_ingredient["item:remote-tower:normal"].count == 114)
 assert(strict_large_ingredient_record.supermarket_order_diagnostics["item:factory-2:normal"].stage.signal.name
   == "remote-tower")
+-- control.lua 会在每轮计算前重置非当前模式；生产订单重置不能清掉超市订单用于等待的上一轮输出。
+require("scripts.modes.production_order").reset(strict_large_ingredient_record)
 inventory[4].count = 0
 game.tick = 30
 local strict_wait_held = Mode.calculate(strict_large_ingredient_record)
@@ -463,6 +497,31 @@ assert(Mode.calculate(strict_large_ingredient_record)["item:remote-tower:normal"
 game.tick = 150
 assert(next(Mode.calculate(strict_large_ingredient_record)) == nil)
 assert(strict_large_ingredient_record.recursion_material_wait_tick == nil)
+
+-- 严格校验遵守生产机器的地表限制；例如只允许高磁场的机器不能在低磁场地表接单。
+prototypes.entity["surface-limited-assembler"] = {
+  crafting_categories = {crafting = true},
+  surface_conditions = {{property = "magnetic-field", min = 90}}
+}
+local original_surface = entity.surface
+entity.surface = {get_property = function(property)
+  return property == "magnetic-field" and 0 or 100
+end}
+orders = {{signal = {type = "item", name = "circuit", quality = "normal"}, count = 10}}
+inventory = {
+  {signal = {type = "item", name = "wire", quality = "normal"}, count = 100},
+  {signal = {type = "item", name = "plate", quality = "normal"}, count = 100}
+}
+local surface_limited_record = {entity = entity, config = {
+  production_machine = "surface-limited-assembler", recursion_output_mode = "single",
+  sequential_production = false, recursion_strict_validation = true, recurise_depth = 0,
+  recursion_timeout = 0, recursion_additional_production_rate = 0,
+  recursion_material_demand_rate = 1, recursion_material_retention_rate = 0
+}}
+assert(next(Mode.calculate(surface_limited_record)) == nil)
+assert(surface_limited_record.supermarket_order_diagnostics["item:circuit:normal"].kind
+  == "surface_conditions")
+entity.surface = original_surface
 
 -- 严格开关属于输出缓存条件；开启后不能继续复用关闭时的终端原料输出。
 orders = {{signal = {type = "item", name = "stone-brick", quality = "normal"}, count = 10}}

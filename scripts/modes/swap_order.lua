@@ -1,6 +1,5 @@
--- “切换订单”模式：合并两色输入，并在条件持续成立时按全排列依次改变输出槽位顺序。
+-- “切换订单”模式：合并两色输入，并用 101、102……的唯一数值把全排列传给下游选择器。
 
-local Util = require("scripts.common_util")
 local Conditions = require("scripts.conditions")
 local Mode = {
   name = "swap_order",
@@ -32,6 +31,13 @@ local function next_permutation(values)
 end
 
 Mode.next_permutation = next_permutation
+
+local function is_last_permutation(values)
+  for index = 2, #values do
+    if values[index - 1] < values[index] then return false end
+  end
+  return true
+end
 
 local function signal_allowed(signal, output_mode)
   local signal_type = signal.type or "item"
@@ -69,12 +75,21 @@ end
 
 function Mode.calculate(record)
   local inputs = Conditions.read_inputs(record.entity)
-  local entries, signature_parts = {}, {record.config.swap_output_mode}
-  for _, value in ipairs(Util.sorted_outputs(inputs.merged)) do
-    signature_parts[#signature_parts + 1] = value.key .. "=" .. tostring(value.entry.count)
-    if signal_allowed(value.entry.signal, record.config.swap_output_mode) then
-      entries[#entries + 1] = value.entry
+  local entries = {}
+  for key, entry in pairs(inputs.merged) do
+    if signal_allowed(entry.signal, record.config.swap_output_mode) then
+      entries[#entries + 1] = {key = key, signal = entry.signal, count = entry.count}
     end
+  end
+  -- 初始排列按输入数量从大到小；数量相同时按稳定信号键排序。线路输出随后改写为
+  -- 101、102……的唯一排名值，让下游原版选择运算器能够真正观察到排列变化。
+  table.sort(entries, function(a, b)
+    if a.count ~= b.count then return a.count > b.count end
+    return a.key < b.key
+  end)
+  local signature_parts = {record.config.swap_output_mode}
+  for _, entry in ipairs(entries) do
+    signature_parts[#signature_parts + 1] = entry.key .. "=" .. tostring(entry.count)
   end
   local signature = table.concat(signature_parts, "|")
   if record.swap_signature ~= signature or #entries ~= #(record.swap_permutation or {}) then
@@ -87,7 +102,11 @@ function Mode.calculate(record)
   local timeout = tonumber(record.config.swap_timeout) or 0
   local all_conditions_met, condition_results = Conditions.evaluate(record.config.swap_conditions, inputs)
   record.swap_condition_results = condition_results
-  if timeout > 0 and #entries > 1 and all_conditions_met then
+  -- 默认只遍历一次全排列；到达降序的最后一项后停止计时，输入签名变化时才从头开始。
+  -- 开启循环后保留旧行为，由 next_permutation 把最后一项重新折回第一个排列。
+  local can_advance = record.config.swap_loop == true
+    or not is_last_permutation(record.swap_permutation or {})
+  if timeout > 0 and #entries > 1 and all_conditions_met and can_advance then
     record.swap_condition_tick = record.swap_condition_tick or game.tick
     local elapsed_ticks = game.tick - record.swap_condition_tick
     if elapsed_ticks >= timeout * 60 then
@@ -102,7 +121,7 @@ function Mode.calculate(record)
   for output_index, source_index in ipairs(record.swap_permutation or {}) do
     local entry = entries[source_index]
     if entry then
-      outputs[Util.signal_key(entry.signal)] = {signal = entry.signal, count = entry.count,
+      outputs[entry.key] = {signal = entry.signal, count = 100 + output_index,
         sort_priority = #entries - output_index + 1}
     end
   end

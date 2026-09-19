@@ -950,7 +950,15 @@ script.on_event(defines.events.on_gui_click, function(event)
     return
   end
   if tags.bmsc_signal_panel_icon then
-    if event.alt and event.button == defines.mouse_button_type.left then
+    if event.button == defines.mouse_button_type.right and tags.bmsc_signal_side == "input"
+      and tags.bmsc_signal_color == "green"
+      and record and record.config.mode == MODE_SUPERMARKET_ORDER
+      and MODES[MODE_SUPERMARKET_ORDER].defer_current_order(record, tags.bmsc_signal_key) then
+      -- defer_current_order 已先清除旧输出选择，因此这次重算不会进入原料等待门。
+      write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
+      Gui.refresh_connection_status(
+        player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+    elseif event.alt and event.button == defines.mouse_button_type.left then
       local prototype_group = tags.bmsc_signal_type == "fluid" and prototypes.fluid
         or tags.bmsc_signal_type == "virtual" and prototypes.virtual_signal
         or prototypes.item
@@ -1014,6 +1022,14 @@ script.on_event(defines.events.on_gui_click, function(event)
 end)
 
 script.on_event(defines.events.on_gui_checked_state_changed, function(event)
+  if event.element.name == "bmsc-swap-loop" then
+    local record = current_record(event.player_index)
+    if record then
+      record.config.swap_loop = event.element.state
+      reset_swap_timer(record)
+    end
+    return
+  end
   if event.element.name == "bmsc-recursion-strict-validation" then
     local record = current_record(event.player_index)
     if record then

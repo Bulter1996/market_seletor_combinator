@@ -312,6 +312,8 @@ function Gui.production_diagnostic_tooltip(diagnostic)
     reason = {"bmsc.production-reason-stock-sufficient", diagnostic.stock}
   elseif diagnostic.kind == "no_recipe" then
     reason = {"bmsc.production-reason-no-recipe"}
+  elseif diagnostic.kind == "surface_conditions" then
+    reason = {"bmsc.supermarket-reason-surface-conditions"}
   elseif diagnostic.kind == "unsupported_signal" then
     reason = {"bmsc.production-reason-unsupported-signal"}
   elseif diagnostic.kind == "non_positive_order" then
@@ -473,6 +475,9 @@ local function refresh_signal_section(section, networks, diagnostics)
           tooltip = Gui.production_diagnostic_tooltip(diagnostic),
           tags = {
             bmsc_signal_panel_icon = true,
+            bmsc_signal_side = section.name == "bmsc-input-signals" and "input" or "output",
+            bmsc_signal_color = color,
+            bmsc_signal_key = Util.signal_key(entry.signal),
             bmsc_signal_type = entry.signal.type or "item",
             bmsc_signal_name = entry.signal.name
           }}
@@ -1374,6 +1379,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     selected_index = ({fluid = 1, item = 2, all = 3, all_with_signals = 4})[config.swap_output_mode] or 1})
   add_timeout_slider(swap_fields, {"bmsc.swap-timeout"}, "bmsc-swap-timeout",
     config.swap_timeout or 0, true, {"bmsc.swap-timeout-tooltip"})
+  add_labeled(swap_fields, {"bmsc.swap-loop"}, {type = "checkbox", name = "bmsc-swap-loop",
+    state = config.swap_loop == true, tooltip = {"bmsc.swap-loop-tooltip"}})
   swap_settings.add{type = "button", name = "bmsc-clear-swap", caption = {"bmsc.clear-swap"}}
   add_conditions_editor(swap_settings, "swap", {"bmsc.conditions"}, config.swap_conditions)
   Gui.add_signal_panel(swap_details, player)

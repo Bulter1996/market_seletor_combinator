@@ -8,17 +8,22 @@ local Mode = {
   visual_operation = "count"                         -- 仅借用原版“输入计数”的 # 屏幕动画。
 }
 
----清除生产订单模式的临时运行状态，但不修改玩家配置。
----@param record table control.lua 保存的组合器记录。
----@return nil
-function Mode.reset(record)
+local function clear_current_order(record)
   record.selected_request = nil
   record.remembered_order = nil
   record.production_order_output_count = nil
   record.production_order_changed_tick = nil
+  if record.config and record.config.mode == Mode.name then record.detail_outputs = nil end
+end
+
+---清除生产订单模式的临时运行状态，但不修改玩家配置。
+---@param record table control.lua 保存的组合器记录。
+---@return nil
+function Mode.reset(record)
+  clear_current_order(record)
+  record.production_order_queue = nil
   record.production_order_diagnostics = nil
   record.production_timeout_condition_results = nil
-  record.detail_outputs = nil
 end
 
 ---导出需要随存档配置重建保留的模式运行状态。
@@ -28,6 +33,7 @@ function Mode.save_state(record)
   return {
     selected_request = record.selected_request,
     remembered_order = record.remembered_order,
+    queue = record.production_order_queue,
     output_count = record.production_order_output_count,
     changed_tick = record.production_order_changed_tick
   }
@@ -41,6 +47,7 @@ function Mode.restore_state(record, saved)
   saved = saved or {}
   record.selected_request = saved.selected_request
   record.remembered_order = saved.remembered_order
+  record.production_order_queue = saved.queue
   record.production_order_output_count = saved.output_count
   record.production_order_changed_tick = saved.changed_tick
 end
@@ -96,6 +103,32 @@ function Mode.calculate(record)
   local material_crafts = 0
   table.sort(demands, function(a, b) return Util.signal_key(a.signal) < Util.signal_key(b.signal) end)
 
+  -- 队列只保存仍存在的订单键；已有键保持轮转后的顺序，新输入按稳定排序追加。
+  local demands_by_key, present, queued = {}, {}, {}
+  for _, demand in ipairs(demands) do
+    local key = Util.signal_key(demand.signal)
+    demands_by_key[key], present[key] = demand, true
+  end
+  local order_queue = {}
+  for _, key in ipairs(type(record.production_order_queue) == "table"
+    and record.production_order_queue or {}) do
+    if present[key] and not queued[key] then
+      order_queue[#order_queue + 1], queued[key] = key, true
+    end
+  end
+  for _, demand in ipairs(demands) do
+    local key = Util.signal_key(demand.signal)
+    if not queued[key] then order_queue[#order_queue + 1], queued[key] = key, true end
+  end
+  record.production_order_queue = order_queue
+
+  local function move_order_to_back(key)
+    for index, queued_key in ipairs(order_queue) do
+      if queued_key == key then table.remove(order_queue, index); break end
+    end
+    if present[key] then order_queue[#order_queue + 1] = key end
+  end
+
   ---判断一个订单在启动或锁定阶段是否仍可执行。
   ---@param demand Signal 当前需求信号及数量。
   ---@param locked boolean 是否为已经启动的订单。
@@ -150,7 +183,7 @@ function Mode.calculate(record)
       selected_demand = record.remembered_order
       selected_was_locked = true
     else
-      Mode.reset(record)
+      clear_current_order(record)
     end
   elseif record.selected_request then
     for _, demand in ipairs(demands) do
@@ -172,7 +205,6 @@ function Mode.calculate(record)
   end
 
   -- 超时可选监控最终写入线路的产品数量；关闭后，数量变化只更新比较基准，不刷新计时。
-  local timed_out_key
   local selected_output_count
   if selected_demand then
     local selected_key = Util.signal_key(selected_demand.signal)
@@ -191,8 +223,8 @@ function Mode.calculate(record)
       else
         local unchanged_ticks = game.tick - (record.production_order_changed_tick or game.tick)
         if unchanged_ticks >= timeout * 60 then
-          timed_out_key = selected_key
-          Mode.reset(record)
+          move_order_to_back(selected_key)
+          clear_current_order(record)
           selected_demand, selected_recipe = nil, nil
         end
       end
@@ -204,18 +236,9 @@ function Mode.calculate(record)
     record.production_order_output_count = nil
     record.production_order_changed_tick = nil
     if not config.remember_order then record.remembered_order = nil end
-    -- 超时后从当前订单的下一项开始循环；正常完成时仍从排序后的第一项开始。
-    local start_index = 1
-    if timed_out_key then
-      for index, demand in ipairs(demands) do
-        if Util.signal_key(demand.signal) == timed_out_key then
-          start_index = index % #demands + 1
-          break
-        end
-      end
-    end
-    for offset = 0, #demands - 1 do
-      local demand = demands[(start_index + offset - 1) % #demands + 1]
+    -- 超时订单已经被移到队尾；后续订单即使完成，也继续从队首向后扫描，不会让它插队。
+    for _, key in ipairs(order_queue) do
+      local demand = demands_by_key[key]
       local recipe, _, signal = eligible(demand, false)
       if recipe then
         selected_demand, selected_recipe, selected_signal = demand, recipe, signal

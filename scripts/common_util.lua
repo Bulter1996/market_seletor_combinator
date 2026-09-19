@@ -132,6 +132,24 @@ local function recipe_product_key(signal_type, name)
   return (signal_type or "item") .. ":" .. tostring(name or "")
 end
 
+---生成配方内容签名，用于折叠不同内部名称但生产内容完全相同的模组兼容配方。
+---制造类别不参与签名：候选已经按当前机器过滤，同一机器中的等价类别无需重复展示。
+local function recipe_content_signature(recipe)
+  local function entries_signature(entries)
+    local parts = {}
+    for _, entry in pairs(entries or {}) do
+      parts[#parts + 1] = table.concat({entry.type or "item", entry.name or "",
+        tostring(entry.amount or ""), tostring(entry.amount_min or ""),
+        tostring(entry.amount_max or ""), tostring(entry.probability or 1),
+        tostring(entry.temperature or "")}, ":")
+    end
+    table.sort(parts)
+    return table.concat(parts, ",")
+  end
+  return entries_signature(recipe.ingredients) .. "->" .. entries_signature(recipe.products)
+    .. "@" .. tostring(recipe.energy or recipe.energy_required or "")
+end
+
 ---为一台机器一次性构建全部产品配方和结构层级。
 ---@param machine_name string 制造机实体原型名。
 ---@return table cache 机器配方缓存。
@@ -142,7 +160,7 @@ local function get_machine_recipe_cache(machine_name)
   local cached = machine_recipe_cache[cache_key]
   if cached then return cached end
 
-  cached = {candidates = {}, layers = {}}
+  cached = {candidates = {}, all_candidates = {}, layers = {}}
   -- prototypes.recipe 枚举当前模组组合下的全部配方原型。这里先用机器实体原型的
   -- crafting_categories 筛掉机器无法执行的制造类别，再用 products 建立反向索引：
   -- product type+name -> 能生产它的配方。ingredients 为空和 recycling 配方不参与递归。
@@ -157,6 +175,9 @@ local function get_machine_recipe_cache(machine_name)
           local main_product = recipe.main_product
           local primary = main_product and main_product.type == product.type and main_product.name == product.name
           local same_name = recipe.name == product.name
+          local all_candidates = cached.all_candidates[key]
+          if not all_candidates then all_candidates = {}; cached.all_candidates[key] = all_candidates end
+          all_candidates[#all_candidates + 1] = {recipe = recipe, primary = primary, same_name = same_name}
           -- 多产物配方的普通副产品不能证明机器能“以该物品为目标”继续生产。否则铁板等
           -- 基础材料可能因为某个副产物配方被错误标记为可递归，并在下一深度展开为空。
           -- 单产物配方即使名称不同、未显式声明 main_product，也仍是明确的生产路径。
@@ -170,6 +191,13 @@ local function get_machine_recipe_cache(machine_name)
     end
   end
   for _, candidates in pairs(cached.candidates) do
+    table.sort(candidates, function(a, b)
+      if a.primary ~= b.primary then return a.primary end
+      if a.same_name ~= b.same_name then return a.same_name end
+      return a.recipe.name < b.recipe.name
+    end)
+  end
+  for _, candidates in pairs(cached.all_candidates) do
     table.sort(candidates, function(a, b)
       if a.primary ~= b.primary then return a.primary end
       if a.same_name ~= b.same_name then return a.same_name end
@@ -205,6 +233,28 @@ local function get_machine_recipe_cache(machine_name)
   for key in pairs(cached.candidates) do calculate_layer(key) end
   machine_recipe_cache[cache_key] = cached
   return cached
+end
+
+---列出当前势力已解锁、机器支持且确实产出目标信号的全部配方。
+---与自动选择不同，这里允许目标只是副产物：玩家手动指定已经消除了生产意图的歧义。
+---@param force LuaForce 实体所属势力。
+---@param target_signal SignalID 目标物品或流体。
+---@param machine_name string 制造机实体原型名。
+---@return table recipes 按稳定优先级排列的 LuaRecipePrototype 数组。
+function Util.available_recipes(force, target_signal, machine_name)
+  if not (Util.is_recipe_signal(target_signal) and force and force.recipes) then return {} end
+  local cache = get_machine_recipe_cache(machine_name)
+  local candidates = cache.all_candidates[recipe_product_key(target_signal.type, target_signal.name)] or {}
+  local recipes, seen = {}, {}
+  for _, candidate in ipairs(candidates) do
+    local force_recipe = force.recipes[candidate.recipe.name]
+    local signature = recipe_content_signature(candidate.recipe)
+    if force_recipe and force_recipe.enabled and candidate.recipe.hidden ~= true
+      and Util.machine_supports(machine_name, candidate.recipe) and not seen[signature] then
+      recipes[#recipes + 1], seen[signature] = candidate.recipe, true
+    end
+  end
+  return recipes
 end
 
 ---取得指定机器能够制造目标信号的稳定候选配方列表。

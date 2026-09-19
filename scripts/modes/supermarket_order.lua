@@ -3,7 +3,8 @@
 
 local Util = require("scripts.common_util")
 local Conditions = require("scripts.conditions")
-local PLAN_REVISION = 17
+local OrderTarget = require("scripts.order_target")
+local PLAN_REVISION = 18
 local Mode = {
   name = "supermarket_order",                        -- 模式注册名，必须与 config.lua 的值一致。
   -- 原生 select/max 即使关闭 output_networks，仍会计算输入并把结果显示在实体信息的
@@ -173,9 +174,14 @@ function Mode.calculate(record)
 
   ---订单签名只包含会参与计算的正数产品或配方信号；数量或种类变化都会触发重建。
   local signature_parts = {}
+  local resolved_targets = {}
   for _, demand in ipairs(demands) do
     if Util.is_recipe_input(demand.signal) and demand.count > 0 then
-      signature_parts[#signature_parts + 1] = Util.signal_key(demand.signal) .. "=" .. tostring(demand.count)
+      local key = Util.signal_key(demand.signal)
+      local target = OrderTarget.resolve(record.entity.force, config.production_machine, demand.signal, config)
+      resolved_targets[key] = target
+      signature_parts[#signature_parts + 1] = key .. "=" .. tostring(demand.count)
+        .. "@" .. tostring(target.signature)
     end
   end
   local order_signature = table.concat(signature_parts, "|")
@@ -256,15 +262,19 @@ function Mode.calculate(record)
     }
     for _, demand in ipairs(demands) do
       if Util.is_recipe_input(demand.signal) and demand.count > 0 then
-        local signal, specified_recipe = Util.resolve_recipe_input(demand.signal, config.production_machine)
-        specified_recipe = signal and specified_recipe and Util.find_recipe(
-          record.entity.force, signal, config.production_machine, specified_recipe) or nil
+        local target = resolved_targets[Util.signal_key(demand.signal)]
+        local signal, specified_recipe = target and target.signal, target and target.recipe
         if signal and (demand.signal.type ~= "recipe" or specified_recipe) then
           local root = build_plan_node(signal, demand.count, 1, {}, specified_recipe)
           root.source_key = Util.signal_key(demand.signal)
-          -- 库存和递归始终使用产品信号；只有根订单输出时恢复玩家输入的配方信号。
+          root.validation_products = target.products
+          root.manual_recipe = target.manual_recipe
+          -- 库存和递归始终使用产品信号；配方输入及手动选配方的根订单输出配方信号，
+          -- 使下游机器能够识别玩家明确指定的制造路径。
           if demand.signal.type == "recipe" then
             root.output_signal = Util.make_signal("recipe", demand.signal.name)
+          elseif target.manual_recipe then
+            root.output_signal = Util.make_signal("recipe", target.manual_recipe)
           end
           plan.roots[#plan.roots + 1] = root
         end
@@ -337,12 +347,28 @@ function Mode.calculate(record)
   local sequential = config.recursion_output_mode == "single" and config.sequential_production ~= false
   local roots_to_resolve = {}
   local root_targets = {}
+  local root_requirements = {}
   local active_order_key = sequential and nil or "*"
   local active_order_keys = {}
   local active_orders = type(record.supermarket_active_orders) == "table"
     and record.supermarket_active_orders or {}
   record.supermarket_active_orders = active_orders
   local completed_order_keys = {}
+  local function root_status(root, goal)
+    return OrderTarget.inventory_status(root.validation_products or {root.signal}, observed_inventory, goal)
+  end
+  local function remember_root_requirements(root, extended_target)
+    local stock = math.max(0, observed_inventory[Util.signal_key(root.signal)] or 0)
+    local base = root_status(root, root.amount)
+    local extended = root_status(root, extended_target)
+    -- 递归层仍以根产品信号表达生产请求；把最大选中产物缺口平移到该信号的当前库存，
+    -- 即可复用原有产量与原料展开，而不会把库存目标按副产物比例换算。
+    root_requirements[root.source_key] = {
+      base = stock + base.remaining,
+      extended = stock + extended.remaining,
+      status = extended
+    }
+  end
   if sequential then
     if record.supermarket_sequence_signature ~= order_signature then
       record.supermarket_sequence_signature = order_signature
@@ -354,10 +380,9 @@ function Mode.calculate(record)
     if config.recursion_strict_validation == true then
       -- 当前项运行时仍为队列中其他订单保留具体校验原因，避免输入悬浮框退化为“等待中”。
       for _, root in ipairs(plan.roots) do
-        local stock = observed_inventory[Util.signal_key(root.signal)] or 0
         local target = active_orders[root.source_key]
           and root.amount * (1 + additional_rate) or root.amount
-        if stock < target then
+        if not root_status(root, target).satisfied then
           strict_order_diagnostics[root.source_key] = strict_order_diagnostic(root)
         end
       end
@@ -370,10 +395,9 @@ function Mode.calculate(record)
     local selected
     for _ = 1, root_count do
       local root = plan.roots[sequence_index]
-      local stock = observed_inventory[Util.signal_key(root.signal)] or 0
       local extended_target = root.amount * (1 + additional_rate)
       local target = active_orders[root.source_key] and extended_target or root.amount
-      if stock < target then
+      if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostics[root.source_key]
         if diagnostic then
           active_orders[root.source_key] = nil
@@ -383,6 +407,7 @@ function Mode.calculate(record)
           record.supermarket_active_orders = active_orders
           roots_to_resolve[1] = root
           root_targets[root.source_key] = extended_target
+          remember_root_requirements(root, extended_target)
           active_order_key = root.source_key
           active_order_keys[root.source_key] = true
           selected = true
@@ -399,10 +424,9 @@ function Mode.calculate(record)
   else
     -- 非顺序模式允许多个订单同时处于迟滞区间：库存低于基础目标时启动，达到扩展目标后退出。
     for _, root in ipairs(plan.roots) do
-      local stock = observed_inventory[Util.signal_key(root.signal)] or 0
       local extended_target = root.amount * (1 + additional_rate)
       local target = active_orders[root.source_key] and extended_target or root.amount
-      if stock < target then
+      if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostic(root)
         if diagnostic then
           strict_order_diagnostics[root.source_key] = diagnostic
@@ -411,6 +435,7 @@ function Mode.calculate(record)
           active_order_keys[root.source_key] = true
           roots_to_resolve[#roots_to_resolve + 1] = root
           root_targets[root.source_key] = extended_target
+          remember_root_requirements(root, extended_target)
         end
       else
         active_orders[root.source_key] = nil
@@ -723,7 +748,9 @@ function Mode.calculate(record)
     for _, root in ipairs(roots_to_resolve) do
       current_root_detail = {outputs = {}, stages = {}}
       root_details[root.source_key] = current_root_detail
-      resolve(root, root.amount, root_targets[root.source_key] or root.amount, false, true)
+      local requirements = root_requirements[root.source_key]
+        or {base = root.amount, extended = root_targets[root.source_key] or root.amount}
+      resolve(root, requirements.base, requirements.extended, false, true)
     end
     -- 缓存只保存普通数组，避免 GUI 依赖内部聚合映射，也保证同一订单的输出顺序稳定。
     for _, detail in pairs(root_details) do
@@ -842,14 +869,14 @@ function Mode.calculate(record)
     end
     for _, demand in ipairs(demands) do
       local source_key = Util.signal_key(demand.signal)
-      local signal, specified_recipe = Util.resolve_recipe_input(demand.signal, config.production_machine)
+      local target = resolved_targets[source_key]
+      local signal, specified_recipe = target and target.signal, target and target.recipe
       local diagnostic
       if not Util.is_recipe_input(demand.signal) then
         diagnostic = {kind = "unsupported_signal"}
       elseif demand.count <= 0 then
         diagnostic = {kind = "non_positive_order"}
-      elseif not signal or (specified_recipe and not Util.find_recipe(
-        record.entity.force, signal, config.production_machine, specified_recipe)) then
+      elseif not signal or (demand.signal.type == "recipe" and not specified_recipe) then
         diagnostic = {kind = "no_recipe"}
       elseif strict_order_diagnostics[source_key] then
         diagnostic = strict_order_diagnostics[source_key]
@@ -858,30 +885,36 @@ function Mode.calculate(record)
       elseif sequential and active_order_key and source_key ~= active_order_key then
         diagnostic = {kind = "waiting_for_order", signal = active_signal}
       elseif active_order_keys[source_key] then
-        diagnostic = final_outputs[source_key] and {kind = "active_output"}
+        local root = roots_by_source[source_key]
+        local output_key = root and Util.signal_key(node_output_signal(root)) or source_key
+        diagnostic = final_outputs[output_key] and {kind = "active_output"}
           or {kind = "supermarket_expanding"}
       elseif not final_outputs[source_key] then
-        local stock = observed_inventory[Util.signal_key(signal)] or 0
-        diagnostic = stock >= demand.count and {kind = "stock_sufficient", stock = stock}
+        local status = OrderTarget.inventory_status(target.products, observed_inventory, demand.count)
+        diagnostic = status.satisfied and {kind = "stock_sufficient",
+          stock = status.products[1] and status.products[1].stock or 0, products = status.products}
           or {kind = "supermarket_expanding"}
       end
       if diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "supermarket_expanding") then
         local root = roots_by_source[source_key]
         local detail = root_details[source_key]
         if root then
-          local product_stock = math.max(0, observed_inventory[Util.signal_key(root.signal)] or 0)
           -- 信号只能输出整数；目标出现小数时展示真正能够解除订单的最小整数库存。
           local product_target = math.ceil(root_targets[source_key] or root.amount * (1 + additional_rate))
+          local status = OrderTarget.inventory_status(
+            root.validation_products or {root.signal}, observed_inventory, product_target)
+          local product = status.products[1]
           diagnostic.order = {
             signal = Util.make_signal(demand.signal.type, demand.signal.name, demand.signal.quality),
             count = demand.count
           }
           diagnostic.product = {
-            signal = Util.make_signal(root.signal.type, root.signal.name, root.signal.quality),
-            target = product_target,
-            stock = product_stock,
-            remaining = math.max(0, product_target - product_stock)
+            signal = Util.make_signal(product.signal.type, product.signal.name, product.signal.quality),
+            target = product.target, stock = product.stock, remaining = product.remaining
           }
+          diagnostic.products = status.products
+          diagnostic.recipe_name = root.recipe_name
+          diagnostic.manual_recipe = root.manual_recipe ~= nil
           if config.recursion_output_mode == "all" then
             diagnostic.outputs = detail and detail.outputs or {}
           elseif detail then

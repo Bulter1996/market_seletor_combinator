@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 12
+Config.schema_revision = 13
 
 Config.mode = {
   production_order = "production_order",
@@ -24,6 +24,28 @@ local LEGACY_ORDER_RECURSION = "order_recursion"
 local function default_conditions()
   return {{relation = "or", first = {red = true, green = true, constant = 0}, comparator = "<",
     second = {red = true, green = true, constant = 0}}}
+end
+
+---复制每个订单信号的手动配方和库存校验产物。
+---这里只接受纯 Lua 数据；原型是否仍存在由运行阶段按当前模组、机器和科技重新判断。
+local function normalize_order_targets(source)
+  local targets = {}
+  for source_key, entry in pairs(type(source) == "table" and source or {}) do
+    if type(source_key) == "string" and type(entry) == "table" then
+      local products, seen = {}, {}
+      for _, product in ipairs(type(entry.products) == "table" and entry.products or {}) do
+        local signal = Config.normalize_signal(product)
+        if signal and (signal.type == "item" or signal.type == "fluid") then
+          local key = signal.type .. ":" .. signal.name
+            .. (signal.type == "item" and ":" .. (signal.quality or "normal") or "")
+          if not seen[key] then products[#products + 1], seen[key] = signal, true end
+        end
+      end
+      local recipe = type(entry.recipe) == "string" and entry.recipe or nil
+      if recipe or products[1] then targets[source_key] = {recipe = recipe, products = products} end
+    end
+  end
+  return targets
 end
 
 ---把 GUI、蓝图或旧存档中的信号配置收敛为可持久化的 SignalID。
@@ -60,6 +82,7 @@ function Config.default()
     schema_revision = Config.schema_revision,          -- 内部字段：用于识别热加载遗留的旧配置。
     mode = Config.mode.supermarket_order,          -- 参数：当前操作模式。
     production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
+    order_targets = {},                          -- 参数：订单信号对应的手动配方与库存校验产物。
     multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
     recipe_query_cache_grid_number = 0,           -- 参数：多配方查询可占用的原料缓存格数。
     query_type = Config.query_type.all,            -- 参数：共享库存查询包含流体、物品或两者。
@@ -135,6 +158,7 @@ function Config.normalize(source)
     config.mode = Config.mode.supermarket_order
   end
   if type(source.production_machine) == "string" then config.production_machine = source.production_machine end
+  config.order_targets = normalize_order_targets(source.order_targets)
   if type(source.multiple_recipe_support) == "boolean" then
     config.multiple_recipe_support = source.multiple_recipe_support
   end

@@ -43,6 +43,15 @@ assert(normalized.swap_loop == false)
 assert(normalized.swap_conditions[1].first.signal.name == "signal-R")
 assert(normalized.swap_conditions[1].second.signal.type == "item")
 assert(normalized.swap_conditions[1].first.signal ~= reset)
+local target_source = {['item:product:normal'] = {recipe = 'make-product', products = {
+  {type = 'item', name = 'product', quality = 'normal'},
+  {type = 'item', name = 'product', quality = 'normal'}
+}}}
+local normalized_targets = Config.normalize{order_targets = target_source}.order_targets
+assert(normalized_targets['item:product:normal'].recipe == 'make-product')
+assert(#normalized_targets['item:product:normal'].products == 1)
+target_source['item:product:normal'].products[1].name = 'changed'
+assert(normalized_targets['item:product:normal'].products[1].name == 'product')
 local copied = Config.normalize{mode = Config.mode.swap_order, swap_timeout = 12, swap_loop = true,
   recipe_query_cache_grid_number = 7,
   recursion_material_wait_time = 7,

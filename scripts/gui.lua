@@ -7,6 +7,7 @@ local Config = require("scripts.config")               -- 只读取模式常量�
 local Util = require("scripts.common_util")            -- 复用稳定信号键，将生产诊断绑定到对应绿色输入。
 
 Gui.name = "bmsc-window"                              -- 参数：窗口唯一名称，供 control.lua 识别事件来源。
+Gui.order_target_name = "bmsc-order-target-window"    -- 参数：Shift+左键打开的配方与库存校验子窗口。
 Gui.network_info_name = "bmsc-network-info"           -- 参数：网络信息图标名称前缀；实际名称会追加颜色和网络编号。
 Gui.network_popup_name = "bmsc-network-popup"         -- 参数：仿原版网络信号悬浮面板的唯一名称。
 Gui.production_order = Config.mode.production_order    -- 参数：生产订单模式标识，只用于决定参数区是否可见。
@@ -207,11 +208,21 @@ local function active_order_tooltip(diagnostic)
   local order = diagnostic.order
   local product = diagnostic.product
   add_line({"bmsc.production-active-order-line", signal_localised_label(order.signal), order.count})
+  if diagnostic.recipe_name then
+    add_line({"bmsc.production-active-recipe-line",
+      signal_localised_label(Util.make_signal("recipe", diagnostic.recipe_name)),
+      {diagnostic.manual_recipe and "bmsc.order-target-manual" or "bmsc.order-target-automatic"}})
+  end
   if (order.signal.type or "item") == "recipe" then
     add_line({"bmsc.production-active-product-line", signal_localised_label(product.signal)})
   end
-  add_line({"bmsc.production-active-target-line", signal_localised_label(product.signal),
-    product.target, product.stock, product.remaining})
+  local checked_products = type(diagnostic.products) == "table" and diagnostic.products or {product}
+  for _, checked in ipairs(checked_products) do
+    if checked.signal then
+      add_line({"bmsc.production-active-target-line", signal_localised_label(checked.signal),
+        checked.target, checked.stock, checked.remaining})
+    end
+  end
 
   local outputs = diagnostic.outputs
   if type(outputs) == "table" and outputs[1] then
@@ -309,7 +320,10 @@ function Gui.production_diagnostic_tooltip(diagnostic)
     local shortages = shortage_localised_list(diagnostic.shortages)
     reason = shortages and {"bmsc.supermarket-reason-strict-materials", shortages} or nil
   elseif diagnostic.kind == "stock_sufficient" then
-    reason = {"bmsc.production-reason-stock-sufficient", diagnostic.stock}
+    local products = type(diagnostic.products) == "table" and diagnostic.products or nil
+    local stocks = products and signal_count_localised_list(products, "stock")
+    reason = stocks and {"bmsc.production-reason-products-sufficient", stocks}
+      or {"bmsc.production-reason-stock-sufficient", diagnostic.stock}
   elseif diagnostic.kind == "no_recipe" then
     reason = {"bmsc.production-reason-no-recipe"}
   elseif diagnostic.kind == "surface_conditions" then
@@ -479,7 +493,8 @@ local function refresh_signal_section(section, networks, diagnostics)
             bmsc_signal_color = color,
             bmsc_signal_key = Util.signal_key(entry.signal),
             bmsc_signal_type = entry.signal.type or "item",
-            bmsc_signal_name = entry.signal.name
+            bmsc_signal_name = entry.signal.name,
+            bmsc_signal_quality = Util.quality_name(entry.signal.quality)
           }}
         apply_diagnostic_signal_style(slot, color, diagnostic)
         local quality = type(entry.signal.quality) == "string" and entry.signal.quality
@@ -490,6 +505,111 @@ local function refresh_signal_section(section, networks, diagnostics)
       end
     end
   end
+end
+
+---打开订单配方和库存校验产物子窗口。
+---子窗口成为 player.opened，因此 Esc 只先关闭它；关闭后 control.lua 会恢复后方主窗口。
+function Gui.open_order_target(player, order_signal, order_count, target, recipes)
+  local old = player.gui.screen[Gui.order_target_name]
+  if old then old.destroy() end
+
+  local frame = player.gui.screen.add{type = "frame", name = Gui.order_target_name, direction = "vertical",
+    tags = {bmsc_source_key = target.source_key, bmsc_signal_type = order_signal.type or "item",
+      bmsc_signal_name = order_signal.name, bmsc_signal_quality = Util.quality_name(order_signal.quality),
+      bmsc_order_count = order_count}}
+  frame.style.width = 440
+  frame.force_auto_center()
+  local titlebar = frame.add{type = "flow", direction = "horizontal"}
+  titlebar.drag_target = frame
+  titlebar.add{type = "label", caption = {"bmsc.order-target-title"}, style = "frame_title"}.drag_target = frame
+  local dragger = titlebar.add{type = "empty-widget", style = "draggable_space_header"}
+  dragger.style.horizontally_stretchable = true
+  dragger.style.height = 24
+  dragger.drag_target = frame
+  titlebar.add{type = "sprite-button", name = "bmsc-order-target-close", sprite = "utility/close",
+    style = "frame_action_button", tooltip = {"gui.close"}}
+
+  local content = frame.add{type = "flow", direction = "vertical"}
+  content.style.padding = 8
+  content.style.vertical_spacing = 8
+  content.add{type = "label", caption = {"bmsc.order-target-order",
+    signal_localised_label(order_signal), order_count}}
+
+  content.add{type = "label", caption = {"bmsc.order-target-recipe"}, style = "heading_2_label"}
+  local function recipe_tags(recipe_name)
+    return {bmsc_order_target_recipe = recipe_name or false,
+      bmsc_signal_type = order_signal.type or "item", bmsc_signal_name = order_signal.name,
+      bmsc_signal_quality = Util.quality_name(order_signal.quality), bmsc_order_count = order_count}
+  end
+  if order_signal.type == "recipe" then
+    local recipe = target.recipe
+    if recipe then
+      local row = content.add{type = "flow", direction = "horizontal"}
+      row.add{type = "sprite-button", sprite = "recipe/" .. recipe.name, style = "slot_button",
+        elem_tooltip = {type = "recipe", name = recipe.name}}
+      row.add{type = "label", caption = recipe.localised_name}
+    else
+      content.add{type = "label", caption = {"bmsc.order-target-no-recipe"}}
+    end
+  else
+    content.add{type = "button", name = "bmsc-order-target-auto-recipe",
+      caption = {"bmsc.order-target-auto-recipe", target.automatic_recipe
+        and target.automatic_recipe.localised_name or {"bmsc.order-target-no-recipe"}},
+      style = target.manual_recipe and "button" or "confirm_button", tags = recipe_tags(nil)}
+    local scroll = content.add{type = "scroll-pane", direction = "vertical",
+      horizontal_scroll_policy = "never", vertical_scroll_policy = "auto"}
+    scroll.style.horizontally_stretchable = true
+    scroll.style.maximal_height = 180
+    if not recipes[1] then
+      scroll.add{type = "label", caption = {"bmsc.order-target-no-recipe"}}
+    end
+    for _, recipe in ipairs(recipes or {}) do
+      local row = scroll.add{type = "flow", direction = "horizontal"}
+      row.style.vertical_align = "center"
+      row.add{type = "sprite-button", sprite = "recipe/" .. recipe.name,
+        style = target.manual_recipe == recipe.name and "green_circuit_network_content_slot" or "slot_button",
+        elem_tooltip = {type = "recipe", name = recipe.name}, tags = recipe_tags(recipe.name)}
+      row.add{type = "label", caption = recipe.localised_name}
+    end
+  end
+
+  content.add{type = "label", caption = {"bmsc.order-target-products"}, style = "heading_2_label"}
+  local selected = {}
+  for _, product in ipairs(target.products or {}) do selected[Util.signal_key(product)] = true end
+  local products = content.add{type = "table", column_count = 8}
+  for _, product in ipairs(target.available_products or {}) do
+    local chosen = selected[Util.signal_key(product)] == true
+    local button = products.add{type = "sprite-button", sprite = signal_sprite_path(product),
+      style = chosen and "green_circuit_network_content_slot" or "slot_button",
+      elem_tooltip = signal_elem_tooltip(product), tooltip = chosen
+        and {"bmsc.order-target-selected"} or {"bmsc.order-target-not-selected"},
+      tags = {bmsc_order_target_product = true, bmsc_signal_type = product.type or "item",
+        bmsc_signal_name = product.name, bmsc_signal_quality = Util.quality_name(product.quality),
+        bmsc_order_count = order_count}}
+    if product.type == "item" and product.quality and product.quality ~= "normal" then
+      button.quality = product.quality
+    end
+  end
+  local help = content.add{type = "label", caption = {"bmsc.order-target-help"}}
+  help.style.single_line = false
+  help.style.maximal_width = 420
+  player.opened = frame
+  return frame
+end
+
+---关闭订单子窗口；restore_main 为 true 时让下一次 Esc 继续关闭后方主窗口。
+function Gui.close_order_target(player, restore_main)
+  local frame = player.gui.screen[Gui.order_target_name]
+  if frame and frame.valid then frame.destroy() end
+  local main = player.gui.screen[Gui.name]
+  player.opened = restore_main and main and main.valid and main or nil
+end
+
+---销毁留在子窗口后方的主窗口，但不改写 player.opened（它可能已经指向另一个实体）。
+function Gui.destroy_background(player)
+  Gui.hide_network_popup(player)
+  local frame = player.gui.screen[Gui.name]
+  if frame and frame.valid then frame.destroy() end
 end
 
 ---创建一个有独立边界、内容可按需纵向滚动的信号子 GUI。
@@ -1110,6 +1230,7 @@ end
 ---@return LuaGuiElement frame 新创建的主窗口。
 function Gui.open(player, entity, config, current_output_networks, input_diagnostics)
   Gui.hide_network_popup(player)
+  Gui.close_order_target(player, false)
   local old = player.gui.screen[Gui.name]
   if old then old.destroy() end
 
@@ -1468,6 +1589,7 @@ end
 ---@return nil
 function Gui.close(player)
   Gui.hide_network_popup(player)
+  Gui.close_order_target(player, false)
   local frame = player.gui.screen[Gui.name]
   player.opened = nil
   if frame and frame.valid then frame.destroy() end

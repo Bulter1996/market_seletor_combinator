@@ -1,17 +1,28 @@
 package.path = "./?.lua;" .. package.path
 
 local product = {type = "item", name = "widget", amount = 1}
+local byproduct = {type = "item", name = "slag", amount = 1}
 local recipe_a = {
   name = "widget-a", categories = {"crafting"}, ingredients = {{type = "item", name = "iron", amount = 1}},
   products = {product}, main_product = product
 }
 local recipe_b = {
   name = "widget-b", categories = {"crafting"}, ingredients = {{type = "item", name = "copper", amount = 1}},
-  products = {product}, main_product = product
+  products = {product, byproduct}, main_product = product
+}
+local recipe_b_clone = {
+  name = "widget-b-clone", categories = {"crafting"},
+  ingredients = {{type = "item", name = "copper", amount = 1}},
+  products = {product, byproduct}, main_product = product
+}
+local recipe_other_machine = {
+  name = "widget-smelting", categories = {"smelting"},
+  ingredients = {{type = "item", name = "stone", amount = 1}}, products = {product}, main_product = product
 }
 prototypes = {
   entity = {assembler = {crafting_categories = {crafting = true}}},
-  recipe = {[recipe_a.name] = recipe_a, [recipe_b.name] = recipe_b},
+  recipe = {[recipe_a.name] = recipe_a, [recipe_b.name] = recipe_b,
+    [recipe_b_clone.name] = recipe_b_clone, [recipe_other_machine.name] = recipe_other_machine},
   item = {
     iron = {stack_size = 2, has_flag = function() return false end},
     copper = {stack_size = 2, has_flag = function() return false end}
@@ -25,9 +36,34 @@ local query_signal, query_recipe = Util.resolve_recipe_input({type = "recipe", n
 assert(query_signal.type == "item" and query_signal.name == "widget" and query_recipe == recipe_b)
 assert(Util.find_recipe_ignoring_research(signal, "assembler") == recipe_a)
 assert(Util.find_recipe_ignoring_research(signal, "assembler", specified) == recipe_b)
-local force = {index = 1, recipes = {['widget-a'] = {enabled = true}, ['widget-b'] = {enabled = true}}}
+local force = {index = 1, recipes = {['widget-a'] = {enabled = true}, ['widget-b'] = {enabled = true},
+  ['widget-b-clone'] = {enabled = true}, ['widget-smelting'] = {enabled = true}}}
 assert(Util.find_recipe(force, signal, "assembler", specified) == recipe_b)
 assert(Util.resolve_recipe_input({type = "recipe", name = "widget-b"}, "furnace") == nil)
+
+local OrderTarget = require("scripts.order_target")
+assert(#OrderTarget.available_recipes(
+  force, "assembler", {type = "item", name = "widget", quality = "normal"}) == 2)
+local manual_config = {order_targets = {['item:widget:normal'] = {
+  recipe = "widget-b", products = {
+    {type = "item", name = "widget", quality = "normal"},
+    {type = "item", name = "slag", quality = "normal"}
+  }
+}}}
+local manual_target = OrderTarget.resolve(
+  force, "assembler", {type = "item", name = "widget", quality = "normal"}, manual_config)
+assert(manual_target.recipe == recipe_b and manual_target.manual_recipe == "widget-b")
+assert(#manual_target.products == 2)
+local multi_status = OrderTarget.inventory_status(manual_target.products,
+  {['item:widget:normal'] = 3, ['item:slag:normal'] = 2}, 3)
+assert(not multi_status.satisfied and multi_status.remaining == 1)
+local invalid_config = {order_targets = {['item:widget:normal'] = {
+  recipe = 'removed-recipe', products = {{type = 'item', name = 'removed-product'}}
+}}}
+local fallback_target = OrderTarget.resolve(
+  force, 'assembler', {type = 'item', name = 'widget', quality = 'normal'}, invalid_config)
+assert(fallback_target.recipe == recipe_a and invalid_config.order_targets['item:widget:normal'].recipe == nil)
+assert(fallback_target.products[1].name == 'widget')
 
 defines = {wire_connector_id = {combinator_input_red = 1, combinator_input_green = 2}}
 game = {tick = 0}
@@ -95,6 +131,25 @@ local separated = ProductionOrder.calculate({entity = entity, config = {
 assert(separated.separated and separated.red["item:copper:normal"].count == 2)
 assert(separated.green["recipe:widget-b"].count == 3)
 
+-- 普通物品订单可以固定另一条合法配方；主产品已达标时，所选副产物不足仍继续输出。
+recipe_entry = {{signal = {type = "item", name = "widget", quality = "normal"}, count = 3}}
+inventory_entries = {
+  {signal = {type = "item", name = "widget", quality = "normal"}, count = 3},
+  {signal = {type = "item", name = "slag", quality = "normal"}, count = 1},
+  {signal = {type = "item", name = "copper", quality = "normal"}, count = 10}
+}
+local manual_record = {entity = entity, config = {
+  production_machine = "assembler", order_targets = manual_config.order_targets,
+  remember_order = false, production_timeout = 0, additional_production_rate = 0,
+  material_demand_rate = 1, material_retention_rate = 0, output_mode = "only_item"
+}}
+local manual_output = ProductionOrder.calculate(manual_record)
+assert(manual_output['recipe:widget-b'].count == 2 and manual_output['item:widget:normal'] == nil)
+assert(#manual_record.production_order_diagnostics['item:widget:normal'].products == 2)
+inventory_entries[2].count = 3
+assert(next(ProductionOrder.calculate(manual_record)) == nil)
+
+recipe_entry = {{signal = {type = "recipe", name = "widget-b"}, count = 3}}
 local supermarket_inventory = {}
 entity.get_signals = function(connector_id)
   return connector_id == defines.wire_connector_id.combinator_input_green and recipe_entry
@@ -125,5 +180,22 @@ assert(recipe_diagnostic.product.signal.type == "item"
   and recipe_diagnostic.product.signal.name == "widget" and recipe_diagnostic.product.target == 3)
 assert(recipe_diagnostic.stage.signal.type == "item"
   and recipe_diagnostic.stage.signal.name == "widget" and recipe_diagnostic.stage.output_count == 3)
+
+recipe_entry = {{signal = {type = "item", name = "widget", quality = "normal"}, count = 3}}
+supermarket_inventory = {
+  {signal = {type = "item", name = "widget", quality = "normal"}, count = 3},
+  {signal = {type = "item", name = "slag", quality = "normal"}, count = 1},
+  {signal = {type = "item", name = "copper", quality = "normal"}, count = 10}
+}
+local multi_supermarket = {entity = entity, config = {
+  production_machine = "assembler", order_targets = manual_config.order_targets,
+  recursion_output_mode = "all", sequential_production = false, recurise_depth = 1,
+  recursion_additional_production_rate = 0
+}}
+local manual_supermarket_output = SupermarketOrder.calculate(multi_supermarket)
+assert(manual_supermarket_output['recipe:widget-b'].count == 2
+  and manual_supermarket_output['item:widget:normal'] == nil)
+supermarket_inventory[2].count = 3
+assert(next(SupermarketOrder.calculate(multi_supermarket)) == nil)
 
 print("recipe input compatibility: ok")

@@ -19,6 +19,7 @@ local MODE_RECIPE_QUERY = Config.mode.recipe_query
 local MODE_INVENTORY_QUERY = Config.mode.inventory_query
 local MODE_SWAP_ORDER = Config.mode.swap_order
 local MAX_PROXY_SIGNALS = 65535                    -- Factorio 常量运算器筛选索引的 uint16 上限。
+local DOUBLE_CLICK_TICKS = 30                      -- 0.5 秒：等待订单左键双击判定窗口。
 local refresh_open_order_targets                    -- 研究事件发生时刷新仍打开的配方选择窗口。
 
 
@@ -29,6 +30,7 @@ local function state()
   -- 防御开发期脚本曾写入错误类型的半旧 storage；只依赖 `or {}` 无法修复 truthy 字符串。
   if type(storage.combinators) ~= "table" then storage.combinators = {} end
   if type(storage.player_gui) ~= "table" then storage.player_gui = {} end
+  if type(storage.signal_clicks) ~= "table" then storage.signal_clicks = {} end
   return storage
 end
 
@@ -617,6 +619,21 @@ local function signal_from_tags(tags)
     tags.bmsc_signal_type, tags.bmsc_signal_name, tags.bmsc_signal_quality) or nil
 end
 
+---按玩家记录上次普通左键点击，避免多人同时查看同一运算器时互相触发双击。
+---@param player_index uint 玩家索引。
+---@param record table 组合器记录。
+---@param signal_key string 被点击的订单信号键。
+---@return boolean double_clicked 同一玩家在时限内再次点击同一订单时返回 true。
+local function signal_double_clicked(player_index, record, signal_key)
+  local clicks = state().signal_clicks
+  local previous = clicks[player_index]
+  local double_clicked = previous and previous.unit_number == record.entity.unit_number
+    and previous.signal_key == signal_key and game.tick - previous.tick <= DOUBLE_CLICK_TICKS
+  clicks[player_index] = double_clicked and nil
+    or {unit_number = record.entity.unit_number, signal_key = signal_key, tick = game.tick}
+  return double_clicked == true
+end
+
 local function order_target_entry(record, source_key)
   if type(record.config.order_targets) ~= "table" then record.config.order_targets = {} end
   local entry = record.config.order_targets[source_key]
@@ -1116,6 +1133,16 @@ script.on_event(defines.events.on_gui_click, function(event)
       and record and record.config.mode == MODE_SUPERMARKET_ORDER
       and MODES[MODE_SUPERMARKET_ORDER].defer_current_order(record, tags.bmsc_signal_key) then
       -- defer_current_order 已先清除旧输出选择，因此这次重算不会进入原料等待门。
+      write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
+      Gui.refresh_connection_status(
+        player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+    elseif event.button == defines.mouse_button_type.left and not event.alt
+      and not event.control and not event.shift and tags.bmsc_signal_side == "input"
+      and tags.bmsc_signal_color == "green"
+      and record and record.config.mode == MODE_SUPERMARKET_ORDER
+      and signal_double_clicked(event.player_index, record, tags.bmsc_signal_key)
+      and MODES[MODE_SUPERMARKET_ORDER].prioritize_waiting_order(record, tags.bmsc_signal_key) then
+      -- 与右键后移一样立即重算，双击选中的等待订单不继承旧输出的原料等待。
       write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
       Gui.refresh_connection_status(
         player, record.entity, record.gui_output_networks, current_input_diagnostics(record))

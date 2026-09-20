@@ -99,6 +99,41 @@ assert(deferred_record.recursion_order_key == "item:b:normal")
 assert(deferred["item:b:normal"].count == 20)
 assert(deferred_record.recursion_material_wait_tick == nil)
 
+-- 左键双击的 GUI 分发最终调用此入口：只有等待项可被立即提升。
+assert(not Mode.prioritize_waiting_order(deferred_record, "item:b:normal"))
+assert(Mode.prioritize_waiting_order(deferred_record, "item:a:normal"))
+local prioritized = Mode.calculate(deferred_record)
+assert(deferred_record.recursion_order_key == "item:a:normal")
+assert(prioritized["item:a:normal"].count == 10)
+assert(deferred_record.recursion_material_wait_tick == nil)
+
+-- 非顺序 single 也把各根订单映射到自己的可生产候选，支持同样的后移和置顶交互。
+orders = {
+  {signal = {type = "item", name = "a", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "circuit", quality = "normal"}, count = 10}
+}
+inventory = {
+  {signal = {type = "item", name = "iron", quality = "normal"}, count = 1},
+  {signal = {type = "item", name = "wire", quality = "normal"}, count = 31},
+  {signal = {type = "item", name = "plate", quality = "normal"}, count = 11}
+}
+local nonsequential_record = {entity = entity, config = {
+  production_machine = "assembler", recursion_output_mode = "single",
+  sequential_production = false, recurise_depth = 0, recursion_timeout = 0,
+  recursion_material_wait_time = 10, recursion_material_demand_rate = 0,
+  recursion_material_retention_rate = 0
+}}
+assert(Mode.calculate(nonsequential_record)["item:a:normal"].count == 10)
+assert(nonsequential_record.recursion_order_key == "item:a:normal")
+assert(nonsequential_record.supermarket_order_diagnostics["item:circuit:normal"].kind
+  == "waiting_for_order")
+assert(Mode.prioritize_waiting_order(nonsequential_record, "item:circuit:normal"))
+assert(Mode.calculate(nonsequential_record)["item:circuit:normal"].count == 10)
+assert(nonsequential_record.recursion_material_wait_tick == nil)
+assert(Mode.defer_current_order(nonsequential_record, "item:circuit:normal"))
+assert(Mode.calculate(nonsequential_record)["item:a:normal"].count == 10)
+assert(nonsequential_record.recursion_material_wait_tick == nil)
+
 orders = {
   {signal = {type = "item", name = "a", quality = "normal"}, count = 10},
   {signal = {type = "item", name = "b", quality = "normal"}, count = 10}

@@ -48,6 +48,7 @@ function Mode.reset(record)
   reset_output_state(record)
   record.recursion_order_key = nil
   record.supermarket_active_orders = nil
+  record.supermarket_order_candidates = nil
   record.supermarket_order_diagnostics = nil
   record.supermarket_sequence_completed_orders = nil
   record.recursion_timeout_condition_results = nil
@@ -66,21 +67,67 @@ function Mode.restart_sequence(record)
   record.supermarket_sequence_signature = nil
 end
 
----把顺序制作中的当前订单移到循环队列末尾；调用方随后立即重算，因此不经过等待门。
+---后移 single 当前订单；顺序模式推进游标，非顺序模式选择下一个有候选输出的订单。
 ---@param record table 组合器记录。
 ---@param source_key string 被右键点击的绿色订单信号键。
 ---@return boolean deferred 当前订单确实被后移时返回 true。
 function Mode.defer_current_order(record, source_key)
   local config = type(record.config) == "table" and record.config or {}
-  if config.recursion_output_mode ~= "single" or config.sequential_production == false
-    or record.recursion_order_key ~= source_key then return false end
+  if config.recursion_output_mode ~= "single" or record.recursion_order_key ~= source_key then return false end
   local roots = record.supermarket_order_plan and record.supermarket_order_plan.roots or {}
   for index, root in ipairs(roots) do
     if root.source_key == source_key then
-      record.supermarket_sequence_index = index % #roots + 1
-      if type(record.supermarket_active_orders) == "table" then
-        record.supermarket_active_orders[source_key] = nil
+      if config.sequential_production ~= false then
+        record.supermarket_sequence_index = index % #roots + 1
+        if type(record.supermarket_active_orders) == "table" then
+          record.supermarket_active_orders[source_key] = nil
+        end
+        reset_output_state(record)
+        record.recursion_order_key = nil
+        return true
       end
+      local candidates = type(record.supermarket_order_candidates) == "table"
+        and record.supermarket_order_candidates or {}
+      for offset = 1, #roots - 1 do
+        local next_root = roots[(index + offset - 1) % #roots + 1]
+        local next_candidates = candidates[next_root.source_key]
+        if next_candidates and next_candidates[1] then
+          reset_output_state(record)
+          record.selected_recursion_output = next_candidates[1]
+          record.recursion_order_key = next_root.source_key
+          return true
+        end
+      end
+      return false
+    end
+  end
+  return false
+end
+
+---把双击的等待订单提升为 single 当前项。
+---@param record table 组合器记录。
+---@param source_key string 被双击的绿色订单信号键。
+---@return boolean prioritized 目标确实是等待订单时返回 true。
+function Mode.prioritize_waiting_order(record, source_key)
+  local config = type(record.config) == "table" and record.config or {}
+  local diagnostic = type(record.supermarket_order_diagnostics) == "table"
+    and record.supermarket_order_diagnostics[source_key] or nil
+  if config.recursion_output_mode ~= "single"
+    or not diagnostic or diagnostic.kind ~= "waiting_for_order" then return false end
+  if config.sequential_production == false then
+    local candidates = type(record.supermarket_order_candidates) == "table"
+      and record.supermarket_order_candidates[source_key] or nil
+    if not (candidates and candidates[1]) then return false end
+    reset_output_state(record)
+    record.selected_recursion_output = candidates[1]
+    record.recursion_order_key = source_key
+    return true
+  end
+  local roots = record.supermarket_order_plan and record.supermarket_order_plan.roots or {}
+  for index, root in ipairs(roots) do
+    if root.source_key == source_key then
+      record.supermarket_sequence_index = index
+      record.supermarket_active_orders = {}
       reset_output_state(record)
       record.recursion_order_key = nil
       return true
@@ -545,7 +592,7 @@ function Mode.calculate(record)
     end
   end
   -- 顺序订单切换时解除上一条生产链的当前输出；同一订单内仍由原料迟滞保持层级稳定。
-  if record.recursion_order_key ~= active_order_key then
+  if sequential and record.recursion_order_key ~= active_order_key then
     reset_output_state(record)
     record.recursion_inventory_shortages = nil
     record.recursion_inventory_protection_tick = nil
@@ -978,15 +1025,54 @@ function Mode.calculate(record)
     or plan.root_details_by_depth[0]
     or {}
 
+  -- 非顺序 single 仍只输出一个信号；记录每个根订单此刻真正可选的输出，供点击交互
+  -- 在不改变默认“最深缺口优先”算法的前提下切换订单归属。
+  local order_candidates = {}
+  if config.recursion_output_mode == "single" and not sequential then
+    local ordered_outputs = Util.sorted_outputs(outputs)
+    for _, root in ipairs(plan.roots) do
+      local detail = root_details[root.source_key]
+      local candidates = {}
+      for _, value in ipairs(ordered_outputs) do
+        if detail and detail.stages[value.key] then candidates[#candidates + 1] = value.key end
+      end
+      if candidates[1] then order_candidates[root.source_key] = candidates end
+    end
+  end
+  record.supermarket_order_candidates = order_candidates
+
+  local function candidate_contains(source_key, output_key)
+    for _, key in ipairs(order_candidates[source_key] or {}) do
+      if key == output_key then return true end
+    end
+    return false
+  end
+
   ---记录每个绿色订单信号当前未直接输出的原因，供公共信号面板悬浮提示。
   ---@param final_outputs table 本轮实际输出。
   local function update_diagnostics(final_outputs)
     local diagnostics = {}
     local active_signal
+    local current_order_key = active_order_key
+    if not sequential and config.recursion_output_mode == "single" then
+      local selected_key = record.selected_recursion_output
+      current_order_key = candidate_contains(record.recursion_order_key, selected_key)
+        and record.recursion_order_key or nil
+      if not current_order_key then
+        for _, root in ipairs(plan.roots) do
+          if candidate_contains(root.source_key, selected_key) then
+            current_order_key = root.source_key
+            break
+          end
+        end
+      end
+      record.recursion_order_key = current_order_key
+      active_signal = selected_key and outputs[selected_key] and outputs[selected_key].signal or nil
+    end
     local roots_by_source = {}
     for _, root in ipairs(plan.roots) do
       roots_by_source[root.source_key] = root
-      if root.source_key == active_order_key then active_signal = node_output_signal(root) end
+      if sequential and root.source_key == active_order_key then active_signal = node_output_signal(root) end
     end
     for _, demand in ipairs(demands) do
       local source_key = Util.signal_key(demand.signal)
@@ -1006,6 +1092,9 @@ function Mode.calculate(record)
       elseif sequential and completed_order_keys[source_key] then
         diagnostic = {kind = "supermarket_completed"}
       elseif sequential and active_order_key and source_key ~= active_order_key then
+        diagnostic = {kind = "waiting_for_order", signal = active_signal}
+      elseif not sequential and current_order_key and source_key ~= current_order_key
+        and order_candidates[source_key] then
         diagnostic = {kind = "waiting_for_order", signal = active_signal}
       elseif active_order_keys[source_key] then
         local root = roots_by_source[source_key]

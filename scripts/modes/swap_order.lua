@@ -57,18 +57,21 @@ end
 
 function Mode.clear(record)
   record.swap_signature = nil
+  record.swap_sources = nil
   record.swap_permutation = nil
   record.swap_condition_tick = nil
 end
 
 function Mode.save_state(record)
-  return {signature = record.swap_signature, permutation = record.swap_permutation,
+  return {signature = record.swap_signature, sources = record.swap_sources,
+    permutation = record.swap_permutation,
     condition_tick = record.swap_condition_tick}
 end
 
 function Mode.restore_state(record, saved)
   saved = saved or {}
   record.swap_signature = saved.signature
+  record.swap_sources = saved.sources
   record.swap_permutation = saved.permutation
   record.swap_condition_tick = saved.condition_tick
 end
@@ -88,14 +91,20 @@ function Mode.calculate(record)
     return a.key < b.key
   end)
   local signature_parts = {record.config.swap_output_mode}
-  for _, entry in ipairs(entries) do
-    signature_parts[#signature_parts + 1] = entry.key .. "=" .. tostring(entry.count)
-  end
+  local signature_keys = {}
+  for _, entry in ipairs(entries) do signature_keys[#signature_keys + 1] = entry.key end
+  table.sort(signature_keys)
+  for _, key in ipairs(signature_keys) do signature_parts[#signature_parts + 1] = key end
   local signature = table.concat(signature_parts, "|")
-  if record.swap_signature ~= signature or #entries ~= #(record.swap_permutation or {}) then
+  if record.swap_signature ~= signature or #entries ~= #(record.swap_sources or {})
+    or #entries ~= #(record.swap_permutation or {}) then
     record.swap_signature = signature
+    record.swap_sources = {}
     record.swap_permutation = {}
-    for index = 1, #entries do record.swap_permutation[index] = index end
+    for index, entry in ipairs(entries) do
+      record.swap_sources[index] = entry.key
+      record.swap_permutation[index] = index
+    end
     record.swap_condition_tick = nil
   end
 
@@ -118,8 +127,11 @@ function Mode.calculate(record)
   end
 
   local outputs = {}
+  local entries_by_key = {}
+  for _, entry in ipairs(entries) do entries_by_key[entry.key] = entry end
   for output_index, source_index in ipairs(record.swap_permutation or {}) do
-    local entry = entries[source_index]
+    -- 数量变化可能改变 entries 的排序；使用首次建序时保存的信号键保持当前排列不动。
+    local entry = entries_by_key[record.swap_sources[source_index]]
     if entry then
       outputs[entry.key] = {signal = entry.signal, count = 100 + output_index,
         sort_priority = #entries - output_index + 1}

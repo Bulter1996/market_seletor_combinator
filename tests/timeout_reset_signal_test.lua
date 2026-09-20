@@ -352,7 +352,7 @@ local surface_tooltip = Gui.production_diagnostic_tooltip{kind = "surface_condit
 assert(surface_tooltip[1] == "bmsc.production-no-output-reason")
 assert(surface_tooltip[2][1] == "bmsc.supermarket-reason-surface-conditions")
 
--- 切换订单默认在最后一个排列停止；输入变化后从头开始，显式开启循环才会折回第一项。
+-- 切换订单默认在最后一个排列停止；只有输入种类变化才从头开始，显式开启循环才会折回第一项。
 local swap_inputs = {
   {signal = {type = "fluid", name = "water"}, count = 20},
   {signal = {type = "fluid", name = "steam"}, count = 10},
@@ -381,12 +381,41 @@ assert(swap_record.swap_condition_tick == nil)
 swap_inputs[1].count = 21
 game.tick = 150
 SwapOrder.calculate(swap_record)
-assert(swap_record.swap_permutation[1] == 1 and swap_record.swap_permutation[2] == 2)
+assert(swap_record.swap_permutation[1] == 2 and swap_record.swap_permutation[2] == 1)
 swap_inputs[1].count = 10
 game.tick = 180
 local tied_swap = SwapOrder.calculate(swap_record)
 assert(tied_swap["fluid:steam"].count == 101 and tied_swap["fluid:water"].count == 102)
 assert(tied_swap["fluid:steam"].count ~= tied_swap["fluid:water"].count)
+
+-- 计时过程中输入数量变化既不改变当前排列，也不重新开始计时。
+swap_inputs[1].count = 20
+local timing_swap_record = {entity = swap_entity, config = {
+  swap_output_mode = "fluid", swap_timeout = 1, swap_loop = false,
+  swap_conditions = reset_conditions
+}}
+game.tick = 0
+SwapOrder.calculate(timing_swap_record)
+swap_inputs[1].count = 5
+game.tick = 30
+local quantity_changed_swap = SwapOrder.calculate(timing_swap_record)
+assert(timing_swap_record.swap_condition_tick == 0)
+assert(quantity_changed_swap["fluid:water"].count == 101
+  and quantity_changed_swap["fluid:steam"].count == 102)
+game.tick = 60
+SwapOrder.calculate(timing_swap_record)
+assert(timing_swap_record.swap_permutation[1] == 2
+  and timing_swap_record.swap_permutation[2] == 1)
+
+-- 新增信号属于种类变化，仍需回到初始排列并重新计时。
+swap_inputs[#swap_inputs + 1] = {signal = {type = "fluid", name = "crude-oil"}, count = 1}
+game.tick = 90
+SwapOrder.calculate(timing_swap_record)
+assert(timing_swap_record.swap_permutation[1] == 1
+  and timing_swap_record.swap_permutation[2] == 2
+  and timing_swap_record.swap_permutation[3] == 3)
+assert(timing_swap_record.swap_condition_tick == 90)
+swap_inputs[#swap_inputs] = nil
 
 local looping_swap_record = {entity = swap_entity, config = {
   swap_output_mode = "fluid", swap_timeout = 1, swap_loop = true,

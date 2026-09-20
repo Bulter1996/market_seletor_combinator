@@ -205,6 +205,12 @@ local function active_order_tooltip(diagnostic)
 
   local lines = {{"bmsc.production-active-title"}}
   local function add_line(line) lines[#lines + 1] = line end
+  if diagnostic.unavailable_recipe then
+    add_line({"bmsc.production-active-fallback-line",
+      signal_localised_label(Util.make_signal("recipe", diagnostic.unavailable_recipe)),
+      diagnostic.fallback_recipe and signal_localised_label(
+        Util.make_signal("recipe", diagnostic.fallback_recipe)) or {"bmsc.order-target-no-recipe"}})
+  end
   local order = diagnostic.order
   local product = diagnostic.product
   add_line({"bmsc.production-active-order-line", signal_localised_label(order.signal), order.count})
@@ -307,7 +313,8 @@ end
 ---@return LocalisedString|nil tooltip 没有诊断时不追加提示。
 function Gui.production_diagnostic_tooltip(diagnostic)
   if not diagnostic then return nil end
-  if diagnostic.kind == "active_output" or diagnostic.kind == "supermarket_expanding" then
+  if diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+    or diagnostic.kind == "supermarket_expanding" then
     return active_order_tooltip(diagnostic)
   end
   local reason
@@ -326,6 +333,12 @@ function Gui.production_diagnostic_tooltip(diagnostic)
       or {"bmsc.production-reason-stock-sufficient", diagnostic.stock}
   elseif diagnostic.kind == "no_recipe" then
     reason = {"bmsc.production-reason-no-recipe"}
+  elseif diagnostic.kind == "recipe_locked" then
+    reason = {"bmsc.production-reason-recipe-locked",
+      signal_localised_label(Util.make_signal("recipe", diagnostic.recipe_name))}
+  elseif diagnostic.kind == "recipe_machine_unsupported" then
+    reason = {"bmsc.production-reason-recipe-machine-unsupported",
+      signal_localised_label(Util.make_signal("recipe", diagnostic.recipe_name))}
   elseif diagnostic.kind == "surface_conditions" then
     reason = {"bmsc.supermarket-reason-surface-conditions"}
   elseif diagnostic.kind == "unsupported_signal" then
@@ -350,7 +363,7 @@ local function diagnostic_signal_style(color, diagnostic)
   if kind == "active_output" or kind == "supermarket_expanding" then
     return "green_circuit_network_content_slot" -- 标准绿色：当前正在输出或展开。
   end
-  if kind == "waiting_for_order" then
+  if kind == "waiting_for_order" or kind == "active_fallback" then
     return "bmsc_signal_diagnostic_filtered"  -- 黄色：有效订单，等待轮到它。
   end
   if kind == "stock_sufficient" or kind == "supermarket_completed" then
@@ -362,7 +375,7 @@ end
 ---把绿色订单诊断映射为显示顺序：当前输出、等待、异常/未知、库存充足。
 local function diagnostic_signal_priority(diagnostic)
   local kind = diagnostic and diagnostic.kind
-  if kind == "active_output" or kind == "supermarket_expanding" then return 4 end
+  if kind == "active_output" or kind == "active_fallback" or kind == "supermarket_expanding" then return 4 end
   if kind == "waiting_for_order" then return 3 end
   if kind == "stock_sufficient" or kind == "supermarket_completed" then return 1 end
   return 2
@@ -509,7 +522,8 @@ end
 
 ---打开订单配方和库存校验产物子窗口。
 ---子窗口成为 player.opened，因此 Esc 只先关闭它；关闭后 control.lua 会恢复后方主窗口。
-function Gui.open_order_target(player, order_signal, order_count, target, recipes)
+function Gui.open_order_target(player, order_signal, order_count, target, recipes, options)
+  options = options or {}
   local old = player.gui.screen[Gui.order_target_name]
   if old then old.destroy() end
 
@@ -521,7 +535,8 @@ function Gui.open_order_target(player, order_signal, order_count, target, recipe
   frame.force_auto_center()
   local titlebar = frame.add{type = "flow", direction = "horizontal"}
   titlebar.drag_target = frame
-  titlebar.add{type = "label", caption = {"bmsc.order-target-title"}, style = "frame_title"}.drag_target = frame
+  titlebar.add{type = "label", caption = {options.show_products == false
+    and "bmsc.recipe-selection-title" or "bmsc.order-target-title"}, style = "frame_title"}.drag_target = frame
   local dragger = titlebar.add{type = "empty-widget", style = "draggable_space_header"}
   dragger.style.horizontally_stretchable = true
   dragger.style.height = 24
@@ -532,7 +547,8 @@ function Gui.open_order_target(player, order_signal, order_count, target, recipe
   local content = frame.add{type = "flow", direction = "vertical"}
   content.style.padding = 8
   content.style.vertical_spacing = 8
-  content.add{type = "label", caption = {"bmsc.order-target-order",
+  content.add{type = "label", caption = {options.show_products == false
+    and "bmsc.recipe-query-target" or "bmsc.order-target-order",
     signal_localised_label(order_signal), order_count}}
 
   content.add{type = "label", caption = {"bmsc.order-target-recipe"}, style = "heading_2_label"}
@@ -542,10 +558,12 @@ function Gui.open_order_target(player, order_signal, order_count, target, recipe
       bmsc_signal_quality = Util.quality_name(order_signal.quality), bmsc_order_count = order_count}
   end
   if order_signal.type == "recipe" then
-    local recipe = target.recipe
+    local recipe = target.recipe or target.locked_recipe and prototypes.recipe[target.locked_recipe]
     if recipe then
       local row = content.add{type = "flow", direction = "horizontal"}
-      row.add{type = "sprite-button", sprite = "recipe/" .. recipe.name, style = "slot_button",
+      local unlocked = options.enabled_recipes and options.enabled_recipes[recipe.name]
+      row.add{type = "sprite-button", sprite = "recipe/" .. recipe.name,
+        style = unlocked and "green_circuit_network_content_slot" or "bmsc_signal_diagnostic_invalid",
         elem_tooltip = {type = "recipe", name = recipe.name}}
       row.add{type = "label", caption = recipe.localised_name}
     else
@@ -555,7 +573,13 @@ function Gui.open_order_target(player, order_signal, order_count, target, recipe
     content.add{type = "button", name = "bmsc-order-target-auto-recipe",
       caption = {"bmsc.order-target-auto-recipe", target.automatic_recipe
         and target.automatic_recipe.localised_name or {"bmsc.order-target-no-recipe"}},
-      style = target.manual_recipe and "button" or "confirm_button", tags = recipe_tags(nil)}
+      style = target.configured_recipe and "button" or "confirm_button", tags = recipe_tags(nil)}
+    if target.machine_unsupported_recipe then
+      content.add{type = "label", caption = {"bmsc.order-target-machine-unsupported",
+        signal_localised_label(Util.make_signal("recipe", target.machine_unsupported_recipe)),
+        target.automatic_recipe and signal_localised_label(
+          Util.make_signal("recipe", target.automatic_recipe.name)) or {"bmsc.order-target-no-recipe"}}}
+    end
     local scroll = content.add{type = "scroll-pane", direction = "vertical",
       horizontal_scroll_policy = "never", vertical_scroll_policy = "auto"}
     scroll.style.horizontally_stretchable = true
@@ -566,33 +590,40 @@ function Gui.open_order_target(player, order_signal, order_count, target, recipe
     for _, recipe in ipairs(recipes or {}) do
       local row = scroll.add{type = "flow", direction = "horizontal"}
       row.style.vertical_align = "center"
+      local selected = target.configured_recipe == recipe.name
+      local unlocked = options.enabled_recipes and options.enabled_recipes[recipe.name]
+      local style = selected and (unlocked and "green_circuit_network_content_slot"
+        or "bmsc_signal_diagnostic_invalid")
+        or unlocked and "slot_button" or "bmsc_signal_diagnostic_pending"
       row.add{type = "sprite-button", sprite = "recipe/" .. recipe.name,
-        style = target.manual_recipe == recipe.name and "green_circuit_network_content_slot" or "slot_button",
+        style = style,
         elem_tooltip = {type = "recipe", name = recipe.name}, tags = recipe_tags(recipe.name)}
       row.add{type = "label", caption = recipe.localised_name}
     end
   end
 
-  content.add{type = "label", caption = {"bmsc.order-target-products"}, style = "heading_2_label"}
-  local selected = {}
-  for _, product in ipairs(target.products or {}) do selected[Util.signal_key(product)] = true end
-  local products = content.add{type = "table", column_count = 8}
-  for _, product in ipairs(target.available_products or {}) do
-    local chosen = selected[Util.signal_key(product)] == true
-    local button = products.add{type = "sprite-button", sprite = signal_sprite_path(product),
-      style = chosen and "green_circuit_network_content_slot" or "slot_button",
-      elem_tooltip = signal_elem_tooltip(product), tooltip = chosen
-        and {"bmsc.order-target-selected"} or {"bmsc.order-target-not-selected"},
-      tags = {bmsc_order_target_product = true, bmsc_signal_type = product.type or "item",
-        bmsc_signal_name = product.name, bmsc_signal_quality = Util.quality_name(product.quality),
-        bmsc_order_count = order_count}}
-    if product.type == "item" and product.quality and product.quality ~= "normal" then
-      button.quality = product.quality
+  if options.show_products ~= false then
+    content.add{type = "label", caption = {"bmsc.order-target-products"}, style = "heading_2_label"}
+    local selected = {}
+    for _, product in ipairs(target.products or {}) do selected[Util.signal_key(product)] = true end
+    local products = content.add{type = "table", column_count = 8}
+    for _, product in ipairs(target.available_products or {}) do
+      local chosen = selected[Util.signal_key(product)] == true
+      local button = products.add{type = "sprite-button", sprite = signal_sprite_path(product),
+        style = chosen and "green_circuit_network_content_slot" or "slot_button",
+        elem_tooltip = signal_elem_tooltip(product), tooltip = chosen
+          and {"bmsc.order-target-selected"} or {"bmsc.order-target-not-selected"},
+        tags = {bmsc_order_target_product = true, bmsc_signal_type = product.type or "item",
+          bmsc_signal_name = product.name, bmsc_signal_quality = Util.quality_name(product.quality),
+          bmsc_order_count = order_count}}
+      if product.type == "item" and product.quality and product.quality ~= "normal" then
+        button.quality = product.quality
+      end
     end
+    local help = content.add{type = "label", caption = {"bmsc.order-target-help"}}
+    help.style.single_line = false
+    help.style.maximal_width = 420
   end
-  local help = content.add{type = "label", caption = {"bmsc.order-target-help"}}
-  help.style.single_line = false
-  help.style.maximal_width = 420
   player.opened = frame
   return frame
 end

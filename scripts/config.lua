@@ -26,7 +26,7 @@ local function default_conditions()
     second = {red = true, green = true, constant = 0}}}
 end
 
----复制每个订单信号的手动配方和库存校验产物。
+---复制每个输入信号的共享手动配方和订单模式使用的库存校验产物。
 ---这里只接受纯 Lua 数据；原型是否仍存在由运行阶段按当前模组、机器和科技重新判断。
 local function normalize_order_targets(source)
   local targets = {}
@@ -82,7 +82,7 @@ function Config.default()
     schema_revision = Config.schema_revision,          -- 内部字段：用于识别热加载遗留的旧配置。
     mode = Config.mode.supermarket_order,          -- 参数：当前操作模式。
     production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
-    order_targets = {},                          -- 参数：订单信号对应的手动配方与库存校验产物。
+    order_targets = {},                          -- 参数：输入信号共享配方，以及订单模式的库存校验产物。
     multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
     recipe_query_cache_grid_number = 0,           -- 参数：多配方查询可占用的原料缓存格数。
     query_type = Config.query_type.all,            -- 参数：共享库存查询包含流体、物品或两者。

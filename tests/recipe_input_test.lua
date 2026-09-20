@@ -101,6 +101,39 @@ assert(limited_query["item:copper:normal"].count == 2)
 query_config.recipe_query_cache_grid_number = 1
 assert(next(RecipeQuery.calculate({entity = entity, config = query_config})) == nil)
 
+-- 同一条多产物配方只制造满足所有目标所需的最大次数，不按每个产物重复累计原料。
+recipe_entry = {
+  {signal = {type = "item", name = "widget", quality = "normal"}, count = 3},
+  {signal = {type = "item", name = "slag", quality = "normal"}, count = 5}
+}
+local shared_recipe_config = {production_machine = "assembler", multiple_recipe_support = true,
+  recipe_query_cache_grid_number = 0, order_targets = {
+    ["item:widget:normal"] = {recipe = "widget-b", products = {}},
+    ["item:slag:normal"] = {recipe = "widget-b", products = {}}
+  }}
+local shared_recipe_query = RecipeQuery.calculate({entity = entity, config = shared_recipe_config})
+assert(shared_recipe_query["item:copper:normal"].count == 5)
+
+-- 未解锁配方仍可供查询模式使用，但订单模式必须保留选择并等待科技解锁。
+force.recipes["widget-b"].enabled = false
+local locked_target = OrderTarget.resolve(force, "assembler",
+  {type = "item", name = "widget", quality = "normal"}, manual_config)
+assert(locked_target.recipe == nil and locked_target.locked_recipe == "widget-b")
+assert(manual_config.order_targets["item:widget:normal"].recipe == "widget-b")
+local locked_choices = OrderTarget.available_recipes(
+  force, "assembler", {type = "item", name = "widget", quality = "normal"})
+assert(#locked_choices == 2 and locked_choices[2].name == "widget-b-clone")
+local preferred_locked_choices = OrderTarget.available_recipes(
+  force, "assembler", {type = "item", name = "widget", quality = "normal"}, "widget-b")
+assert(#preferred_locked_choices == 2 and preferred_locked_choices[2].name == "widget-b")
+recipe_entry = {{signal = {type = "item", name = "widget", quality = "normal"}, count = 3}}
+local locked_query = RecipeQuery.calculate({entity = entity, config = {
+  production_machine = "assembler", multiple_recipe_support = false,
+  order_targets = manual_config.order_targets
+}})
+assert(locked_query["item:copper:normal"].count == 1 and locked_query["item:iron:normal"] == nil)
+force.recipes["widget-b"].enabled = true
+
 -- 单个配方内部仍按完整制造批次缩放，不会用剩余格数破坏 3:1 的原料比例。
 local ratio_recipe = {ingredients = {
   {type = "item", name = "iron", amount = 3},
@@ -116,6 +149,15 @@ local ProductionOrder = require("scripts.modes.production_order")
 entity.get_signals = function(connector_id)
   return connector_id == defines.wire_connector_id.combinator_input_green and recipe_entry or inventory_entries
 end
+force.recipes["widget-b"].enabled = false
+local locked_recipe_record = {entity = entity, config = {
+  production_machine = "assembler", remember_order = false, production_timeout = 0,
+  additional_production_rate = 0, material_demand_rate = 1, material_retention_rate = 1,
+  output_mode = "all", cache_grid_number = 0
+}}
+assert(next(ProductionOrder.calculate(locked_recipe_record)) == nil)
+assert(locked_recipe_record.production_order_diagnostics["recipe:widget-b"].kind == "recipe_locked")
+force.recipes["widget-b"].enabled = true
 local produced = ProductionOrder.calculate({entity = entity, config = {
   production_machine = "assembler", remember_order = false, production_timeout = 0,
   additional_production_rate = 0, material_demand_rate = 1, material_retention_rate = 1,
@@ -143,6 +185,11 @@ local manual_record = {entity = entity, config = {
   remember_order = false, production_timeout = 0, additional_production_rate = 0,
   material_demand_rate = 1, material_retention_rate = 0, output_mode = "only_item"
 }}
+force.recipes["widget-b"].enabled = false
+local locked_output = ProductionOrder.calculate(manual_record)
+assert(next(locked_output) == nil)
+assert(manual_record.production_order_diagnostics["item:widget:normal"].kind == "recipe_locked")
+force.recipes["widget-b"].enabled = true
 local manual_output = ProductionOrder.calculate(manual_record)
 assert(manual_output['recipe:widget-b'].count == 2 and manual_output['item:widget:normal'] == nil)
 assert(#manual_record.production_order_diagnostics['item:widget:normal'].products == 2)
@@ -156,6 +203,14 @@ entity.get_signals = function(connector_id)
     or supermarket_inventory
 end
 local SupermarketOrder = require("scripts.modes.supermarket_order")
+force.recipes["widget-b"].enabled = false
+local locked_supermarket = {entity = entity, config = {
+  production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
+  recurise_depth = 1
+}}
+assert(next(SupermarketOrder.calculate(locked_supermarket)) == nil)
+assert(locked_supermarket.supermarket_order_diagnostics["recipe:widget-b"].kind == "recipe_locked")
+force.recipes["widget-b"].enabled = true
 local expanded = SupermarketOrder.calculate({entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
   recurise_depth = 1

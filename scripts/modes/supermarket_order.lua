@@ -264,11 +264,13 @@ function Mode.calculate(record)
       if Util.is_recipe_input(demand.signal) and demand.count > 0 then
         local target = resolved_targets[Util.signal_key(demand.signal)]
         local signal, specified_recipe = target and target.signal, target and target.recipe
-        if signal and (demand.signal.type ~= "recipe" or specified_recipe) then
+        if signal and not (target and target.blocked)
+          and (demand.signal.type ~= "recipe" or specified_recipe) then
           local root = build_plan_node(signal, demand.count, 1, {}, specified_recipe)
           root.source_key = Util.signal_key(demand.signal)
           root.validation_products = target.products
           root.manual_recipe = target.manual_recipe
+          root.machine_unsupported_recipe = target.machine_unsupported_recipe
           -- 库存和递归始终使用产品信号；配方输入及手动选配方的根订单输出配方信号，
           -- 使下游机器能够识别玩家明确指定的制造路径。
           if demand.signal.type == "recipe" then
@@ -876,6 +878,8 @@ function Mode.calculate(record)
         diagnostic = {kind = "unsupported_signal"}
       elseif demand.count <= 0 then
         diagnostic = {kind = "non_positive_order"}
+      elseif target and target.locked_recipe then
+        diagnostic = {kind = "recipe_locked", recipe_name = target.locked_recipe}
       elseif not signal or (demand.signal.type == "recipe" and not specified_recipe) then
         diagnostic = {kind = "no_recipe"}
       elseif strict_order_diagnostics[source_key] then
@@ -887,15 +891,18 @@ function Mode.calculate(record)
       elseif active_order_keys[source_key] then
         local root = roots_by_source[source_key]
         local output_key = root and Util.signal_key(node_output_signal(root)) or source_key
-        diagnostic = final_outputs[output_key] and {kind = "active_output"}
-          or {kind = "supermarket_expanding"}
+        diagnostic = root and root.machine_unsupported_recipe and {kind = "active_fallback",
+          unavailable_recipe = root and root.machine_unsupported_recipe,
+          fallback_recipe = root and root.recipe_name}
+          or final_outputs[output_key] and {kind = "active_output"} or {kind = "supermarket_expanding"}
       elseif not final_outputs[source_key] then
         local status = OrderTarget.inventory_status(target.products, observed_inventory, demand.count)
         diagnostic = status.satisfied and {kind = "stock_sufficient",
           stock = status.products[1] and status.products[1].stock or 0, products = status.products}
           or {kind = "supermarket_expanding"}
       end
-      if diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "supermarket_expanding") then
+      if diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+        or diagnostic.kind == "supermarket_expanding") then
         local root = roots_by_source[source_key]
         local detail = root_details[source_key]
         if root then

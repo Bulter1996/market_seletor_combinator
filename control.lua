@@ -19,6 +19,7 @@ local MODE_RECIPE_QUERY = Config.mode.recipe_query
 local MODE_INVENTORY_QUERY = Config.mode.inventory_query
 local MODE_SWAP_ORDER = Config.mode.swap_order
 local MAX_PROXY_SIGNALS = 65535                    -- Factorio 常量运算器筛选索引的 uint16 上限。
+local refresh_open_order_targets                    -- 研究事件发生时刷新仍打开的配方选择窗口。
 
 
 ---取得并初始化本模组的持久状态。
@@ -552,6 +553,7 @@ script.on_event(research_events, function(event)
       invalidate_all_recipe_plans(record)
     end
   end
+  if refresh_open_order_targets then refresh_open_order_targets(force) end
 end)
 
 -- GUI 事件：拦截原版选择运算器窗口，改为本模组自己的参数窗口。
@@ -631,11 +633,36 @@ local function copy_products(products)
 end
 
 local function open_order_target(player, record, order_signal, order_count)
+  local recipe_query = record.config.mode == MODE_RECIPE_QUERY
   local target = OrderTarget.resolve(
-    record.entity.force, record.config.production_machine, order_signal, record.config)
+    record.entity.force, record.config.production_machine, order_signal, record.config,
+    recipe_query and {ignore_research = true} or nil)
   local recipes = OrderTarget.available_recipes(
-    record.entity.force, record.config.production_machine, order_signal)
-  Gui.open_order_target(player, order_signal, order_count, target, recipes)
+    record.entity.force, record.config.production_machine, order_signal, target.configured_recipe)
+  local enabled = {}
+  for _, recipe in ipairs(recipes) do
+    local force_recipe = record.entity.force.recipes[recipe.name]
+    enabled[recipe.name] = force_recipe and force_recipe.enabled == true or false
+  end
+  if order_signal.type == "recipe" then
+    local force_recipe = record.entity.force.recipes[order_signal.name]
+    enabled[order_signal.name] = force_recipe and force_recipe.enabled == true or false
+  end
+  Gui.open_order_target(player, order_signal, order_count, target, recipes,
+    {show_products = not recipe_query, enabled_recipes = enabled})
+end
+
+refresh_open_order_targets = function(force)
+  for player_index, unit_number in pairs(state().player_gui) do
+    local record = state().combinators[unit_number]
+    local player = game.get_player(player_index)
+    local popup = player and player.gui.screen[Gui.order_target_name]
+    if record and record.entity and record.entity.valid and record.entity.force == force
+      and popup and popup.valid then
+      local order_signal = signal_from_tags(popup.tags)
+      if order_signal then open_order_target(player, record, order_signal, popup.tags.bmsc_order_count or 0) end
+    end
+  end
 end
 
 ---订单目标改变后只失效真正依赖配方树的超市缓存；生产订单下一次计算可直接读取新配置。
@@ -1060,9 +1087,10 @@ script.on_event(defines.events.on_gui_click, function(event)
   end
   if tags.bmsc_signal_panel_icon then
     if event.shift and event.button == defines.mouse_button_type.left
-      and tags.bmsc_signal_side == "input" and tags.bmsc_signal_color == "green"
-      and record and (record.config.mode == MODE_PRODUCTION_ORDER
-        or record.config.mode == MODE_SUPERMARKET_ORDER) then
+      and tags.bmsc_signal_side == "input" and record
+      and ((tags.bmsc_signal_color == "green" and (record.config.mode == MODE_PRODUCTION_ORDER
+        or record.config.mode == MODE_SUPERMARKET_ORDER))
+        or record.config.mode == MODE_RECIPE_QUERY) then
       local order_signal = signal_from_tags(tags)
       if order_signal and Util.is_recipe_input(order_signal) then
         open_order_target(player, record, order_signal, event.element.number or 0)

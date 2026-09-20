@@ -235,23 +235,36 @@ local function get_machine_recipe_cache(machine_name)
   return cached
 end
 
----列出当前势力已解锁、机器支持且确实产出目标信号的全部配方。
+---列出机器支持且确实产出目标信号的全部配方。
 ---与自动选择不同，这里允许目标只是副产物：玩家手动指定已经消除了生产意图的歧义。
 ---@param force LuaForce 实体所属势力。
 ---@param target_signal SignalID 目标物品或流体。
 ---@param machine_name string 制造机实体原型名。
+---@param preferred_name string|nil 已手动选择的配方；语义重复时优先保留，确保选择仍可见。
 ---@return table recipes 按稳定优先级排列的 LuaRecipePrototype 数组。
-function Util.available_recipes(force, target_signal, machine_name)
+function Util.available_recipes(force, target_signal, machine_name, preferred_name)
   if not (Util.is_recipe_signal(target_signal) and force and force.recipes) then return {} end
   local cache = get_machine_recipe_cache(machine_name)
   local candidates = cache.all_candidates[recipe_product_key(target_signal.type, target_signal.name)] or {}
-  local recipes, seen = {}, {}
+  local recipes, signature_indexes = {}, {}
   for _, candidate in ipairs(candidates) do
     local force_recipe = force.recipes[candidate.recipe.name]
     local signature = recipe_content_signature(candidate.recipe)
-    if force_recipe and force_recipe.enabled and candidate.recipe.hidden ~= true
-      and Util.machine_supports(machine_name, candidate.recipe) and not seen[signature] then
-      recipes[#recipes + 1], seen[signature] = candidate.recipe, true
+    if force_recipe and candidate.recipe.hidden ~= true
+      and Util.machine_supports(machine_name, candidate.recipe) then
+      local index = signature_indexes[signature]
+      if not index then
+        recipes[#recipes + 1] = candidate.recipe
+        signature_indexes[signature] = #recipes
+      else
+        local existing = recipes[index]
+        local existing_force_recipe = force.recipes[existing.name]
+        -- 手动选择必须保持可见；否则优先展示已解锁的等价原型，避免灰色项遮住可用项。
+        if candidate.recipe.name == preferred_name or existing.name ~= preferred_name
+          and force_recipe.enabled and not (existing_force_recipe and existing_force_recipe.enabled) then
+          recipes[index] = candidate.recipe
+        end
+      end
     end
   end
   return recipes

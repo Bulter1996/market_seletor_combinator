@@ -139,6 +139,13 @@ function Mode.calculate(record)
     if not Util.is_recipe_input(demand.signal) then return nil, {kind = "unsupported_signal"} end
     if demand.count <= 0 then return nil, {kind = "non_positive_order"} end
     local target = OrderTarget.resolve(record.entity.force, config.production_machine, demand.signal, config)
+    if target.locked_recipe then
+      return nil, {kind = "recipe_locked", recipe_name = target.locked_recipe}
+    end
+    if target.machine_unsupported_recipe and not target.recipe then
+      return nil, {kind = "recipe_machine_unsupported",
+        recipe_name = target.machine_unsupported_recipe}
+    end
     if not (target.signal and target.recipe) then return nil, {kind = "no_recipe"} end
     -- 未锁定订单按基础数量启动；锁定后所有选中产物都达到扩展目标才结束。
     local target_count = locked and demand.count * (1 + config.additional_production_rate) or demand.count
@@ -331,7 +338,9 @@ function Mode.calculate(record)
 
     local product = product_status.products[1]
     selected_diagnostic = {
-      kind = "active_output",
+      kind = selected_target.machine_unsupported_recipe and "active_fallback" or "active_output",
+      unavailable_recipe = selected_target.machine_unsupported_recipe,
+      fallback_recipe = selected_target.machine_unsupported_recipe and selected_recipe.name or nil,
       order = {
         signal = Util.make_signal(selected_demand.signal.type, selected_demand.signal.name,
           selected_demand.signal.quality),

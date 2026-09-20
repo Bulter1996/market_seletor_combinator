@@ -567,7 +567,8 @@ script.on_event(defines.events.on_gui_opened, function(event)
     -- 做一次迁移，不能只依赖下一次定时计算来修复配置。
     record.config = normalize_runtime_config(record.config)
     Gui.open(
-      player, event.entity, record.config, record.gui_output_networks, current_input_diagnostics(record))
+      player, event.entity, record.config, record.gui_output_networks, current_input_diagnostics(record),
+      MODES[MODE_INVENTORY_QUERY].is_available())
     Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
       record.production_timeout_condition_results)
     Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
@@ -975,6 +976,21 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     Gui.set_recursion_single_options_visible(event.element, record.config.recursion_output_mode == "single")
     return
   end
+  if event.element.name == "bmsc-inventory-validation" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    local available = MODES[MODE_INVENTORY_QUERY].is_available()
+    local values = available
+      and {Config.inventory_validation.inventory, Config.inventory_validation.linked,
+        Config.inventory_validation.none}
+      or {Config.inventory_validation.inventory, Config.inventory_validation.none}
+    record.config.inventory_validation = values[event.element.selected_index]
+      or Config.inventory_validation.inventory
+    MODES[MODE_SUPERMARKET_ORDER].reset(record)
+    -- 库存来源会改变整张订单能否输出；立即清空旧代理，等待下一轮按新来源重算。
+    write_outputs(record, {})
+    return
+  end
   if event.element.name == "bmsc-sequential-production" then
     local record = current_record(event.player_index)
     if not record then return end
@@ -1175,16 +1191,6 @@ script.on_event(defines.events.on_gui_checked_state_changed, function(event)
     end
     return
   end
-  if event.element.name == "bmsc-recursion-strict-validation" then
-    local record = current_record(event.player_index)
-    if record then
-      record.config.recursion_strict_validation = event.element.state
-      MODES[MODE_SUPERMARKET_ORDER].reset(record)
-      -- 严格校验会改变整张订单能否输出；立即清空旧代理，避免在下个刷新周期前继续发送旧信号。
-      write_outputs(record, {})
-    end
-    return
-  end
   local tags = event.element.tags or {}
   if not (tags.bmsc_swap_condition and tags.bmsc_condition_set) then return end
   local record = current_record(event.player_index)
@@ -1236,7 +1242,8 @@ local function apply_pasted_config(destination, source_config)
     if unit == destination.entity.unit_number then
       local player = game.get_player(player_index)
       if player then
-        Gui.open(player, destination.entity, destination.config, {}, nil)
+        Gui.open(player, destination.entity, destination.config, {}, nil,
+          MODES[MODE_INVENTORY_QUERY].is_available())
         state().player_gui[player_index] = unit
       end
     end

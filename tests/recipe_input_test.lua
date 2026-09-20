@@ -206,22 +206,22 @@ local SupermarketOrder = require("scripts.modes.supermarket_order")
 force.recipes["widget-b"].enabled = false
 local locked_supermarket = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
-  recurise_depth = 1
+  recurise_depth = 1, inventory_validation = "none"
 }}
 assert(next(SupermarketOrder.calculate(locked_supermarket)) == nil)
 assert(locked_supermarket.supermarket_order_diagnostics["recipe:widget-b"].kind == "recipe_locked")
 force.recipes["widget-b"].enabled = true
 local expanded = SupermarketOrder.calculate({entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
-  recurise_depth = 1
+  recurise_depth = 1, inventory_validation = "none"
 }})
-assert(expanded["item:copper:normal"].count == 3 and expanded["item:iron:normal"] == nil)
+assert(expanded["item:copper:normal"] == nil and expanded["item:iron:normal"] == nil)
 assert(expanded["recipe:widget-b"].count == 3 and expanded["item:widget:normal"] == nil)
 
 supermarket_inventory = {{signal = {type = "item", name = "copper", quality = "normal"}, count = 10}}
 local supermarket_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 0
+  recurise_depth = 0, recursion_timeout = 0, inventory_validation = "none"
 }}
 local supermarket_recipe = SupermarketOrder.calculate(supermarket_record)
 assert(supermarket_recipe["recipe:widget-b"].count == 3)
@@ -245,7 +245,7 @@ supermarket_inventory = {
 local multi_supermarket = {entity = entity, config = {
   production_machine = "assembler", order_targets = manual_config.order_targets,
   recursion_output_mode = "all", sequential_production = false, recurise_depth = 1,
-  recursion_additional_production_rate = 0
+  recursion_additional_production_rate = 0, inventory_validation = "none"
 }}
 local manual_supermarket_output = SupermarketOrder.calculate(multi_supermarket)
 assert(manual_supermarket_output['recipe:widget-b'].count == 2

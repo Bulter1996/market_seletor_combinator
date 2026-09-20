@@ -38,7 +38,7 @@ assert(normalized.recursion_timeout_conditions[1].first.signal.type == "item")
 assert(normalized.production_timeout_monitor_item_changes == true)
 assert(normalized.recursion_timeout_monitor_item_changes == true)
 assert(normalized.recursion_material_wait_time == 0)
-assert(normalized.recursion_strict_validation == false)
+assert(normalized.inventory_validation == Config.inventory_validation.none)
 assert(normalized.swap_loop == false)
 assert(normalized.swap_conditions[1].first.signal.name == "signal-R")
 assert(normalized.swap_conditions[1].second.signal.type == "item")
@@ -67,7 +67,7 @@ assert(copied.mode == Config.mode.swap_order and copied.swap_timeout == 12)
 assert(copied.swap_loop == true)
 assert(copied.recipe_query_cache_grid_number == 7)
 assert(copied.recursion_material_wait_time == 7)
-assert(copied.recursion_strict_validation == true)
+assert(copied.inventory_validation == Config.inventory_validation.inventory)
 assert(copied.production_timeout_monitor_item_changes == false)
 assert(copied.recursion_timeout_monitor_item_changes == false)
 assert(copied.recursion_additional_production_rate == 2)
@@ -75,6 +75,8 @@ assert(copied.recursion_material_demand_rate == 6 and copied.recursion_material_
 assert(copied.production_timeout_conditions[1].first.signal.name == "signal-R")
 assert(copied.recursion_timeout_conditions[1].first.signal.name == "iron")
 assert(copied.swap_conditions[1].second.signal.name == "iron")
+assert(Config.normalize{inventory_validation = Config.inventory_validation.linked}.inventory_validation
+  == Config.inventory_validation.linked)
 local green = {
   {signal = {type = "item", name = "product", quality = "normal"}, count = 10},
   {signal = reset, count = 1}

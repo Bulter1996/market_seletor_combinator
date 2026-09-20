@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 13
+Config.schema_revision = 14
 
 Config.mode = {
   production_order = "production_order",
@@ -16,6 +16,12 @@ Config.query_type = {
   fluid = "fluid",
   item = "item",
   all = "all"
+}
+
+Config.inventory_validation = {
+  inventory = "inventory",
+  linked = "linked",
+  none = "none"
 }
 
 -- 旧版存档和蓝图使用的模式值；只用于迁移，规范化后统一写为 supermarket_order。
@@ -101,7 +107,7 @@ function Config.default()
     recursion_material_demand_rate = 10,         -- 参数：超市订单切入上层配方的原料启动倍率。
     recursion_material_retention_rate = 1,       -- 参数：超市订单当前配方的原料保留倍率。
     recursion_output_mode = "single",            -- 参数：超市订单输出单项或全部结果。
-    recursion_strict_validation = false,          -- 参数：是否跳过缺少机器无法制造原料的订单。
+    inventory_validation = Config.inventory_validation.none, -- 参数：超市订单使用的库存校验来源。
     sequential_production = true,                -- 参数：single 模式是否按订单顺序逐个完成。
     recursion_material_wait_time = 0,            -- 参数：single 当前输出被撤销或切换前的保持秒数。
     recursion_timeout = 0,                       -- 参数：single 无变化轮换秒数；0 表示禁用。
@@ -219,8 +225,14 @@ function Config.normalize(source)
   if source.recursion_output_mode == "single" or source.recursion_output_mode == "all" then
     config.recursion_output_mode = source.recursion_output_mode
   end
-  if type(source.recursion_strict_validation) == "boolean" then
-    config.recursion_strict_validation = source.recursion_strict_validation
+  if source.inventory_validation == Config.inventory_validation.inventory
+    or source.inventory_validation == Config.inventory_validation.linked
+    or source.inventory_validation == Config.inventory_validation.none then
+    config.inventory_validation = source.inventory_validation
+  elseif type(source.recursion_strict_validation) == "boolean" then
+    -- 旧布尔开关迁移：勾选沿用库存校验，未勾选采用新的直接输出语义。
+    config.inventory_validation = source.recursion_strict_validation
+      and Config.inventory_validation.inventory or Config.inventory_validation.none
   end
   if type(source.sequential_production) == "boolean" then
     config.sequential_production = source.sequential_production

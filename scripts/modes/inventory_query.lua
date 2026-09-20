@@ -32,6 +32,12 @@ local function is_available()
   return script.active_mods[REQUIRED_MOD] ~= nil and prototypes.entity[PROBE_NAME] ~= nil
 end
 
+---供超市订单和 GUI 判断关联库存能力是否可用。
+---@return boolean available 可用时为 true。
+function Mode.is_available()
+  return is_available()
+end
+
 ---取得查询模式的全局持久状态；每个势力永久复用一个探针。
 ---@return table state 包含 forces 映射。
 local function state()
@@ -70,6 +76,26 @@ local function add_record_inputs(signals, record, query_type)
       add_query_signal(signals, entry.signal, query_type)
     end
   end
+end
+
+---收集超市订单配方树实际涉及的产品、原料和库存校验副产品。
+---只提交这些信号，不使用查询全部，避免为自动库存校验扫描所有原型。
+---@param plan table|nil 超市订单缓存的纯数据配方树。
+---@return table signals 按 signal_key 去重的定向查询集合。
+function Mode.supermarket_signals(plan)
+  local signals = {}
+  local function visit(node)
+    if not (node and node.signal) then return end
+    add_query_signal(signals, node.signal, Config.query_type.all)
+    for _, child in ipairs(node.children or {}) do visit(child) end
+  end
+  for _, root in ipairs(type(plan) == "table" and plan.roots or {}) do
+    visit(root)
+    for _, product in ipairs(root.validation_products or {}) do
+      add_query_signal(signals, product, Config.query_type.all)
+    end
+  end
+  return signals
 end
 
 ---构建查询全部时需要交给 LinkedChestAndPipe 的完整单类信号表。
@@ -205,6 +231,9 @@ local function configure_probe(force_state, signals, signature)
   behavior.enabled = #filters > 0
   force_state.signature = signature
   force_state.results = {}
+  force_state.requested = {}
+  for _, signal in ipairs(signals) do force_state.requested[Util.signal_key(signal)] = true end
+  force_state.has_results = false
   force_state.ready_tick = #filters > 0 and next_refresh_tick(probe) or nil
 end
 
@@ -234,6 +263,10 @@ local function refresh_results(force_state)
     end
   end
   force_state.results = results
+  force_state.has_results = true
+  force_state.generation = (force_state.generation or 0) + 1
+  -- 每个探针桶约 120 tick 才会再次产生独立快照；同一缓存不能重复算作新结果。
+  force_state.ready_tick = next_refresh_tick(probe)
 end
 
 ---在逐台 calculate 前汇总所有查询模式运算器，保证同一势力只需要一个共享探针。
@@ -243,20 +276,28 @@ function Mode.prepare(records)
   if not is_available() then return end
   local requests = {}
   for _, record in pairs(records or {}) do
-    if record.entity and record.entity.valid and type(record.config) == "table"
-      and record.config.mode == Mode.name then
+    if record.entity and record.entity.valid and type(record.config) == "table" then
       local query_type = record.config.query_type or Config.query_type.all
       local force = record.entity.force
-      local request = requests[force.index]
-      if not request then
-        request = {force = force, signals = {}}
-        requests[force.index] = request
-      end
-      if record.config.query_all then
-        if query_type ~= Config.query_type.fluid then request.query_all_items = true end
-        if query_type ~= Config.query_type.item then request.query_all_fluids = true end
-      else
-        add_record_inputs(request.signals, record, query_type)
+      local query_record = record.config.mode == Mode.name
+      local linked_supermarket = record.config.mode == Config.mode.supermarket_order
+        and record.config.inventory_validation == Config.inventory_validation.linked
+      if query_record or linked_supermarket then
+        local request = requests[force.index]
+        if not request then
+          request = {force = force, signals = {}}
+          requests[force.index] = request
+        end
+        if query_record and record.config.query_all then
+          if query_type ~= Config.query_type.fluid then request.query_all_items = true end
+          if query_type ~= Config.query_type.item then request.query_all_fluids = true end
+        elseif query_record then
+          add_record_inputs(request.signals, record, query_type)
+        elseif record.supermarket_order_plan then
+          for key, signal in pairs(Mode.supermarket_signals(record.supermarket_order_plan)) do
+            request.signals[key] = signal
+          end
+        end
       end
     end
   end
@@ -280,7 +321,9 @@ function Mode.prepare(records)
     else
       local probe = get_probe(request.force, force_state)
       if probe then
-        if force_state.signature ~= signature then configure_probe(force_state, signals, signature) end
+        if force_state.signature ~= signature or type(force_state.requested) ~= "table" then
+          configure_probe(force_state, signals, signature)
+        end
         refresh_results(force_state)
       end
     end
@@ -307,13 +350,34 @@ end
 function Mode.restore_state(record, saved)
 end
 
+---读取一张超市订单配方树对应的共享库存快照。
+---查询集合尚未包含全部信号或首份结果未返回时返回 nil，调用方据此保持/暂停输出。
+---@param force LuaForce 查询所属势力。
+---@param requested table supermarket_signals 返回的信号集合。
+---@return table|nil inventory 以 signal_key 为键的数量表。
+---@return uint|nil generation 独立探针快照编号。
+function Mode.get_shared_inventory(force, requested)
+  if not is_available() then return nil end
+  local force_state = state().forces[force.index]
+  if not (force_state and force_state.has_results) then return nil end
+  for key in pairs(requested or {}) do
+    if not (force_state.requested and force_state.requested[key]) then return nil end
+  end
+  local inventory = {}
+  for key in pairs(requested or {}) do
+    local result = force_state.results and force_state.results[key]
+    inventory[key] = result and result.count or 0
+  end
+  return inventory, force_state.generation
+end
+
 ---输出共享区库存；query_all=false 时只保留符合查询类型且出现在输入中的信号。
 ---@param record table 组合器记录，必须包含 entity 和 config。
 ---@return table outputs 标准输出集合，由 control.lua 统一写入线路。
 function Mode.calculate(record)
   if not is_available() then return {} end
   local force_state = state().forces[record.entity.force.index]
-  if not (force_state and force_state.ready_tick and game.tick >= force_state.ready_tick) then return {} end
+  if not (force_state and force_state.has_results) then return {} end
 
   local query_type = record.config.query_type or Config.query_type.all
   local outputs = {}

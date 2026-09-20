@@ -341,6 +341,8 @@ function Gui.production_diagnostic_tooltip(diagnostic)
       signal_localised_label(Util.make_signal("recipe", diagnostic.recipe_name))}
   elseif diagnostic.kind == "surface_conditions" then
     reason = {"bmsc.supermarket-reason-surface-conditions"}
+  elseif diagnostic.kind == "inventory_query_pending" then
+    reason = {"bmsc.supermarket-reason-inventory-query-pending"}
   elseif diagnostic.kind == "unsupported_signal" then
     reason = {"bmsc.production-reason-unsupported-signal"}
   elseif diagnostic.kind == "non_positive_order" then
@@ -363,7 +365,8 @@ local function diagnostic_signal_style(color, diagnostic)
   if kind == "active_output" or kind == "supermarket_expanding" then
     return "green_circuit_network_content_slot" -- 标准绿色：当前正在输出或展开。
   end
-  if kind == "waiting_for_order" or kind == "active_fallback" then
+  if kind == "waiting_for_order" or kind == "active_fallback"
+    or kind == "inventory_query_pending" then
     return "bmsc_signal_diagnostic_filtered"  -- 黄色：有效订单，等待轮到它。
   end
   if kind == "stock_sufficient" or kind == "supermarket_completed" then
@@ -376,7 +379,7 @@ end
 local function diagnostic_signal_priority(diagnostic)
   local kind = diagnostic and diagnostic.kind
   if kind == "active_output" or kind == "active_fallback" or kind == "supermarket_expanding" then return 4 end
-  if kind == "waiting_for_order" then return 3 end
+  if kind == "waiting_for_order" or kind == "inventory_query_pending" then return 3 end
   if kind == "stock_sufficient" or kind == "supermarket_completed" then return 1 end
   return 2
 end
@@ -1258,8 +1261,9 @@ end
 ---@param config table 已由业务层校验过的实体配置。
 ---@param current_output_networks table|nil control.lua 最近一次写入代理的输出快照。
 ---@param input_diagnostics table|nil 生产订单绿色输入信号的未输出原因。
+---@param linked_inventory_available boolean|nil 是否显示关联箱自动库存校验选项。
 ---@return LuaGuiElement frame 新创建的主窗口。
-function Gui.open(player, entity, config, current_output_networks, input_diagnostics)
+function Gui.open(player, entity, config, current_output_networks, input_diagnostics, linked_inventory_available)
   Gui.hide_network_popup(player)
   Gui.close_order_target(player, false)
   local old = player.gui.screen[Gui.name]
@@ -1413,9 +1417,19 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     name = "bmsc-recursion-machine", elem_type = "entity", entity = config.production_machine,
     tooltip = {"bmsc.production-machine-tooltip"}}
   recursion_machine.style.size = 52                   -- 参数：两个模式使用一致的机器选择按钮尺寸。
-  recursion_machine_controls.add{type = "checkbox", name = "bmsc-recursion-strict-validation",
-    caption = {"bmsc.strict-validation"}, state = config.recursion_strict_validation == true,
-    tooltip = {"bmsc.strict-validation-tooltip"}}
+  local validation_items = {{"bmsc.inventory-validation"}, {"bmsc.inventory-validation-none"}}
+  local validation_values = {Config.inventory_validation.inventory, Config.inventory_validation.none}
+  if linked_inventory_available then
+    table.insert(validation_items, 2, {"bmsc.inventory-validation-linked"})
+    table.insert(validation_values, 2, Config.inventory_validation.linked)
+  end
+  local selected_validation = 1
+  for index, value in ipairs(validation_values) do
+    if value == config.inventory_validation then selected_validation = index; break end
+  end
+  recursion_machine_controls.add{type = "drop-down", name = "bmsc-inventory-validation",
+    items = validation_items, selected_index = selected_validation,
+    tooltip = {"bmsc.inventory-validation-tooltip"}}
   add_numeric_slider(recursion_fields, {"bmsc.additional-rate"}, "bmsc-recursion-additional",
     config.recursion_additional_production_rate, true, {"bmsc.recursion-additional-rate-tooltip"})
   add_numeric_slider(recursion_fields, {"bmsc.material-rate"}, "bmsc-recursion-material",

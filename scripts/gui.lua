@@ -309,7 +309,7 @@ local function active_order_tooltip(diagnostic)
 end
 
 ---把订单模式给出的结构化原因转换为附加在原型详情下方的本地化提示。
----@param diagnostic table|nil 绿色输入诊断。
+---@param diagnostic table|nil 输入信号诊断。
 ---@return LocalisedString|nil tooltip 没有诊断时不追加提示。
 function Gui.production_diagnostic_tooltip(diagnostic)
   if not diagnostic then return nil end
@@ -351,6 +351,8 @@ function Gui.production_diagnostic_tooltip(diagnostic)
     reason = {"bmsc.production-reason-waiting", signal_localised_label(diagnostic.signal)}
   elseif diagnostic.kind == "supermarket_completed" then
     reason = {"bmsc.supermarket-reason-completed"}
+  elseif diagnostic.kind == "swap_discarded" then
+    reason = {"bmsc.swap-reason-discarded"}
   end
   return reason and {"bmsc.production-no-output-reason", reason} or nil
 end
@@ -360,8 +362,10 @@ end
 ---@param diagnostic table|nil 订单模式给出的结构化原因。
 ---@return string style_name GUI 样式名称。
 local function diagnostic_signal_style(color, diagnostic)
-  if color ~= "green" or not diagnostic then return color .. "_circuit_network_content_slot" end
+  if not diagnostic then return color .. "_circuit_network_content_slot" end
   local kind = diagnostic and diagnostic.kind
+  if kind == "swap_discarded" then return "bmsc_signal_diagnostic_filtered" end
+  if color ~= "green" then return color .. "_circuit_network_content_slot" end
   if kind == "active_output" or kind == "supermarket_expanding" then
     return "green_circuit_network_content_slot" -- 标准绿色：当前正在输出或展开。
   end
@@ -375,9 +379,10 @@ local function diagnostic_signal_style(color, diagnostic)
   return "bmsc_signal_diagnostic_invalid"     -- 冷蓝：条件不满足或没有未输出原因。
 end
 
----把绿色订单诊断映射为显示顺序：当前输出、等待、异常/未知、库存充足。
+---把输入诊断映射为显示顺序：当前输出、等待、异常/未知、库存充足或已截断。
 local function diagnostic_signal_priority(diagnostic)
   local kind = diagnostic and diagnostic.kind
+  if kind == "swap_discarded" then return -1 end
   if kind == "active_output" or kind == "active_fallback" or kind == "supermarket_expanding" then return 4 end
   if kind == "waiting_for_order" or kind == "inventory_query_pending" then return 3 end
   if kind == "stock_sufficient" or kind == "supermarket_completed" then return 1 end
@@ -408,7 +413,7 @@ end
 ---把输入/输出两侧的红绿网络信号展开成稳定排序的槽位数组。
 ---同一信号同时出现在红、绿网络时保留两个槽位，以不同线路底色明确区分来源。
 ---@param networks table `get_side_networks` 返回的网络数组。
----@param diagnostics table|nil 以 Util.signal_key 为键的绿色输入诊断。
+---@param diagnostics table|nil 以 Util.signal_key 为键的输入诊断；all_colors 可应用到红色槽位。
 ---@return table entries 每项包含 color、signal、count、sprite 和稳定 key。
 local function collect_signal_entries(networks, diagnostics)
   local entries = {}
@@ -418,15 +423,15 @@ local function collect_signal_entries(networks, diagnostics)
         local quality = type(value.signal.quality) == "string" and value.signal.quality
           or (value.signal.quality and value.signal.quality.name)
         local sprite = signal_sprite_path(value.signal)
-        local diagnostic = network.color == "green" and diagnostics
-          and diagnostics[Util.signal_key(value.signal)] or nil
+        local diagnostic = diagnostics and diagnostics[Util.signal_key(value.signal)] or nil
+        if network.color ~= "green" and not (diagnostic and diagnostic.all_colors) then diagnostic = nil end
         entries[#entries + 1] = {
           color = network.color,
           signal = value.signal,
           count = value.count,
           sort_priority = tonumber(value.sort_priority) or 0,
           diagnostic = diagnostic,
-          diagnostic_priority = network.color == "green" and diagnostic_signal_priority(diagnostic) or 0,
+          diagnostic_priority = diagnostic and diagnostic_signal_priority(diagnostic) or 0,
           sprite = sprite,
           key = network.color .. "|" .. sprite .. "|" .. (quality or "normal")
         }
@@ -435,7 +440,7 @@ local function collect_signal_entries(networks, diagnostics)
   end
   table.sort(entries, function(a, b)
     if a.color ~= b.color then return a.color < b.color end
-    if a.color == "green" and a.diagnostic_priority ~= b.diagnostic_priority then
+    if a.diagnostic_priority ~= b.diagnostic_priority then
       return a.diagnostic_priority > b.diagnostic_priority
     end
     if a.sort_priority ~= b.sort_priority then return a.sort_priority > b.sort_priority end
@@ -1547,8 +1552,9 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     config.swap_timeout or 0, true, {"bmsc.swap-timeout-tooltip"})
   add_labeled(swap_fields, {"bmsc.swap-loop"}, {type = "checkbox", name = "bmsc-swap-loop",
     state = config.swap_loop == true, tooltip = {"bmsc.swap-loop-tooltip"}})
-  swap_settings.add{type = "button", name = "bmsc-clear-swap", caption = {"bmsc.clear-swap"}}
-  add_conditions_editor(swap_settings, "swap", {"bmsc.conditions"}, config.swap_conditions)
+  swap_settings.add{type = "button", name = "bmsc-clear-swap", caption = {"bmsc.clear-swap"},
+    tooltip = {"bmsc.clear-swap-tooltip"}}
+  add_conditions_editor(swap_settings, "swap", {"bmsc.timeout-reset-conditions"}, config.swap_conditions)
   Gui.add_signal_panel(swap_details, player)
 
   -- 已保存的说明直接显示在配置界面内；内容支持 Factorio 富文本图标。

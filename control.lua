@@ -89,12 +89,13 @@ local function restore_mode_states(record, states)
   for name, mode in pairs(MODES) do mode.restore_state(record, states[name]) end
 end
 
----取得当前模式写给绿色输入槽位的诊断，避免其他模式显示残留原因。
+---取得当前模式写给输入槽位的诊断，避免其他模式显示残留原因。
 ---@param record table 组合器记录。
 ---@return table|nil diagnostics 当前模式诊断。
 local function current_input_diagnostics(record)
   if record.config.mode == MODE_PRODUCTION_ORDER then return record.production_order_diagnostics end
   if record.config.mode == MODE_SUPERMARKET_ORDER then return record.supermarket_order_diagnostics end
+  if record.config.mode == MODE_SWAP_ORDER then return record.swap_order_diagnostics end
   return nil
 end
 
@@ -273,22 +274,35 @@ end
 ---@param outputs table 当前输出集合。
 ---@return nil
 local function update_hover_tooltip(record, outputs)
-  local parts = {}
-  local signature_parts = {}
-  for _, value in ipairs(Util.sorted_outputs(outputs)) do
-    local entry = value.entry
-    signature_parts[#signature_parts + 1] = value.key .. "=" .. tostring(entry.count)
-    local signal_type = entry.signal.type or "item"
-    local tag_type = signal_type == "virtual" and "virtual-signal" or signal_type
-    local quality = signal_type == "item" and Util.quality_name(entry.signal.quality) or nil
-    local quality_part = quality and quality ~= "normal" and ",quality=" .. quality or ""
-    parts[#parts + 1] = "[" .. tag_type .. "=" .. entry.signal.name
-      .. quality_part .. "] " .. entry.count
+  local function format_entries(entries, signature_prefix)
+    local parts, signature_parts = {}, {}
+    for _, value in ipairs(Util.sorted_outputs(entries)) do
+      local entry = value.entry
+      signature_parts[#signature_parts + 1] = signature_prefix .. value.key .. "=" .. tostring(entry.count)
+      local signal_type = entry.signal.type or "item"
+      local tag_type = signal_type == "virtual" and "virtual-signal" or signal_type
+      local quality = signal_type == "item" and Util.quality_name(entry.signal.quality) or nil
+      local quality_part = quality and quality ~= "normal" and ",quality=" .. quality or ""
+      parts[#parts + 1] = "[" .. tag_type .. "=" .. entry.signal.name
+        .. quality_part .. "] " .. entry.count
+    end
+    return #parts > 0 and table.concat(parts, "  ") or {"bmsc.no-output"}, signature_parts
+  end
+
+  local content, signature_parts
+  if outputs.separated == true then
+    local red, red_signature = format_entries(outputs.red or {}, "red:")
+    local green, green_signature = format_entries(outputs.green or {}, "green:")
+    content = {"bmsc.output-signals-separated", red, green}
+    signature_parts = {"separated"}
+    for _, part in ipairs(red_signature) do signature_parts[#signature_parts + 1] = part end
+    for _, part in ipairs(green_signature) do signature_parts[#signature_parts + 1] = part end
+  else
+    content, signature_parts = format_entries(outputs, "")
   end
   local signature = table.concat(signature_parts, "|")
   -- set_tooltip_field 会修改实体运行时状态；输出未变化时直接复用旧字段，避免重复写入。
   if record.tooltip_output_signature == signature then return end
-  local content = #parts > 0 and table.concat(parts, "  ") or {"bmsc.no-output"}
   record.output_tooltip_id = record.entity.set_tooltip_field{
     id = record.output_tooltip_id, name = {"bmsc.output-signals"}, value = content, order = 31
   }
@@ -421,16 +435,7 @@ local function write_outputs(record, outputs)
       record.detail_proxy, record.detail_outputs or {}, record.proxy_output_cache.detail)
   end
 
-  local tooltip_outputs = outputs
-  if separated then
-    tooltip_outputs = {}
-    for _, wire_outputs in pairs({red_outputs or {}, green_outputs or {}}) do
-      for _, entry in pairs(wire_outputs) do
-        Util.add_output(tooltip_outputs, entry.signal, entry.count)
-      end
-    end
-  end
-  update_hover_tooltip(record, tooltip_outputs)
+  update_hover_tooltip(record, outputs)
 end
 
 local function timeout_elapsed_seconds(start_tick, timeout, active)
@@ -972,7 +977,11 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     if record then
       record.config.swap_output_mode = ({"fluid", "item", "all", "all_with_signals"})
         [event.element.selected_index] or "fluid"
-      reset_swap_timer(record)
+      -- 类型过滤会改变候选集合；立即重新选择并刷新面板，不能暂留旧类型的线路输出。
+      MODES[MODE_SWAP_ORDER].clear(record)
+      write_outputs(record, MODES[MODE_SWAP_ORDER].calculate(record))
+      Gui.refresh_connection_status(game.get_player(event.player_index), record.entity,
+        record.gui_output_networks, current_input_diagnostics(record))
     end
     return
   end
@@ -1182,6 +1191,8 @@ script.on_event(defines.events.on_gui_click, function(event)
   if event.element.name == "bmsc-clear-swap" and record then
     MODES[MODE_SWAP_ORDER].clear(record)
     write_outputs(record, MODES[MODE_SWAP_ORDER].calculate(record))
+    Gui.refresh_connection_status(
+      player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
     return
   end
   if event.element.name == "bmsc-description-toggle" then

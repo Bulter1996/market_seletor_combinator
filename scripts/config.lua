@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 14
+Config.schema_revision = 15
 
 Config.mode = {
   production_order = "production_order",
@@ -114,9 +114,9 @@ function Config.default()
     recursion_timeout_monitor_item_changes = true, -- 参数：当前输出数量变化时是否重置超市超时。
     recursion_timeout_conditions = default_conditions(),  -- 参数：满足时重置超市订单超时。
     swap_output_mode = "fluid",                 -- 参数：切换订单输出的信号类型。
-    swap_timeout = 0,                            -- 参数：条件持续满足多久后切换排列；0 表示直通。
-    swap_loop = false,                           -- 参数：到达最后一个排列后是否回到第一个。
-    swap_conditions = default_conditions()       -- 参数：切换计时条件；relation 表示与前一条的关系。
+    swap_timeout = 0,                            -- 参数：重置条件不满足多久后交换红绿输出；0 表示禁用。
+    swap_loop = false,                           -- 参数：首次交换后是否继续在红绿输出间往返。
+    swap_conditions = default_conditions()       -- 参数：满足时重置交换计时；relation 表示与前一条的关系。
   }
 end
 

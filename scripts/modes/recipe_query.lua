@@ -2,6 +2,7 @@
 -- 红绿输入在本模式中地位相同：输入代表希望查询的产品，输出为制造这些产品所需的直接原料。
 
 local Util = require("scripts.common_util")
+local OrderTarget = require("scripts.order_target")
 local Mode = {
   name = "recipe_query",                           -- 模式注册名，必须与 config.lua 的值一致。
   -- 使用最小值选择对应的独立素材槽位显示“?”，但把索引设为 int32 最大值。线路中的
@@ -68,25 +69,30 @@ function Mode.calculate(record)
   if not record.config.multiple_recipe_support then
     local first = sorted_queries[1]
     if not first then return outputs end
-    local signal, specified_recipe = Util.resolve_recipe_input(
-      first.entry.signal, record.config.production_machine)
-    local recipe = signal and Util.find_recipe_ignoring_research(
-      signal, record.config.production_machine, specified_recipe)
+    local target = OrderTarget.resolve(record.entity.force, record.config.production_machine,
+      first.entry.signal, record.config, {ignore_research = true})
+    local recipe = target.recipe
     if recipe then add_recipe_ingredients(outputs, recipe, 1) end
     return outputs
   end
 
-  local requirements = {}
+  local requirements, by_recipe = {}, {}
   for _, query in ipairs(sorted_queries) do
-    local signal, specified_recipe = Util.resolve_recipe_input(
-      query.entry.signal, record.config.production_machine)
-    local recipe = signal and Util.find_recipe_ignoring_research(
-      signal, record.config.production_machine, specified_recipe)
+    local target = OrderTarget.resolve(record.entity.force, record.config.production_machine,
+      query.entry.signal, record.config, {ignore_research = true})
+    local signal, recipe = target.signal, target.recipe
     if recipe then
       local product_amount = Util.recipe_product_amount(recipe, signal)
       if product_amount > 0 then
         local crafts = math.ceil(query.entry.count / product_amount)
-        requirements[#requirements + 1] = {recipe = recipe, crafts = crafts}
+        local requirement = by_recipe[recipe.name]
+        if requirement then
+          -- 同一配方的多个产物由同一批制造同时满足，取最大制作次数而不是重复累计。
+          requirement.crafts = math.max(requirement.crafts, crafts)
+        else
+          requirement = {recipe = recipe, crafts = crafts}
+          by_recipe[recipe.name], requirements[#requirements + 1] = requirement, requirement
+        end
       end
     end
   end

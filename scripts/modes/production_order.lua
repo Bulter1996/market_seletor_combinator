@@ -3,6 +3,7 @@
 
 local Util = require("scripts.common_util")
 local Conditions = require("scripts.conditions")
+local OrderTarget = require("scripts.order_target")
 local Mode = {
   name = "production_order",                         -- 模式注册名，必须与 config.lua 的值一致。
   visual_operation = "count"                         -- 仅借用原版“输入计数”的 # 屏幕动画。
@@ -135,30 +136,28 @@ function Mode.calculate(record)
   ---@return LuaRecipePrototype|nil recipe 满足时返回配方，否则返回 nil。
   ---@return table|nil diagnostic 不满足时返回结构化原因，供绿色输入信号悬浮提示复用。
   local function eligible(demand, locked)
-    local signal, specified_recipe = Util.resolve_recipe_input(demand.signal, config.production_machine)
     if not Util.is_recipe_input(demand.signal) then return nil, {kind = "unsupported_signal"} end
-    if not signal then return nil, {kind = "no_recipe"} end
     if demand.count <= 0 then return nil, {kind = "non_positive_order"} end
-    local stock = inventory[Util.signal_key(signal)] or 0
-    if locked then
-      -- 停止条件：订单一旦启动，就忽略基础订单阈值，继续保持锁定直到扩展目标。
-      -- 这样库存处于 [订单量, 扩展目标) 时不会关闭输出后又立刻重新启动。
-      -- 达到目标上限时缺口已经为 0，应立即完成当前订单；若仍使用严格大于，
-      -- 下游收到 0 后不会继续生产，组合器也就永远无法靠库存增长解除锁定。
-      if stock >= demand.count * (1 + config.additional_production_rate) then
-        return nil, {kind = "stock_sufficient", stock = stock}
-      end
-    elseif demand.count <= stock then
-      -- 启动条件：只有库存严格小于基础订单量才能选中新订单。
-      -- 此处不能使用扩展目标，否则迟滞区间内会反复重新启动，失去防频闪作用。
-      return nil, {kind = "stock_sufficient", stock = stock}
+    local target = OrderTarget.resolve(record.entity.force, config.production_machine, demand.signal, config)
+    if target.locked_recipe then
+      return nil, {kind = "recipe_locked", recipe_name = target.locked_recipe}
     end
-    local recipe = Util.find_recipe(record.entity.force, signal, config.production_machine, specified_recipe)
-    if not recipe then return nil, {kind = "no_recipe"} end
+    if target.machine_unsupported_recipe and not target.recipe then
+      return nil, {kind = "recipe_machine_unsupported",
+        recipe_name = target.machine_unsupported_recipe}
+    end
+    if not (target.signal and target.recipe) then return nil, {kind = "no_recipe"} end
+    -- 未锁定订单按基础数量启动；锁定后所有选中产物都达到扩展目标才结束。
+    local target_count = locked and demand.count * (1 + config.additional_production_rate) or demand.count
+    local status = OrderTarget.inventory_status(target.products, inventory, target_count)
+    if status.satisfied then
+      return nil, {kind = "stock_sufficient", stock = status.products[1] and status.products[1].stock or 0,
+        products = status.products}
+    end
     local material_rate = locked and (config.material_retention_rate or 1) or config.material_demand_rate
-    local shortages = recipe_material_shortages(recipe, inventory, material_rate, locked)
+    local shortages = recipe_material_shortages(target.recipe, inventory, material_rate, locked)
     if #shortages > 0 then return nil, {kind = "materials", shortages = shortages} end
-    return recipe, nil, signal
+    return target.recipe, nil, target
   end
 
   ---计算产品线路当前应输出的实时生产缺口。
@@ -168,17 +167,17 @@ function Mode.calculate(record)
   ---配置的目标。最后再限制到 int32 范围，使超时比较值与线路实际输出值一致。
   ---@param demand Signal 当前锁定订单。
   ---@return integer count 最终写入产品线路的非负缺口数量。
-  local function product_output_count(demand)
-    local signal = Util.resolve_recipe_input(demand.signal, config.production_machine)
-    local stock = signal and inventory[Util.signal_key(signal)] or 0
-    local target = demand.count * (1 + config.additional_production_rate)
-    return Util.clamp_int32(math.max(0, math.ceil(target - stock)))
+  local function product_output_count(demand, target)
+    target = target or OrderTarget.resolve(record.entity.force, config.production_machine, demand.signal, config)
+    local goal = demand.count * (1 + config.additional_production_rate)
+    local status = OrderTarget.inventory_status(target.products, inventory, goal)
+    return Util.clamp_int32(status.remaining), status
   end
 
-  local selected_demand, selected_recipe, selected_signal
+  local selected_demand, selected_recipe, selected_target
   local selected_was_locked = false
   if config.remember_order and record.remembered_order then
-    selected_recipe, _, selected_signal = eligible(record.remembered_order, true)
+    selected_recipe, _, selected_target = eligible(record.remembered_order, true)
     if selected_recipe then
       selected_demand = record.remembered_order
       selected_was_locked = true
@@ -188,7 +187,7 @@ function Mode.calculate(record)
   elseif record.selected_request then
     for _, demand in ipairs(demands) do
       if Util.signal_key(demand.signal) == record.selected_request then
-        selected_recipe, _, selected_signal = eligible(demand, true)
+        selected_recipe, _, selected_target = eligible(demand, true)
         if selected_recipe then
           selected_demand = demand
           selected_was_locked = true
@@ -208,7 +207,7 @@ function Mode.calculate(record)
   local selected_output_count
   if selected_demand then
     local selected_key = Util.signal_key(selected_demand.signal)
-    selected_output_count = product_output_count(selected_demand)
+    selected_output_count = product_output_count(selected_demand, selected_target)
     local output_changed = record.production_order_output_count ~= selected_output_count
     local reset_by_output = record.production_order_changed_tick == nil
       or output_changed and config.production_timeout_monitor_item_changes ~= false
@@ -239,12 +238,12 @@ function Mode.calculate(record)
     -- 超时订单已经被移到队尾；后续订单即使完成，也继续从队首向后扫描，不会让它插队。
     for _, key in ipairs(order_queue) do
       local demand = demands_by_key[key]
-      local recipe, _, signal = eligible(demand, false)
+      local recipe, _, target = eligible(demand, false)
       if recipe then
-        selected_demand, selected_recipe, selected_signal = demand, recipe, signal
+        selected_demand, selected_recipe, selected_target = demand, recipe, target
         selected_was_locked = false
         record.selected_request = Util.signal_key(demand.signal)
-        selected_output_count = product_output_count(demand)
+        selected_output_count = product_output_count(demand, target)
         record.production_order_output_count = selected_output_count
         record.production_order_changed_tick = game.tick
         if config.remember_order then
@@ -289,17 +288,22 @@ function Mode.calculate(record)
 
   local selected_diagnostic
   if selected_demand then
-    local output_count = selected_output_count or product_output_count(selected_demand)
+    local output_count, product_status = product_output_count(selected_demand, selected_target)
+    output_count = selected_output_count or output_count
     local output_signal = selected_demand.signal.type == "recipe"
-      and Util.make_signal("recipe", selected_demand.signal.name) or selected_signal
+      and Util.make_signal("recipe", selected_demand.signal.name)
+      or selected_target.manual_recipe
+        and Util.make_signal("recipe", selected_target.manual_recipe)
+      or selected_target.signal
     if config.output_mode ~= "only_material" then
-      -- 配方订单内部仍按产品计算库存和缺口，但输出保留玩家输入的原配方信号。
+      -- 配方订单保留输入配方；普通产品手动选配方后也输出配方信号，便于机器直接识别。
+      -- 库存、制造次数和原料需求仍使用真实产品计算，不受输出信号类型影响。
       Util.add_output(outputs, output_signal, output_count)
       Util.add_output(product_outputs, output_signal, output_count)
     end
     -- 诊断与线路输出共用同一制造次数，确保“本次需要”和实际材料信号口径一致。
     -- 即使选择“仅产品”，悬浮信息仍展示完成当前缺口需要的全部直接原料。
-    local product_amount = Util.recipe_product_amount(selected_recipe, selected_signal)
+    local product_amount = Util.recipe_product_amount(selected_recipe, selected_target.signal)
     local crafts = product_amount > 0 and math.ceil(output_count / product_amount) or 0
     material_crafts = crafts
     local ingredients = {}
@@ -332,27 +336,30 @@ function Mode.calculate(record)
       return Util.signal_key(a.signal) < Util.signal_key(b.signal)
     end)
 
-    local product_stock = inventory[Util.signal_key(selected_signal)] or 0
-    local target = math.ceil(selected_demand.count * (1 + config.additional_production_rate))
+    local product = product_status.products[1]
     selected_diagnostic = {
-      kind = "active_output",
+      kind = selected_target.machine_unsupported_recipe and "active_fallback" or "active_output",
+      unavailable_recipe = selected_target.machine_unsupported_recipe,
+      fallback_recipe = selected_target.machine_unsupported_recipe and selected_recipe.name or nil,
       order = {
         signal = Util.make_signal(selected_demand.signal.type, selected_demand.signal.name,
           selected_demand.signal.quality),
         count = selected_demand.count
       },
       product = {
-        signal = Util.make_signal(selected_signal.type, selected_signal.name, selected_signal.quality),
-        target = target,
-        stock = product_stock,
-        remaining = output_count
+        signal = Util.make_signal(product.signal.type, product.signal.name, product.signal.quality),
+        target = product.target, stock = product.stock, remaining = product.remaining
       },
+      products = product_status.products,
+      recipe_name = selected_recipe.name,
+      manual_recipe = selected_target.manual_recipe ~= nil,
       stage = {
         -- 订单行已经保留原始配方信号；“当前计划制作”应显示配方实际产出的产品。
-        signal = Util.make_signal(selected_signal.type, selected_signal.name, selected_signal.quality),
+        signal = Util.make_signal(selected_target.signal.type, selected_target.signal.name,
+          selected_target.signal.quality),
         level = 1,
-        target = target,
-        stock = product_stock,
+        target = product.target,
+        stock = inventory[Util.signal_key(selected_target.signal)] or 0,
         output_count = output_count,
         ingredients = ingredients,
         gate_kind = selected_was_locked and "retention" or "start",

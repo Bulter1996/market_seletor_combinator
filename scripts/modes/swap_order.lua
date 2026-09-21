@@ -1,4 +1,4 @@
--- “切换订单”模式：合并两色输入，并用 101、102……的唯一数值把全排列传给下游选择器。
+-- “切换订单”模式：从合并输入锁定前两个信号，并用 101/102 在红绿输出间交换排名。
 
 local Conditions = require("scripts.conditions")
 local Mode = {
@@ -10,34 +10,7 @@ local Mode = {
   visual_revision = 2  -- 强制旧存档立即替换此前每 tick 产生原版输出的 random 参数。
 }
 
-local function next_permutation(values)
-  local pivot = #values - 1
-  while pivot > 0 and values[pivot] >= values[pivot + 1] do pivot = pivot - 1 end
-  if pivot == 0 then
-    for index = 1, math.floor(#values / 2) do
-      values[index], values[#values - index + 1] = values[#values - index + 1], values[index]
-    end
-    return values
-  end
-  local successor = #values
-  while values[successor] <= values[pivot] do successor = successor - 1 end
-  values[pivot], values[successor] = values[successor], values[pivot]
-  local left, right = pivot + 1, #values
-  while left < right do
-    values[left], values[right] = values[right], values[left]
-    left, right = left + 1, right - 1
-  end
-  return values
-end
-
-Mode.next_permutation = next_permutation
-
-local function is_last_permutation(values)
-  for index = 2, #values do
-    if values[index - 1] < values[index] then return false end
-  end
-  return true
-end
+local STATE_REVISION = 1
 
 local function signal_allowed(signal, output_mode)
   local signal_type = signal.type or "item"
@@ -50,82 +23,111 @@ end
 Mode.conditions_met = Conditions.evaluate
 
 function Mode.reset(record)
-  -- 模式暂时失活时只停止计时；排列只允许由输入变化或玩家清空恢复。
+  -- 模式暂时失活时保留锁定结果和交换方向，只停止计时并清除界面状态。
   record.swap_condition_tick = nil
   record.swap_condition_results = nil
+  record.swap_order_diagnostics = nil
 end
 
 function Mode.clear(record)
+  record.swap_state_revision = nil
   record.swap_signature = nil
-  record.swap_permutation = nil
+  record.swap_sources = nil
+  record.swap_permutation = nil -- 迁移清理：旧版本保存的任意长度全排列不再参与运行。
+  record.swap_reversed = nil
   record.swap_condition_tick = nil
+  record.swap_order_diagnostics = nil
 end
 
 function Mode.save_state(record)
-  return {signature = record.swap_signature, permutation = record.swap_permutation,
+  if record.swap_state_revision ~= STATE_REVISION then return {} end
+  return {revision = STATE_REVISION, signature = record.swap_signature,
+    sources = record.swap_sources, reversed = record.swap_reversed,
     condition_tick = record.swap_condition_tick}
 end
 
 function Mode.restore_state(record, saved)
-  saved = saved or {}
+  Mode.clear(record)
+  if type(saved) ~= "table" or saved.revision ~= STATE_REVISION then return end
+  record.swap_state_revision = STATE_REVISION
   record.swap_signature = saved.signature
-  record.swap_permutation = saved.permutation
+  record.swap_sources = saved.sources
+  record.swap_reversed = saved.reversed == true
   record.swap_condition_tick = saved.condition_tick
+end
+
+local function ranked_output(entry, count)
+  if not entry then return {} end
+  return {[entry.key] = {signal = entry.signal, count = count, sort_priority = 1}}
 end
 
 function Mode.calculate(record)
   local inputs = Conditions.read_inputs(record.entity)
   local entries = {}
   for key, entry in pairs(inputs.merged) do
-    if signal_allowed(entry.signal, record.config.swap_output_mode) then
+    -- 两色相抵为零时线路不会产生有效输出，也不应占用两个锁定名额之一。
+    if entry.count ~= 0 and signal_allowed(entry.signal, record.config.swap_output_mode) then
       entries[#entries + 1] = {key = key, signal = entry.signal, count = entry.count}
     end
   end
-  -- 初始排列按输入数量从大到小；数量相同时按稳定信号键排序。线路输出随后改写为
-  -- 101、102……的唯一排名值，让下游原版选择运算器能够真正观察到排列变化。
   table.sort(entries, function(a, b)
     if a.count ~= b.count then return a.count > b.count end
     return a.key < b.key
   end)
-  local signature_parts = {record.config.swap_output_mode}
-  for _, entry in ipairs(entries) do
-    signature_parts[#signature_parts + 1] = entry.key .. "=" .. tostring(entry.count)
-  end
-  local signature = table.concat(signature_parts, "|")
-  if record.swap_signature ~= signature or #entries ~= #(record.swap_permutation or {}) then
+
+  local signature_keys = {}
+  for _, entry in ipairs(entries) do signature_keys[#signature_keys + 1] = entry.key end
+  table.sort(signature_keys)
+  local signature = record.config.swap_output_mode .. "|" .. table.concat(signature_keys, "|")
+  if record.swap_state_revision ~= STATE_REVISION or record.swap_signature ~= signature
+    or type(record.swap_sources) ~= "table" or #record.swap_sources > 2 then
+    -- 只有信号种类变化或玩家主动重新选择才重排；单纯数量变化继续锁定原来的两个 ID。
+    record.swap_state_revision = STATE_REVISION
     record.swap_signature = signature
-    record.swap_permutation = {}
-    for index = 1, #entries do record.swap_permutation[index] = index end
+    record.swap_sources = {}
+    for index = 1, math.min(2, #entries) do record.swap_sources[index] = entries[index].key end
+    record.swap_reversed = false
     record.swap_condition_tick = nil
   end
+
+  local entries_by_key = {}
+  for _, entry in ipairs(entries) do entries_by_key[entry.key] = entry end
+  local first = entries_by_key[record.swap_sources[1]]
+  local second = entries_by_key[record.swap_sources[2]]
 
   local timeout = tonumber(record.config.swap_timeout) or 0
-  local all_conditions_met, condition_results = Conditions.evaluate(record.config.swap_conditions, inputs)
+  local timeout_reset_active, condition_results = Conditions.evaluate(record.config.swap_conditions, inputs)
   record.swap_condition_results = condition_results
-  -- 默认只遍历一次全排列；到达降序的最后一项后停止计时，输入签名变化时才从头开始。
-  -- 开启循环后保留旧行为，由 next_permutation 把最后一项重新折回第一个排列。
-  local can_advance = record.config.swap_loop == true
-    or not is_last_permutation(record.swap_permutation or {})
-  if timeout > 0 and #entries > 1 and all_conditions_met and can_advance then
-    record.swap_condition_tick = record.swap_condition_tick or game.tick
-    local elapsed_ticks = game.tick - record.swap_condition_tick
-    if elapsed_ticks >= timeout * 60 then
-      next_permutation(record.swap_permutation)
-      record.swap_condition_tick = game.tick
-    end
-  else
+  local can_swap = timeout > 0 and first ~= nil and second ~= nil
+    and (record.config.swap_loop == true or record.swap_reversed ~= true)
+  if not can_swap then
     record.swap_condition_tick = nil
+  elseif timeout_reset_active then
+    -- 与生产订单一致：条件满足只负责把超时起点刷新到当前 tick。
+    record.swap_condition_tick = game.tick
+  else
+    record.swap_condition_tick = record.swap_condition_tick or game.tick
+    if game.tick - record.swap_condition_tick >= timeout * 60 then
+      record.swap_reversed = not record.swap_reversed
+      record.swap_condition_tick = record.config.swap_loop == true and game.tick or nil
+    end
   end
 
-  local outputs = {}
-  for output_index, source_index in ipairs(record.swap_permutation or {}) do
-    local entry = entries[source_index]
-    if entry then
-      outputs[entry.key] = {signal = entry.signal, count = 100 + output_index,
-        sort_priority = #entries - output_index + 1}
-    end
+  local locked = {}
+  for _, key in ipairs(record.swap_sources) do locked[key] = true end
+  local diagnostics = {}
+  for _, entry in ipairs(entries) do
+    if not locked[entry.key] then diagnostics[entry.key] = {kind = "swap_discarded", all_colors = true} end
   end
-  return outputs
+  record.swap_order_diagnostics = diagnostics
+
+  if not first then return {separated = true, red = {}, green = {}} end
+  if not second then
+    -- 唯一信号在两条输出线路都保持第一名编码，且没有交换计时。
+    return {separated = true, red = ranked_output(first, 101), green = ranked_output(first, 101)}
+  end
+  if record.swap_reversed then first, second = second, first end
+  return {separated = true, red = ranked_output(first, 101), green = ranked_output(second, 102)}
 end
 
 return Mode

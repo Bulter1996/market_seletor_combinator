@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 12
+Config.schema_revision = 15
 
 Config.mode = {
   production_order = "production_order",
@@ -18,12 +18,40 @@ Config.query_type = {
   all = "all"
 }
 
+Config.inventory_validation = {
+  inventory = "inventory",
+  linked = "linked",
+  none = "none"
+}
+
 -- 旧版存档和蓝图使用的模式值；只用于迁移，规范化后统一写为 supermarket_order。
 local LEGACY_ORDER_RECURSION = "order_recursion"
 
 local function default_conditions()
   return {{relation = "or", first = {red = true, green = true, constant = 0}, comparator = "<",
     second = {red = true, green = true, constant = 0}}}
+end
+
+---复制每个输入信号的共享手动配方和订单模式使用的库存校验产物。
+---这里只接受纯 Lua 数据；原型是否仍存在由运行阶段按当前模组、机器和科技重新判断。
+local function normalize_order_targets(source)
+  local targets = {}
+  for source_key, entry in pairs(type(source) == "table" and source or {}) do
+    if type(source_key) == "string" and type(entry) == "table" then
+      local products, seen = {}, {}
+      for _, product in ipairs(type(entry.products) == "table" and entry.products or {}) do
+        local signal = Config.normalize_signal(product)
+        if signal and (signal.type == "item" or signal.type == "fluid") then
+          local key = signal.type .. ":" .. signal.name
+            .. (signal.type == "item" and ":" .. (signal.quality or "normal") or "")
+          if not seen[key] then products[#products + 1], seen[key] = signal, true end
+        end
+      end
+      local recipe = type(entry.recipe) == "string" and entry.recipe or nil
+      if recipe or products[1] then targets[source_key] = {recipe = recipe, products = products} end
+    end
+  end
+  return targets
 end
 
 ---把 GUI、蓝图或旧存档中的信号配置收敛为可持久化的 SignalID。
@@ -60,6 +88,7 @@ function Config.default()
     schema_revision = Config.schema_revision,          -- 内部字段：用于识别热加载遗留的旧配置。
     mode = Config.mode.supermarket_order,          -- 参数：当前操作模式。
     production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
+    order_targets = {},                          -- 参数：输入信号共享配方，以及订单模式的库存校验产物。
     multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
     recipe_query_cache_grid_number = 0,           -- 参数：多配方查询可占用的原料缓存格数。
     query_type = Config.query_type.all,            -- 参数：共享库存查询包含流体、物品或两者。
@@ -78,16 +107,16 @@ function Config.default()
     recursion_material_demand_rate = 10,         -- 参数：超市订单切入上层配方的原料启动倍率。
     recursion_material_retention_rate = 1,       -- 参数：超市订单当前配方的原料保留倍率。
     recursion_output_mode = "single",            -- 参数：超市订单输出单项或全部结果。
-    recursion_strict_validation = false,          -- 参数：是否跳过缺少机器无法制造原料的订单。
+    inventory_validation = Config.inventory_validation.none, -- 参数：超市订单使用的库存校验来源。
     sequential_production = true,                -- 参数：single 模式是否按订单顺序逐个完成。
     recursion_material_wait_time = 0,            -- 参数：single 当前输出被撤销或切换前的保持秒数。
     recursion_timeout = 0,                       -- 参数：single 无变化轮换秒数；0 表示禁用。
     recursion_timeout_monitor_item_changes = true, -- 参数：当前输出数量变化时是否重置超市超时。
     recursion_timeout_conditions = default_conditions(),  -- 参数：满足时重置超市订单超时。
     swap_output_mode = "fluid",                 -- 参数：切换订单输出的信号类型。
-    swap_timeout = 0,                            -- 参数：条件持续满足多久后切换排列；0 表示直通。
-    swap_loop = false,                           -- 参数：到达最后一个排列后是否回到第一个。
-    swap_conditions = default_conditions()       -- 参数：切换计时条件；relation 表示与前一条的关系。
+    swap_timeout = 0,                            -- 参数：重置条件不满足多久后交换红绿输出；0 表示禁用。
+    swap_loop = false,                           -- 参数：首次交换后是否继续在红绿输出间往返。
+    swap_conditions = default_conditions()       -- 参数：满足时重置交换计时；relation 表示与前一条的关系。
   }
 end
 
@@ -135,6 +164,7 @@ function Config.normalize(source)
     config.mode = Config.mode.supermarket_order
   end
   if type(source.production_machine) == "string" then config.production_machine = source.production_machine end
+  config.order_targets = normalize_order_targets(source.order_targets)
   if type(source.multiple_recipe_support) == "boolean" then
     config.multiple_recipe_support = source.multiple_recipe_support
   end
@@ -195,8 +225,14 @@ function Config.normalize(source)
   if source.recursion_output_mode == "single" or source.recursion_output_mode == "all" then
     config.recursion_output_mode = source.recursion_output_mode
   end
-  if type(source.recursion_strict_validation) == "boolean" then
-    config.recursion_strict_validation = source.recursion_strict_validation
+  if source.inventory_validation == Config.inventory_validation.inventory
+    or source.inventory_validation == Config.inventory_validation.linked
+    or source.inventory_validation == Config.inventory_validation.none then
+    config.inventory_validation = source.inventory_validation
+  elseif type(source.recursion_strict_validation) == "boolean" then
+    -- 旧布尔开关迁移：勾选沿用库存校验，未勾选采用新的直接输出语义。
+    config.inventory_validation = source.recursion_strict_validation
+      and Config.inventory_validation.inventory or Config.inventory_validation.none
   end
   if type(source.sequential_production) == "boolean" then
     config.sequential_production = source.sequential_production

@@ -38,11 +38,20 @@ assert(normalized.recursion_timeout_conditions[1].first.signal.type == "item")
 assert(normalized.production_timeout_monitor_item_changes == true)
 assert(normalized.recursion_timeout_monitor_item_changes == true)
 assert(normalized.recursion_material_wait_time == 0)
-assert(normalized.recursion_strict_validation == false)
+assert(normalized.inventory_validation == Config.inventory_validation.none)
 assert(normalized.swap_loop == false)
 assert(normalized.swap_conditions[1].first.signal.name == "signal-R")
 assert(normalized.swap_conditions[1].second.signal.type == "item")
 assert(normalized.swap_conditions[1].first.signal ~= reset)
+local target_source = {['item:product:normal'] = {recipe = 'make-product', products = {
+  {type = 'item', name = 'product', quality = 'normal'},
+  {type = 'item', name = 'product', quality = 'normal'}
+}}}
+local normalized_targets = Config.normalize{order_targets = target_source}.order_targets
+assert(normalized_targets['item:product:normal'].recipe == 'make-product')
+assert(#normalized_targets['item:product:normal'].products == 1)
+target_source['item:product:normal'].products[1].name = 'changed'
+assert(normalized_targets['item:product:normal'].products[1].name == 'product')
 local copied = Config.normalize{mode = Config.mode.swap_order, swap_timeout = 12, swap_loop = true,
   recipe_query_cache_grid_number = 7,
   recursion_material_wait_time = 7,
@@ -58,7 +67,7 @@ assert(copied.mode == Config.mode.swap_order and copied.swap_timeout == 12)
 assert(copied.swap_loop == true)
 assert(copied.recipe_query_cache_grid_number == 7)
 assert(copied.recursion_material_wait_time == 7)
-assert(copied.recursion_strict_validation == true)
+assert(copied.inventory_validation == Config.inventory_validation.inventory)
 assert(copied.production_timeout_monitor_item_changes == false)
 assert(copied.recursion_timeout_monitor_item_changes == false)
 assert(copied.recursion_additional_production_rate == 2)
@@ -66,6 +75,8 @@ assert(copied.recursion_material_demand_rate == 6 and copied.recursion_material_
 assert(copied.production_timeout_conditions[1].first.signal.name == "signal-R")
 assert(copied.recursion_timeout_conditions[1].first.signal.name == "iron")
 assert(copied.swap_conditions[1].second.signal.name == "iron")
+assert(Config.normalize{inventory_validation = Config.inventory_validation.linked}.inventory_validation
+  == Config.inventory_validation.linked)
 local green = {
   {signal = {type = "item", name = "product", quality = "normal"}, count = 10},
   {signal = reset, count = 1}
@@ -341,42 +352,96 @@ local surface_tooltip = Gui.production_diagnostic_tooltip{kind = "surface_condit
 assert(surface_tooltip[1] == "bmsc.production-no-output-reason")
 assert(surface_tooltip[2][1] == "bmsc.supermarket-reason-surface-conditions")
 
--- 切换订单默认在最后一个排列停止；输入变化后从头开始，显式开启循环才会折回第一项。
+-- 切换订单只锁定前两项；数量变化不重选，重置条件满足时刷新计时起点。
 local swap_inputs = {
   {signal = {type = "fluid", name = "water"}, count = 20},
   {signal = {type = "fluid", name = "steam"}, count = 10},
-  {signal = reset, count = 1}
+  {signal = {type = "fluid", name = "crude-oil"}, count = 1},
+  {signal = reset, count = 0}
 }
 local swap_entity = {get_signals = function(connector_id)
   return connector_id == defines.wire_connector_id.combinator_input_green and swap_inputs or {}
 end}
 local SwapOrder = require("scripts.modes.swap_order")
+local legacy_swap_record = {}
+SwapOrder.restore_state(legacy_swap_record, {
+  signature = "legacy", sources = {"fluid:water", "fluid:steam"}, permutation = {2, 1}})
+assert(legacy_swap_record.swap_sources == nil and legacy_swap_record.swap_permutation == nil
+  and legacy_swap_record.swap_reversed == nil)
 local swap_record = {entity = swap_entity, config = {
   swap_output_mode = "fluid", swap_timeout = 1, swap_loop = false,
   swap_conditions = reset_conditions
 }}
 game.tick = 0
 local initial_swap = SwapOrder.calculate(swap_record)
-assert(swap_record.swap_permutation[1] == 1 and swap_record.swap_permutation[2] == 2)
-assert(initial_swap["fluid:water"].count == 101 and initial_swap["fluid:steam"].count == 102)
-game.tick = 60
-local reversed_swap = SwapOrder.calculate(swap_record)
-assert(swap_record.swap_permutation[1] == 2 and swap_record.swap_permutation[2] == 1)
-assert(reversed_swap["fluid:steam"].count == 101 and reversed_swap["fluid:water"].count == 102)
-game.tick = 120
-SwapOrder.calculate(swap_record)
-assert(swap_record.swap_permutation[1] == 2 and swap_record.swap_permutation[2] == 1)
-assert(swap_record.swap_condition_tick == nil)
-swap_inputs[1].count = 21
-game.tick = 150
-SwapOrder.calculate(swap_record)
-assert(swap_record.swap_permutation[1] == 1 and swap_record.swap_permutation[2] == 2)
-swap_inputs[1].count = 10
-game.tick = 180
-local tied_swap = SwapOrder.calculate(swap_record)
-assert(tied_swap["fluid:steam"].count == 101 and tied_swap["fluid:water"].count == 102)
-assert(tied_swap["fluid:steam"].count ~= tied_swap["fluid:water"].count)
+assert(swap_record.swap_sources[1] == "fluid:water" and swap_record.swap_sources[2] == "fluid:steam")
+assert(initial_swap.separated == true)
+assert(initial_swap.red["fluid:water"].count == 101 and initial_swap.green["fluid:steam"].count == 102)
+assert(swap_record.swap_order_diagnostics["fluid:crude-oil"].kind == "swap_discarded"
+  and swap_record.swap_order_diagnostics["fluid:crude-oil"].all_colors == true)
+local restored_swap_record = {}
+SwapOrder.restore_state(restored_swap_record, SwapOrder.save_state(swap_record))
+assert(restored_swap_record.swap_sources[1] == "fluid:water"
+  and restored_swap_record.swap_sources[2] == "fluid:steam"
+  and restored_swap_record.swap_condition_tick == 0)
+local discarded_tooltip = Gui.production_diagnostic_tooltip{kind = "swap_discarded"}
+assert(discarded_tooltip[2][1] == "bmsc.swap-reason-discarded")
 
+-- 第三项数量升到最高也不替换锁定项，并且数量变化不刷新计时。
+swap_inputs[1].count = 5
+swap_inputs[3].count = 100
+game.tick = 30
+local quantity_changed_swap = SwapOrder.calculate(swap_record)
+assert(swap_record.swap_condition_tick == 0)
+assert(quantity_changed_swap.red["fluid:water"].count == 101
+  and quantity_changed_swap.green["fluid:steam"].count == 102)
+
+-- 条件满足时像生产订单一样把计时起点刷新到当前 tick，而不是推进交换。
+swap_inputs[4].count = 1
+game.tick = 45
+SwapOrder.calculate(swap_record)
+assert(swap_record.swap_condition_tick == 45 and swap_record.swap_reversed == false)
+swap_inputs[4].count = 0
+game.tick = 104
+SwapOrder.calculate(swap_record)
+assert(swap_record.swap_reversed == false)
+game.tick = 105
+local reversed_swap = SwapOrder.calculate(swap_record)
+assert(swap_record.swap_reversed == true)
+assert(reversed_swap.red["fluid:steam"].count == 101
+  and reversed_swap.green["fluid:water"].count == 102)
+game.tick = 165
+SwapOrder.calculate(swap_record)
+assert(swap_record.swap_reversed == true and swap_record.swap_condition_tick == nil)
+
+-- 主动重新选择会按当前数量锁定新的前两项并恢复初始方向。
+SwapOrder.clear(swap_record)
+local reselected_swap = SwapOrder.calculate(swap_record)
+assert(swap_record.swap_sources[1] == "fluid:crude-oil"
+  and swap_record.swap_sources[2] == "fluid:steam" and swap_record.swap_reversed == false)
+assert(reselected_swap.red["fluid:crude-oil"].count == 101
+  and reselected_swap.green["fluid:steam"].count == 102)
+
+-- 首次数量相同时使用稳定信号 ID 决胜；steam 的 ID 排在 water 前面。
+swap_inputs[1].count = 10
+swap_inputs[2].count = 10
+swap_inputs[3] = nil
+local tied_record = {entity = swap_entity, config = {
+  swap_output_mode = "fluid", swap_timeout = 0, swap_loop = false,
+  swap_conditions = reset_conditions
+}}
+local tied_swap = SwapOrder.calculate(tied_record)
+assert(tied_swap.red["fluid:steam"].count == 101 and tied_swap.green["fluid:water"].count == 102)
+
+-- 只有一个候选时，两条线路都输出第一名编码且完全停止计时。
+swap_inputs[2] = nil
+local single_swap = SwapOrder.calculate(swap_record)
+assert(single_swap.red["fluid:water"].count == 101 and single_swap.green["fluid:water"].count == 101)
+assert(swap_record.swap_condition_tick == nil)
+
+-- 开启循环后，每次超时都在两个信号之间往返交换。
+swap_inputs[1].count = 20
+swap_inputs[2] = {signal = {type = "fluid", name = "steam"}, count = 10}
 local looping_swap_record = {entity = swap_entity, config = {
   swap_output_mode = "fluid", swap_timeout = 1, swap_loop = true,
   swap_conditions = reset_conditions
@@ -385,9 +450,10 @@ game.tick = 0
 SwapOrder.calculate(looping_swap_record)
 game.tick = 60
 SwapOrder.calculate(looping_swap_record)
+assert(looping_swap_record.swap_reversed == true)
 game.tick = 120
-SwapOrder.calculate(looping_swap_record)
-assert(looping_swap_record.swap_permutation[1] == 1
-  and looping_swap_record.swap_permutation[2] == 2)
+local looped_swap = SwapOrder.calculate(looping_swap_record)
+assert(looping_swap_record.swap_reversed == false)
+assert(looped_swap.red["fluid:water"].count == 101 and looped_swap.green["fluid:steam"].count == 102)
 
 print("timeout reset signal: ok")

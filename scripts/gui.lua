@@ -7,6 +7,7 @@ local Config = require("scripts.config")               -- 只读取模式常量�
 local Util = require("scripts.common_util")            -- 复用稳定信号键，将生产诊断绑定到对应绿色输入。
 
 Gui.name = "bmsc-window"                              -- 参数：窗口唯一名称，供 control.lua 识别事件来源。
+Gui.order_target_name = "bmsc-order-target-window"    -- 参数：Shift+左键打开的配方与库存校验子窗口。
 Gui.network_info_name = "bmsc-network-info"           -- 参数：网络信息图标名称前缀；实际名称会追加颜色和网络编号。
 Gui.network_popup_name = "bmsc-network-popup"         -- 参数：仿原版网络信号悬浮面板的唯一名称。
 Gui.production_order = Config.mode.production_order    -- 参数：生产订单模式标识，只用于决定参数区是否可见。
@@ -204,14 +205,30 @@ local function active_order_tooltip(diagnostic)
 
   local lines = {{"bmsc.production-active-title"}}
   local function add_line(line) lines[#lines + 1] = line end
+  if diagnostic.unavailable_recipe then
+    add_line({"bmsc.production-active-fallback-line",
+      signal_localised_label(Util.make_signal("recipe", diagnostic.unavailable_recipe)),
+      diagnostic.fallback_recipe and signal_localised_label(
+        Util.make_signal("recipe", diagnostic.fallback_recipe)) or {"bmsc.order-target-no-recipe"}})
+  end
   local order = diagnostic.order
   local product = diagnostic.product
   add_line({"bmsc.production-active-order-line", signal_localised_label(order.signal), order.count})
+  if diagnostic.recipe_name then
+    add_line({"bmsc.production-active-recipe-line",
+      signal_localised_label(Util.make_signal("recipe", diagnostic.recipe_name)),
+      {diagnostic.manual_recipe and "bmsc.order-target-manual" or "bmsc.order-target-automatic"}})
+  end
   if (order.signal.type or "item") == "recipe" then
     add_line({"bmsc.production-active-product-line", signal_localised_label(product.signal)})
   end
-  add_line({"bmsc.production-active-target-line", signal_localised_label(product.signal),
-    product.target, product.stock, product.remaining})
+  local checked_products = type(diagnostic.products) == "table" and diagnostic.products or {product}
+  for _, checked in ipairs(checked_products) do
+    if checked.signal then
+      add_line({"bmsc.production-active-target-line", signal_localised_label(checked.signal),
+        checked.target, checked.stock, checked.remaining})
+    end
+  end
 
   local outputs = diagnostic.outputs
   if type(outputs) == "table" and outputs[1] then
@@ -292,11 +309,12 @@ local function active_order_tooltip(diagnostic)
 end
 
 ---把订单模式给出的结构化原因转换为附加在原型详情下方的本地化提示。
----@param diagnostic table|nil 绿色输入诊断。
+---@param diagnostic table|nil 输入信号诊断。
 ---@return LocalisedString|nil tooltip 没有诊断时不追加提示。
 function Gui.production_diagnostic_tooltip(diagnostic)
   if not diagnostic then return nil end
-  if diagnostic.kind == "active_output" or diagnostic.kind == "supermarket_expanding" then
+  if diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+    or diagnostic.kind == "supermarket_expanding" then
     return active_order_tooltip(diagnostic)
   end
   local reason
@@ -309,11 +327,22 @@ function Gui.production_diagnostic_tooltip(diagnostic)
     local shortages = shortage_localised_list(diagnostic.shortages)
     reason = shortages and {"bmsc.supermarket-reason-strict-materials", shortages} or nil
   elseif diagnostic.kind == "stock_sufficient" then
-    reason = {"bmsc.production-reason-stock-sufficient", diagnostic.stock}
+    local products = type(diagnostic.products) == "table" and diagnostic.products or nil
+    local stocks = products and signal_count_localised_list(products, "stock")
+    reason = stocks and {"bmsc.production-reason-products-sufficient", stocks}
+      or {"bmsc.production-reason-stock-sufficient", diagnostic.stock}
   elseif diagnostic.kind == "no_recipe" then
     reason = {"bmsc.production-reason-no-recipe"}
+  elseif diagnostic.kind == "recipe_locked" then
+    reason = {"bmsc.production-reason-recipe-locked",
+      signal_localised_label(Util.make_signal("recipe", diagnostic.recipe_name))}
+  elseif diagnostic.kind == "recipe_machine_unsupported" then
+    reason = {"bmsc.production-reason-recipe-machine-unsupported",
+      signal_localised_label(Util.make_signal("recipe", diagnostic.recipe_name))}
   elseif diagnostic.kind == "surface_conditions" then
     reason = {"bmsc.supermarket-reason-surface-conditions"}
+  elseif diagnostic.kind == "inventory_query_pending" then
+    reason = {"bmsc.supermarket-reason-inventory-query-pending"}
   elseif diagnostic.kind == "unsupported_signal" then
     reason = {"bmsc.production-reason-unsupported-signal"}
   elseif diagnostic.kind == "non_positive_order" then
@@ -322,6 +351,8 @@ function Gui.production_diagnostic_tooltip(diagnostic)
     reason = {"bmsc.production-reason-waiting", signal_localised_label(diagnostic.signal)}
   elseif diagnostic.kind == "supermarket_completed" then
     reason = {"bmsc.supermarket-reason-completed"}
+  elseif diagnostic.kind == "swap_discarded" then
+    reason = {"bmsc.swap-reason-discarded"}
   end
   return reason and {"bmsc.production-no-output-reason", reason} or nil
 end
@@ -331,12 +362,15 @@ end
 ---@param diagnostic table|nil 订单模式给出的结构化原因。
 ---@return string style_name GUI 样式名称。
 local function diagnostic_signal_style(color, diagnostic)
-  if color ~= "green" or not diagnostic then return color .. "_circuit_network_content_slot" end
+  if not diagnostic then return color .. "_circuit_network_content_slot" end
   local kind = diagnostic and diagnostic.kind
+  if kind == "swap_discarded" then return "bmsc_signal_diagnostic_filtered" end
+  if color ~= "green" then return color .. "_circuit_network_content_slot" end
   if kind == "active_output" or kind == "supermarket_expanding" then
     return "green_circuit_network_content_slot" -- 标准绿色：当前正在输出或展开。
   end
-  if kind == "waiting_for_order" then
+  if kind == "waiting_for_order" or kind == "active_fallback"
+    or kind == "inventory_query_pending" then
     return "bmsc_signal_diagnostic_filtered"  -- 黄色：有效订单，等待轮到它。
   end
   if kind == "stock_sufficient" or kind == "supermarket_completed" then
@@ -345,11 +379,12 @@ local function diagnostic_signal_style(color, diagnostic)
   return "bmsc_signal_diagnostic_invalid"     -- 冷蓝：条件不满足或没有未输出原因。
 end
 
----把绿色订单诊断映射为显示顺序：当前输出、等待、异常/未知、库存充足。
+---把输入诊断映射为显示顺序：当前输出、等待、异常/未知、库存充足或已截断。
 local function diagnostic_signal_priority(diagnostic)
   local kind = diagnostic and diagnostic.kind
-  if kind == "active_output" or kind == "supermarket_expanding" then return 4 end
-  if kind == "waiting_for_order" then return 3 end
+  if kind == "swap_discarded" then return -1 end
+  if kind == "active_output" or kind == "active_fallback" or kind == "supermarket_expanding" then return 4 end
+  if kind == "waiting_for_order" or kind == "inventory_query_pending" then return 3 end
   if kind == "stock_sufficient" or kind == "supermarket_completed" then return 1 end
   return 2
 end
@@ -378,7 +413,7 @@ end
 ---把输入/输出两侧的红绿网络信号展开成稳定排序的槽位数组。
 ---同一信号同时出现在红、绿网络时保留两个槽位，以不同线路底色明确区分来源。
 ---@param networks table `get_side_networks` 返回的网络数组。
----@param diagnostics table|nil 以 Util.signal_key 为键的绿色输入诊断。
+---@param diagnostics table|nil 以 Util.signal_key 为键的输入诊断；all_colors 可应用到红色槽位。
 ---@return table entries 每项包含 color、signal、count、sprite 和稳定 key。
 local function collect_signal_entries(networks, diagnostics)
   local entries = {}
@@ -388,15 +423,15 @@ local function collect_signal_entries(networks, diagnostics)
         local quality = type(value.signal.quality) == "string" and value.signal.quality
           or (value.signal.quality and value.signal.quality.name)
         local sprite = signal_sprite_path(value.signal)
-        local diagnostic = network.color == "green" and diagnostics
-          and diagnostics[Util.signal_key(value.signal)] or nil
+        local diagnostic = diagnostics and diagnostics[Util.signal_key(value.signal)] or nil
+        if network.color ~= "green" and not (diagnostic and diagnostic.all_colors) then diagnostic = nil end
         entries[#entries + 1] = {
           color = network.color,
           signal = value.signal,
           count = value.count,
           sort_priority = tonumber(value.sort_priority) or 0,
           diagnostic = diagnostic,
-          diagnostic_priority = network.color == "green" and diagnostic_signal_priority(diagnostic) or 0,
+          diagnostic_priority = diagnostic and diagnostic_signal_priority(diagnostic) or 0,
           sprite = sprite,
           key = network.color .. "|" .. sprite .. "|" .. (quality or "normal")
         }
@@ -405,7 +440,7 @@ local function collect_signal_entries(networks, diagnostics)
   end
   table.sort(entries, function(a, b)
     if a.color ~= b.color then return a.color < b.color end
-    if a.color == "green" and a.diagnostic_priority ~= b.diagnostic_priority then
+    if a.diagnostic_priority ~= b.diagnostic_priority then
       return a.diagnostic_priority > b.diagnostic_priority
     end
     if a.sort_priority ~= b.sort_priority then return a.sort_priority > b.sort_priority end
@@ -479,7 +514,8 @@ local function refresh_signal_section(section, networks, diagnostics)
             bmsc_signal_color = color,
             bmsc_signal_key = Util.signal_key(entry.signal),
             bmsc_signal_type = entry.signal.type or "item",
-            bmsc_signal_name = entry.signal.name
+            bmsc_signal_name = entry.signal.name,
+            bmsc_signal_quality = Util.quality_name(entry.signal.quality)
           }}
         apply_diagnostic_signal_style(slot, color, diagnostic)
         local quality = type(entry.signal.quality) == "string" and entry.signal.quality
@@ -490,6 +526,129 @@ local function refresh_signal_section(section, networks, diagnostics)
       end
     end
   end
+end
+
+---打开订单配方和库存校验产物子窗口。
+---子窗口成为 player.opened，因此 Esc 只先关闭它；关闭后 control.lua 会恢复后方主窗口。
+function Gui.open_order_target(player, order_signal, order_count, target, recipes, options)
+  options = options or {}
+  local old = player.gui.screen[Gui.order_target_name]
+  if old then old.destroy() end
+
+  local frame = player.gui.screen.add{type = "frame", name = Gui.order_target_name, direction = "vertical",
+    tags = {bmsc_source_key = target.source_key, bmsc_signal_type = order_signal.type or "item",
+      bmsc_signal_name = order_signal.name, bmsc_signal_quality = Util.quality_name(order_signal.quality),
+      bmsc_order_count = order_count}}
+  frame.style.width = 440
+  frame.force_auto_center()
+  local titlebar = frame.add{type = "flow", direction = "horizontal"}
+  titlebar.drag_target = frame
+  titlebar.add{type = "label", caption = {options.show_products == false
+    and "bmsc.recipe-selection-title" or "bmsc.order-target-title"}, style = "frame_title"}.drag_target = frame
+  local dragger = titlebar.add{type = "empty-widget", style = "draggable_space_header"}
+  dragger.style.horizontally_stretchable = true
+  dragger.style.height = 24
+  dragger.drag_target = frame
+  titlebar.add{type = "sprite-button", name = "bmsc-order-target-close", sprite = "utility/close",
+    style = "frame_action_button", tooltip = {"gui.close"}}
+
+  local content = frame.add{type = "flow", direction = "vertical"}
+  content.style.padding = 8
+  content.style.vertical_spacing = 8
+  content.add{type = "label", caption = {options.show_products == false
+    and "bmsc.recipe-query-target" or "bmsc.order-target-order",
+    signal_localised_label(order_signal), order_count}}
+
+  content.add{type = "label", caption = {"bmsc.order-target-recipe"}, style = "heading_2_label"}
+  local function recipe_tags(recipe_name)
+    return {bmsc_order_target_recipe = recipe_name or false,
+      bmsc_signal_type = order_signal.type or "item", bmsc_signal_name = order_signal.name,
+      bmsc_signal_quality = Util.quality_name(order_signal.quality), bmsc_order_count = order_count}
+  end
+  if order_signal.type == "recipe" then
+    local recipe = target.recipe or target.locked_recipe and prototypes.recipe[target.locked_recipe]
+    if recipe then
+      local row = content.add{type = "flow", direction = "horizontal"}
+      local unlocked = options.enabled_recipes and options.enabled_recipes[recipe.name]
+      row.add{type = "sprite-button", sprite = "recipe/" .. recipe.name,
+        style = unlocked and "green_circuit_network_content_slot" or "bmsc_signal_diagnostic_invalid",
+        elem_tooltip = {type = "recipe", name = recipe.name}}
+      row.add{type = "label", caption = recipe.localised_name}
+    else
+      content.add{type = "label", caption = {"bmsc.order-target-no-recipe"}}
+    end
+  else
+    content.add{type = "button", name = "bmsc-order-target-auto-recipe",
+      caption = {"bmsc.order-target-auto-recipe", target.automatic_recipe
+        and target.automatic_recipe.localised_name or {"bmsc.order-target-no-recipe"}},
+      style = target.configured_recipe and "button" or "confirm_button", tags = recipe_tags(nil)}
+    if target.machine_unsupported_recipe then
+      content.add{type = "label", caption = {"bmsc.order-target-machine-unsupported",
+        signal_localised_label(Util.make_signal("recipe", target.machine_unsupported_recipe)),
+        target.automatic_recipe and signal_localised_label(
+          Util.make_signal("recipe", target.automatic_recipe.name)) or {"bmsc.order-target-no-recipe"}}}
+    end
+    local scroll = content.add{type = "scroll-pane", direction = "vertical",
+      horizontal_scroll_policy = "never", vertical_scroll_policy = "auto"}
+    scroll.style.horizontally_stretchable = true
+    scroll.style.maximal_height = 180
+    if not recipes[1] then
+      scroll.add{type = "label", caption = {"bmsc.order-target-no-recipe"}}
+    end
+    for _, recipe in ipairs(recipes or {}) do
+      local row = scroll.add{type = "flow", direction = "horizontal"}
+      row.style.vertical_align = "center"
+      local selected = target.configured_recipe == recipe.name
+      local unlocked = options.enabled_recipes and options.enabled_recipes[recipe.name]
+      local style = selected and (unlocked and "green_circuit_network_content_slot"
+        or "bmsc_signal_diagnostic_invalid")
+        or unlocked and "slot_button" or "bmsc_signal_diagnostic_pending"
+      row.add{type = "sprite-button", sprite = "recipe/" .. recipe.name,
+        style = style,
+        elem_tooltip = {type = "recipe", name = recipe.name}, tags = recipe_tags(recipe.name)}
+      row.add{type = "label", caption = recipe.localised_name}
+    end
+  end
+
+  if options.show_products ~= false then
+    content.add{type = "label", caption = {"bmsc.order-target-products"}, style = "heading_2_label"}
+    local selected = {}
+    for _, product in ipairs(target.products or {}) do selected[Util.signal_key(product)] = true end
+    local products = content.add{type = "table", column_count = 8}
+    for _, product in ipairs(target.available_products or {}) do
+      local chosen = selected[Util.signal_key(product)] == true
+      local button = products.add{type = "sprite-button", sprite = signal_sprite_path(product),
+        style = chosen and "green_circuit_network_content_slot" or "slot_button",
+        elem_tooltip = signal_elem_tooltip(product), tooltip = chosen
+          and {"bmsc.order-target-selected"} or {"bmsc.order-target-not-selected"},
+        tags = {bmsc_order_target_product = true, bmsc_signal_type = product.type or "item",
+          bmsc_signal_name = product.name, bmsc_signal_quality = Util.quality_name(product.quality),
+          bmsc_order_count = order_count}}
+      if product.type == "item" and product.quality and product.quality ~= "normal" then
+        button.quality = product.quality
+      end
+    end
+    local help = content.add{type = "label", caption = {"bmsc.order-target-help"}}
+    help.style.single_line = false
+    help.style.maximal_width = 420
+  end
+  player.opened = frame
+  return frame
+end
+
+---关闭订单子窗口；restore_main 为 true 时让下一次 Esc 继续关闭后方主窗口。
+function Gui.close_order_target(player, restore_main)
+  local frame = player.gui.screen[Gui.order_target_name]
+  if frame and frame.valid then frame.destroy() end
+  local main = player.gui.screen[Gui.name]
+  player.opened = restore_main and main and main.valid and main or nil
+end
+
+---销毁留在子窗口后方的主窗口，但不改写 player.opened（它可能已经指向另一个实体）。
+function Gui.destroy_background(player)
+  Gui.hide_network_popup(player)
+  local frame = player.gui.screen[Gui.name]
+  if frame and frame.valid then frame.destroy() end
 end
 
 ---创建一个有独立边界、内容可按需纵向滚动的信号子 GUI。
@@ -1107,9 +1266,11 @@ end
 ---@param config table 已由业务层校验过的实体配置。
 ---@param current_output_networks table|nil control.lua 最近一次写入代理的输出快照。
 ---@param input_diagnostics table|nil 生产订单绿色输入信号的未输出原因。
+---@param linked_inventory_available boolean|nil 是否显示关联箱自动库存校验选项。
 ---@return LuaGuiElement frame 新创建的主窗口。
-function Gui.open(player, entity, config, current_output_networks, input_diagnostics)
+function Gui.open(player, entity, config, current_output_networks, input_diagnostics, linked_inventory_available)
   Gui.hide_network_popup(player)
+  Gui.close_order_target(player, false)
   local old = player.gui.screen[Gui.name]
   if old then old.destroy() end
 
@@ -1261,9 +1422,19 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     name = "bmsc-recursion-machine", elem_type = "entity", entity = config.production_machine,
     tooltip = {"bmsc.production-machine-tooltip"}}
   recursion_machine.style.size = 52                   -- 参数：两个模式使用一致的机器选择按钮尺寸。
-  recursion_machine_controls.add{type = "checkbox", name = "bmsc-recursion-strict-validation",
-    caption = {"bmsc.strict-validation"}, state = config.recursion_strict_validation == true,
-    tooltip = {"bmsc.strict-validation-tooltip"}}
+  local validation_items = {{"bmsc.inventory-validation"}, {"bmsc.inventory-validation-none"}}
+  local validation_values = {Config.inventory_validation.inventory, Config.inventory_validation.none}
+  if linked_inventory_available then
+    table.insert(validation_items, 2, {"bmsc.inventory-validation-linked"})
+    table.insert(validation_values, 2, Config.inventory_validation.linked)
+  end
+  local selected_validation = 1
+  for index, value in ipairs(validation_values) do
+    if value == config.inventory_validation then selected_validation = index; break end
+  end
+  recursion_machine_controls.add{type = "drop-down", name = "bmsc-inventory-validation",
+    items = validation_items, selected_index = selected_validation,
+    tooltip = {"bmsc.inventory-validation-tooltip"}}
   add_numeric_slider(recursion_fields, {"bmsc.additional-rate"}, "bmsc-recursion-additional",
     config.recursion_additional_production_rate, true, {"bmsc.recursion-additional-rate-tooltip"})
   add_numeric_slider(recursion_fields, {"bmsc.material-rate"}, "bmsc-recursion-material",
@@ -1381,8 +1552,9 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     config.swap_timeout or 0, true, {"bmsc.swap-timeout-tooltip"})
   add_labeled(swap_fields, {"bmsc.swap-loop"}, {type = "checkbox", name = "bmsc-swap-loop",
     state = config.swap_loop == true, tooltip = {"bmsc.swap-loop-tooltip"}})
-  swap_settings.add{type = "button", name = "bmsc-clear-swap", caption = {"bmsc.clear-swap"}}
-  add_conditions_editor(swap_settings, "swap", {"bmsc.conditions"}, config.swap_conditions)
+  swap_settings.add{type = "button", name = "bmsc-clear-swap", caption = {"bmsc.clear-swap"},
+    tooltip = {"bmsc.clear-swap-tooltip"}}
+  add_conditions_editor(swap_settings, "swap", {"bmsc.timeout-reset-conditions"}, config.swap_conditions)
   Gui.add_signal_panel(swap_details, player)
 
   -- 已保存的说明直接显示在配置界面内；内容支持 Factorio 富文本图标。
@@ -1468,6 +1640,7 @@ end
 ---@return nil
 function Gui.close(player)
   Gui.hide_network_popup(player)
+  Gui.close_order_target(player, false)
   local frame = player.gui.screen[Gui.name]
   player.opened = nil
   if frame and frame.valid then frame.destroy() end

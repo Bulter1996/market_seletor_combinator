@@ -3,7 +3,11 @@
 
 local Util = require("scripts.common_util")
 local Conditions = require("scripts.conditions")
-local PLAN_REVISION = 17
+local OrderTarget = require("scripts.order_target")
+local Config = require("scripts.config")
+local InventoryQuery = require("scripts.modes.inventory_query")
+local PLAN_REVISION = 18
+local LINKED_SHORTAGE_CONFIRMATIONS = 3
 local Mode = {
   name = "supermarket_order",                        -- 模式注册名，必须与 config.lua 的值一致。
   -- 原生 select/max 即使关闭 output_networks，仍会计算输入并把结果显示在实体信息的
@@ -44,9 +48,14 @@ function Mode.reset(record)
   reset_output_state(record)
   record.recursion_order_key = nil
   record.supermarket_active_orders = nil
+  record.supermarket_order_candidates = nil
   record.supermarket_order_diagnostics = nil
   record.supermarket_sequence_completed_orders = nil
   record.recursion_timeout_condition_results = nil
+  record.recursion_inventory_pending_tick = nil
+  record.recursion_inventory_protection_tick = nil
+  record.recursion_inventory_shortages = nil
+  record.recursion_linked_last_outputs = nil
 end
 
 ---让顺序制作在下一轮从第一个订单重新检索。
@@ -58,21 +67,67 @@ function Mode.restart_sequence(record)
   record.supermarket_sequence_signature = nil
 end
 
----把顺序制作中的当前订单移到循环队列末尾；调用方随后立即重算，因此不经过等待门。
+---后移 single 当前订单；顺序模式推进游标，非顺序模式选择下一个有候选输出的订单。
 ---@param record table 组合器记录。
 ---@param source_key string 被右键点击的绿色订单信号键。
 ---@return boolean deferred 当前订单确实被后移时返回 true。
 function Mode.defer_current_order(record, source_key)
   local config = type(record.config) == "table" and record.config or {}
-  if config.recursion_output_mode ~= "single" or config.sequential_production == false
-    or record.recursion_order_key ~= source_key then return false end
+  if config.recursion_output_mode ~= "single" or record.recursion_order_key ~= source_key then return false end
   local roots = record.supermarket_order_plan and record.supermarket_order_plan.roots or {}
   for index, root in ipairs(roots) do
     if root.source_key == source_key then
-      record.supermarket_sequence_index = index % #roots + 1
-      if type(record.supermarket_active_orders) == "table" then
-        record.supermarket_active_orders[source_key] = nil
+      if config.sequential_production ~= false then
+        record.supermarket_sequence_index = index % #roots + 1
+        if type(record.supermarket_active_orders) == "table" then
+          record.supermarket_active_orders[source_key] = nil
+        end
+        reset_output_state(record)
+        record.recursion_order_key = nil
+        return true
       end
+      local candidates = type(record.supermarket_order_candidates) == "table"
+        and record.supermarket_order_candidates or {}
+      for offset = 1, #roots - 1 do
+        local next_root = roots[(index + offset - 1) % #roots + 1]
+        local next_candidates = candidates[next_root.source_key]
+        if next_candidates and next_candidates[1] then
+          reset_output_state(record)
+          record.selected_recursion_output = next_candidates[1]
+          record.recursion_order_key = next_root.source_key
+          return true
+        end
+      end
+      return false
+    end
+  end
+  return false
+end
+
+---把双击的等待订单提升为 single 当前项。
+---@param record table 组合器记录。
+---@param source_key string 被双击的绿色订单信号键。
+---@return boolean prioritized 目标确实是等待订单时返回 true。
+function Mode.prioritize_waiting_order(record, source_key)
+  local config = type(record.config) == "table" and record.config or {}
+  local diagnostic = type(record.supermarket_order_diagnostics) == "table"
+    and record.supermarket_order_diagnostics[source_key] or nil
+  if config.recursion_output_mode ~= "single"
+    or not diagnostic or diagnostic.kind ~= "waiting_for_order" then return false end
+  if config.sequential_production == false then
+    local candidates = type(record.supermarket_order_candidates) == "table"
+      and record.supermarket_order_candidates[source_key] or nil
+    if not (candidates and candidates[1]) then return false end
+    reset_output_state(record)
+    record.selected_recursion_output = candidates[1]
+    record.recursion_order_key = source_key
+    return true
+  end
+  local roots = record.supermarket_order_plan and record.supermarket_order_plan.roots or {}
+  for index, root in ipairs(roots) do
+    if root.source_key == source_key then
+      record.supermarket_sequence_index = index
+      record.supermarket_active_orders = {}
       reset_output_state(record)
       record.recursion_order_key = nil
       return true
@@ -106,7 +161,11 @@ function Mode.save_state(record)
     active_orders = record.supermarket_active_orders,
     sequence_completed_orders = record.supermarket_sequence_completed_orders,
     sequence_index = record.supermarket_sequence_index,
-    sequence_signature = record.supermarket_sequence_signature
+    sequence_signature = record.supermarket_sequence_signature,
+    inventory_pending_tick = record.recursion_inventory_pending_tick,
+    inventory_protection_tick = record.recursion_inventory_protection_tick,
+    inventory_shortages = record.recursion_inventory_shortages,
+    linked_last_outputs = record.recursion_linked_last_outputs
   }
 end
 
@@ -128,6 +187,10 @@ function Mode.restore_state(record, saved)
   record.supermarket_sequence_completed_orders = saved.sequence_completed_orders
   record.supermarket_sequence_index = saved.sequence_index
   record.supermarket_sequence_signature = saved.sequence_signature
+  record.recursion_inventory_pending_tick = saved.inventory_pending_tick
+  record.recursion_inventory_protection_tick = saved.inventory_protection_tick
+  record.recursion_inventory_shortages = saved.inventory_shortages
+  record.recursion_linked_last_outputs = saved.linked_last_outputs
 end
 
 ---执行超市订单递归计算。
@@ -139,6 +202,21 @@ function Mode.calculate(record)
   -- control.lua 正常会先迁移配置；这里仍允许测试桩或热加载中的残缺记录进入，所有缺省
   -- 字段都按最保守语义处理，避免一次坏记录中断同一 on_nth_tick 内其他运算器。
   local config = type(record.config) == "table" and record.config or {}
+  local validation_mode = config.inventory_validation
+  if validation_mode ~= Config.inventory_validation.inventory
+    and validation_mode ~= Config.inventory_validation.linked
+    and validation_mode ~= Config.inventory_validation.none then
+    -- 直接调用模式模块的旧测试桩没有经过 Config.normalize；保留旧递归语义只为兼容该入口。
+    validation_mode = type(config.recursion_strict_validation) == "boolean"
+      and (config.recursion_strict_validation and Config.inventory_validation.inventory or "legacy")
+      or "legacy"
+  end
+  -- 依赖被移除后保留安全语义：继续使用红线库存校验，而不是悄悄放弃校验。
+  if validation_mode == Config.inventory_validation.linked and not InventoryQuery.is_available() then
+    validation_mode = Config.inventory_validation.inventory
+  end
+  local validates_inventory = validation_mode == Config.inventory_validation.inventory
+    or validation_mode == Config.inventory_validation.linked
   -- 计算过程中订单、严格校验或配方树变化可能清除当前选择；先保留上一轮真实输出，
   -- 让统一的等待门在最终切换点决定何时撤销，而不是让各取消分支各自处理。
   local previous_output_key = record.selected_recursion_output
@@ -146,6 +224,18 @@ function Mode.calculate(record)
     and record.detail_outputs[previous_output_key] or nil
   local previous_wait_tick = record.recursion_material_wait_tick
   local previous_wait_output = record.recursion_material_wait_output
+  local function finish_inventory_pause(field)
+    local started = record[field]
+    if not started then return end
+    local paused = game.tick - started
+    if record.recursion_output_changed_tick then
+      record.recursion_output_changed_tick = record.recursion_output_changed_tick + paused
+    end
+    if record.recursion_material_wait_tick then
+      record.recursion_material_wait_tick = record.recursion_material_wait_tick + paused
+    end
+    record[field] = nil
+  end
   -- Factorio 为选择运算器的红、绿输入端提供不同的 connector id：
   --   * 红线表示玩家已经拥有的库存，用于抵扣需求；
   --   * 绿线表示订单，正数物品/流体才进入配方树。
@@ -173,9 +263,14 @@ function Mode.calculate(record)
 
   ---订单签名只包含会参与计算的正数产品或配方信号；数量或种类变化都会触发重建。
   local signature_parts = {}
+  local resolved_targets = {}
   for _, demand in ipairs(demands) do
     if Util.is_recipe_input(demand.signal) and demand.count > 0 then
-      signature_parts[#signature_parts + 1] = Util.signal_key(demand.signal) .. "=" .. tostring(demand.count)
+      local key = Util.signal_key(demand.signal)
+      local target = OrderTarget.resolve(record.entity.force, config.production_machine, demand.signal, config)
+      resolved_targets[key] = target
+      signature_parts[#signature_parts + 1] = key .. "=" .. tostring(demand.count)
+        .. "@" .. tostring(target.signature)
     end
   end
   local order_signature = table.concat(signature_parts, "|")
@@ -240,6 +335,9 @@ function Mode.calculate(record)
     or plan.order_signature ~= order_signature then
     -- 订单、机器或配方结构变化后，旧订单的迟滞状态不能套用到新配方树。
     record.supermarket_active_orders = {}
+    record.recursion_inventory_shortages = nil
+    record.recursion_inventory_protection_tick = nil
+    record.recursion_linked_last_outputs = nil
     reset_output_state(record)
     record.recursion_order_key = nil
     plan = {
@@ -256,15 +354,21 @@ function Mode.calculate(record)
     }
     for _, demand in ipairs(demands) do
       if Util.is_recipe_input(demand.signal) and demand.count > 0 then
-        local signal, specified_recipe = Util.resolve_recipe_input(demand.signal, config.production_machine)
-        specified_recipe = signal and specified_recipe and Util.find_recipe(
-          record.entity.force, signal, config.production_machine, specified_recipe) or nil
-        if signal and (demand.signal.type ~= "recipe" or specified_recipe) then
+        local target = resolved_targets[Util.signal_key(demand.signal)]
+        local signal, specified_recipe = target and target.signal, target and target.recipe
+        if signal and not (target and target.blocked)
+          and (demand.signal.type ~= "recipe" or specified_recipe) then
           local root = build_plan_node(signal, demand.count, 1, {}, specified_recipe)
           root.source_key = Util.signal_key(demand.signal)
-          -- 库存和递归始终使用产品信号；只有根订单输出时恢复玩家输入的配方信号。
+          root.validation_products = target.products
+          root.manual_recipe = target.manual_recipe
+          root.machine_unsupported_recipe = target.machine_unsupported_recipe
+          -- 库存和递归始终使用产品信号；配方输入及手动选配方的根订单输出配方信号，
+          -- 使下游机器能够识别玩家明确指定的制造路径。
           if demand.signal.type == "recipe" then
             root.output_signal = Util.make_signal("recipe", demand.signal.name)
+          elseif target.manual_recipe then
+            root.output_signal = Util.make_signal("recipe", target.manual_recipe)
           end
           plan.roots[#plan.roots + 1] = root
         end
@@ -273,6 +377,35 @@ function Mode.calculate(record)
     plan.maximum_level = maximum_plan_level
     plan.terminal_nodes_by_level = terminal_nodes_by_level
     record.supermarket_order_plan = plan
+  end
+
+  if validation_mode == Config.inventory_validation.linked then
+    local requested = InventoryQuery.supermarket_signals(plan)
+    local shared_inventory, generation = InventoryQuery.get_shared_inventory(record.entity.force, requested)
+    if not shared_inventory then
+      record.recursion_inventory_pending_tick = record.recursion_inventory_pending_tick or game.tick
+      local diagnostics = {}
+      for _, demand in ipairs(demands) do
+        if Util.is_recipe_input(demand.signal) and demand.count > 0 then
+          diagnostics[Util.signal_key(demand.signal)] = {kind = "inventory_query_pending"}
+        end
+      end
+      record.supermarket_order_diagnostics = diagnostics
+      local selected = record.selected_recursion_output
+      local held = selected and record.detail_outputs and record.detail_outputs[selected]
+      return held and {[selected] = held} or record.recursion_linked_last_outputs or {}
+    end
+    finish_inventory_pause("recursion_inventory_pending_tick")
+    local merged = {}
+    for key, count in pairs(shared_inventory) do merged[key] = count end
+    for key, count in pairs(inputs.red) do merged[key] = math.max(0, (merged[key] or 0) + count) end
+    observed_inventory = merged
+    record.recursion_inventory_generation = generation
+  else
+    record.recursion_inventory_pending_tick = nil
+    record.recursion_inventory_protection_tick = nil
+    record.recursion_inventory_shortages = nil
+    record.recursion_inventory_generation = nil
   end
 
   -- 库存参与每一层的逐项抵扣，所以库存数量变化时需要重新计算各深度快照；排序后的
@@ -286,9 +419,13 @@ function Mode.calculate(record)
 
   -- 严格校验按每一层“单份配方用量 × 材料需求倍率”判断能否启动，
   -- 不要求一次备齐整张订单。中间产品超过阈值后即停止继续向下校验。
+  local active_orders = type(record.supermarket_active_orders) == "table"
+    and record.supermarket_active_orders or {}
+  record.supermarket_active_orders = active_orders
   local strict_order_diagnostics = {}
+  local linked_shortage_protected = false
   local function strict_order_diagnostic(root)
-    if config.recursion_strict_validation ~= true then return nil end
+    if not validates_inventory then return nil end
     -- 订单物品本身无法由所选机器制造时也必须跳过，不能把它当作终端原料输出。
     if not root.recipe_name then return {kind = "no_recipe"} end
     local machine = prototypes.entity[config.production_machine]
@@ -329,7 +466,32 @@ function Mode.calculate(record)
     for _, value in ipairs(Util.sorted_outputs(shortages)) do
       result[#result + 1] = {signal = value.entry.signal, count = math.ceil(value.entry.count)}
     end
-    return result[1] and {kind = "strict_materials", shortages = result} or nil
+    local diagnostic = result[1] and {kind = "strict_materials", shortages = result} or nil
+    if validation_mode ~= Config.inventory_validation.linked then return diagnostic end
+    local states = type(record.recursion_inventory_shortages) == "table"
+      and record.recursion_inventory_shortages or {}
+    record.recursion_inventory_shortages = states
+    if not diagnostic then
+      local was_active = active_orders[root.source_key] and states[root.source_key] ~= nil
+      states[root.source_key] = nil
+      if was_active then finish_inventory_pause("recursion_inventory_protection_tick") end
+      return nil
+    end
+    -- 新订单必须先通过库存校验；只有已经启动的订单才享受三份独立快照的防抖保护。
+    if not active_orders[root.source_key] then return diagnostic end
+    local state = states[root.source_key] or {count = 0}
+    if state.generation ~= record.recursion_inventory_generation then
+      state.count = state.count + 1
+      state.generation = record.recursion_inventory_generation
+      states[root.source_key] = state
+    end
+    if state.count >= LINKED_SHORTAGE_CONFIRMATIONS then
+      finish_inventory_pause("recursion_inventory_protection_tick")
+      return diagnostic
+    end
+    record.recursion_inventory_protection_tick = record.recursion_inventory_protection_tick or game.tick
+    linked_shortage_protected = true
+    return nil
   end
 
   -- “顺序制作”仅在 single 输出模式生效。游标从当前项向后扫描，到末尾后回到第一项；
@@ -337,12 +499,25 @@ function Mode.calculate(record)
   local sequential = config.recursion_output_mode == "single" and config.sequential_production ~= false
   local roots_to_resolve = {}
   local root_targets = {}
+  local root_requirements = {}
   local active_order_key = sequential and nil or "*"
   local active_order_keys = {}
-  local active_orders = type(record.supermarket_active_orders) == "table"
-    and record.supermarket_active_orders or {}
-  record.supermarket_active_orders = active_orders
   local completed_order_keys = {}
+  local function root_status(root, goal)
+    return OrderTarget.inventory_status(root.validation_products or {root.signal}, observed_inventory, goal)
+  end
+  local function remember_root_requirements(root, extended_target)
+    local stock = math.max(0, observed_inventory[Util.signal_key(root.signal)] or 0)
+    local base = root_status(root, root.amount)
+    local extended = root_status(root, extended_target)
+    -- 递归层仍以根产品信号表达生产请求；把最大选中产物缺口平移到该信号的当前库存，
+    -- 即可复用原有产量与原料展开，而不会把库存目标按副产物比例换算。
+    root_requirements[root.source_key] = {
+      base = stock + base.remaining,
+      extended = stock + extended.remaining,
+      status = extended
+    }
+  end
   if sequential then
     if record.supermarket_sequence_signature ~= order_signature then
       record.supermarket_sequence_signature = order_signature
@@ -351,13 +526,12 @@ function Mode.calculate(record)
       record.supermarket_active_orders = active_orders
     end
     record.supermarket_sequence_completed_orders = nil -- 旧版一次性顺序状态不再参与循环队列。
-    if config.recursion_strict_validation == true then
+    if validates_inventory then
       -- 当前项运行时仍为队列中其他订单保留具体校验原因，避免输入悬浮框退化为“等待中”。
       for _, root in ipairs(plan.roots) do
-        local stock = observed_inventory[Util.signal_key(root.signal)] or 0
         local target = active_orders[root.source_key]
           and root.amount * (1 + additional_rate) or root.amount
-        if stock < target then
+        if not root_status(root, target).satisfied then
           strict_order_diagnostics[root.source_key] = strict_order_diagnostic(root)
         end
       end
@@ -370,10 +544,9 @@ function Mode.calculate(record)
     local selected
     for _ = 1, root_count do
       local root = plan.roots[sequence_index]
-      local stock = observed_inventory[Util.signal_key(root.signal)] or 0
       local extended_target = root.amount * (1 + additional_rate)
       local target = active_orders[root.source_key] and extended_target or root.amount
-      if stock < target then
+      if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostics[root.source_key]
         if diagnostic then
           active_orders[root.source_key] = nil
@@ -383,6 +556,7 @@ function Mode.calculate(record)
           record.supermarket_active_orders = active_orders
           roots_to_resolve[1] = root
           root_targets[root.source_key] = extended_target
+          remember_root_requirements(root, extended_target)
           active_order_key = root.source_key
           active_order_keys[root.source_key] = true
           selected = true
@@ -395,14 +569,13 @@ function Mode.calculate(record)
       sequence_index = sequence_index % root_count + 1
     end
     record.supermarket_sequence_index = selected
-      and (config.recursion_strict_validation == true and scan_start_index or sequence_index) or 1
+      and (validates_inventory and scan_start_index or sequence_index) or 1
   else
     -- 非顺序模式允许多个订单同时处于迟滞区间：库存低于基础目标时启动，达到扩展目标后退出。
     for _, root in ipairs(plan.roots) do
-      local stock = observed_inventory[Util.signal_key(root.signal)] or 0
       local extended_target = root.amount * (1 + additional_rate)
       local target = active_orders[root.source_key] and extended_target or root.amount
-      if stock < target then
+      if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostic(root)
         if diagnostic then
           strict_order_diagnostics[root.source_key] = diagnostic
@@ -411,6 +584,7 @@ function Mode.calculate(record)
           active_order_keys[root.source_key] = true
           roots_to_resolve[#roots_to_resolve + 1] = root
           root_targets[root.source_key] = extended_target
+          remember_root_requirements(root, extended_target)
         end
       else
         active_orders[root.source_key] = nil
@@ -418,8 +592,11 @@ function Mode.calculate(record)
     end
   end
   -- 顺序订单切换时解除上一条生产链的当前输出；同一订单内仍由原料迟滞保持层级稳定。
-  if record.recursion_order_key ~= active_order_key then
+  if sequential and record.recursion_order_key ~= active_order_key then
     reset_output_state(record)
+    record.recursion_inventory_shortages = nil
+    record.recursion_inventory_protection_tick = nil
+    record.recursion_linked_last_outputs = nil
     record.recursion_order_key = active_order_key
   end
 
@@ -654,7 +831,7 @@ function Mode.calculate(record)
       local stage_expanded_required = recursive_expanded_target(node, expanded_required)
       -- 严格模式只把机器能够制造的产品写入输出。无法制造的终端原料已经在整张订单
       -- 进入递归前按“单份用量 × 材料需求倍率”校验：不足则跳过订单，满足则只作为库存门槛。
-      if config.recursion_strict_validation == true and not node.cyclic and not node.recipe_name then return end
+      if validates_inventory and not node.cyclic and not node.recipe_name then return end
       local output_signal = node_output_signal(node)
       local output_key = Util.signal_key(output_signal)
       local stock = math.max(0, inventory[Util.signal_key(node.signal)] or 0)
@@ -668,6 +845,22 @@ function Mode.calculate(record)
       local output_count = math.ceil(expanded_shortage)
       add_depth_output(all_shortages, output_signal, output_count, node.level)
       add_depth_output(current_root_detail.outputs, output_signal, output_count, node.level)
+
+      -- “不校验”只关心订单产品库存：所有原料视为满足，直接请求根产品或指定配方。
+      if validation_mode == Config.inventory_validation.none and node.level == 1 then
+        add_depth_output(ready_outputs, output_signal, output_count, node.level)
+        current_root_detail.stages[output_key] = {
+          signal = Util.make_signal(node.signal.type, node.signal.name, node.signal.quality),
+          level = node.level,
+          stock = stock,
+          output_count = output_count,
+          target = stock + output_count,
+          ingredients = {},
+          start_ready = true,
+          _ingredients = {}
+        }
+        return
+      end
 
       local selected = output_key == selected_key
       local should_run = selected or force_active or base_shortage > 0
@@ -723,7 +916,9 @@ function Mode.calculate(record)
     for _, root in ipairs(roots_to_resolve) do
       current_root_detail = {outputs = {}, stages = {}}
       root_details[root.source_key] = current_root_detail
-      resolve(root, root.amount, root_targets[root.source_key] or root.amount, false, true)
+      local requirements = root_requirements[root.source_key]
+        or {base = root.amount, extended = root_targets[root.source_key] or root.amount}
+      resolve(root, requirements.base, requirements.extended, false, true)
     end
     -- 缓存只保存普通数组，避免 GUI 依赖内部聚合映射，也保证同一订单的输出顺序稳定。
     for _, detail in pairs(root_details) do
@@ -775,7 +970,7 @@ function Mode.calculate(record)
 
   -- 红线库存也是输入数据；订单或库存变化时一次性更新所有深度对应的输出表。
   local calculation_signature = inventory_signature .. "|sequential=" .. tostring(sequential)
-    .. "|strict=" .. tostring(config.recursion_strict_validation == true)
+    .. "|validation=" .. validation_mode
     .. "|output-mode=" .. tostring(config.recursion_output_mode)
     .. "|active-order=" .. tostring(active_order_key)
     .. "|selected=" .. tostring(record.selected_recursion_output)
@@ -830,26 +1025,67 @@ function Mode.calculate(record)
     or plan.root_details_by_depth[0]
     or {}
 
+  -- 非顺序 single 仍只输出一个信号；记录每个根订单此刻真正可选的输出，供点击交互
+  -- 在不改变默认“最深缺口优先”算法的前提下切换订单归属。
+  local order_candidates = {}
+  if config.recursion_output_mode == "single" and not sequential then
+    local ordered_outputs = Util.sorted_outputs(outputs)
+    for _, root in ipairs(plan.roots) do
+      local detail = root_details[root.source_key]
+      local candidates = {}
+      for _, value in ipairs(ordered_outputs) do
+        if detail and detail.stages[value.key] then candidates[#candidates + 1] = value.key end
+      end
+      if candidates[1] then order_candidates[root.source_key] = candidates end
+    end
+  end
+  record.supermarket_order_candidates = order_candidates
+
+  local function candidate_contains(source_key, output_key)
+    for _, key in ipairs(order_candidates[source_key] or {}) do
+      if key == output_key then return true end
+    end
+    return false
+  end
+
   ---记录每个绿色订单信号当前未直接输出的原因，供公共信号面板悬浮提示。
   ---@param final_outputs table 本轮实际输出。
   local function update_diagnostics(final_outputs)
     local diagnostics = {}
     local active_signal
+    local current_order_key = active_order_key
+    if not sequential and config.recursion_output_mode == "single" then
+      local selected_key = record.selected_recursion_output
+      current_order_key = candidate_contains(record.recursion_order_key, selected_key)
+        and record.recursion_order_key or nil
+      if not current_order_key then
+        for _, root in ipairs(plan.roots) do
+          if candidate_contains(root.source_key, selected_key) then
+            current_order_key = root.source_key
+            break
+          end
+        end
+      end
+      record.recursion_order_key = current_order_key
+      active_signal = selected_key and outputs[selected_key] and outputs[selected_key].signal or nil
+    end
     local roots_by_source = {}
     for _, root in ipairs(plan.roots) do
       roots_by_source[root.source_key] = root
-      if root.source_key == active_order_key then active_signal = node_output_signal(root) end
+      if sequential and root.source_key == active_order_key then active_signal = node_output_signal(root) end
     end
     for _, demand in ipairs(demands) do
       local source_key = Util.signal_key(demand.signal)
-      local signal, specified_recipe = Util.resolve_recipe_input(demand.signal, config.production_machine)
+      local target = resolved_targets[source_key]
+      local signal, specified_recipe = target and target.signal, target and target.recipe
       local diagnostic
       if not Util.is_recipe_input(demand.signal) then
         diagnostic = {kind = "unsupported_signal"}
       elseif demand.count <= 0 then
         diagnostic = {kind = "non_positive_order"}
-      elseif not signal or (specified_recipe and not Util.find_recipe(
-        record.entity.force, signal, config.production_machine, specified_recipe)) then
+      elseif target and target.locked_recipe then
+        diagnostic = {kind = "recipe_locked", recipe_name = target.locked_recipe}
+      elseif not signal or (demand.signal.type == "recipe" and not specified_recipe) then
         diagnostic = {kind = "no_recipe"}
       elseif strict_order_diagnostics[source_key] then
         diagnostic = strict_order_diagnostics[source_key]
@@ -857,31 +1093,43 @@ function Mode.calculate(record)
         diagnostic = {kind = "supermarket_completed"}
       elseif sequential and active_order_key and source_key ~= active_order_key then
         diagnostic = {kind = "waiting_for_order", signal = active_signal}
+      elseif not sequential and current_order_key and source_key ~= current_order_key
+        and order_candidates[source_key] then
+        diagnostic = {kind = "waiting_for_order", signal = active_signal}
       elseif active_order_keys[source_key] then
-        diagnostic = final_outputs[source_key] and {kind = "active_output"}
-          or {kind = "supermarket_expanding"}
+        local root = roots_by_source[source_key]
+        local output_key = root and Util.signal_key(node_output_signal(root)) or source_key
+        diagnostic = root and root.machine_unsupported_recipe and {kind = "active_fallback",
+          unavailable_recipe = root and root.machine_unsupported_recipe,
+          fallback_recipe = root and root.recipe_name}
+          or final_outputs[output_key] and {kind = "active_output"} or {kind = "supermarket_expanding"}
       elseif not final_outputs[source_key] then
-        local stock = observed_inventory[Util.signal_key(signal)] or 0
-        diagnostic = stock >= demand.count and {kind = "stock_sufficient", stock = stock}
+        local status = OrderTarget.inventory_status(target.products, observed_inventory, demand.count)
+        diagnostic = status.satisfied and {kind = "stock_sufficient",
+          stock = status.products[1] and status.products[1].stock or 0, products = status.products}
           or {kind = "supermarket_expanding"}
       end
-      if diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "supermarket_expanding") then
+      if diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+        or diagnostic.kind == "supermarket_expanding") then
         local root = roots_by_source[source_key]
         local detail = root_details[source_key]
         if root then
-          local product_stock = math.max(0, observed_inventory[Util.signal_key(root.signal)] or 0)
           -- 信号只能输出整数；目标出现小数时展示真正能够解除订单的最小整数库存。
           local product_target = math.ceil(root_targets[source_key] or root.amount * (1 + additional_rate))
+          local status = OrderTarget.inventory_status(
+            root.validation_products or {root.signal}, observed_inventory, product_target)
+          local product = status.products[1]
           diagnostic.order = {
             signal = Util.make_signal(demand.signal.type, demand.signal.name, demand.signal.quality),
             count = demand.count
           }
           diagnostic.product = {
-            signal = Util.make_signal(root.signal.type, root.signal.name, root.signal.quality),
-            target = product_target,
-            stock = product_stock,
-            remaining = math.max(0, product_target - product_stock)
+            signal = Util.make_signal(product.signal.type, product.signal.name, product.signal.quality),
+            target = product.target, stock = product.stock, remaining = product.remaining
           }
+          diagnostic.products = status.products
+          diagnostic.recipe_name = root.recipe_name
+          diagnostic.manual_recipe = root.manual_recipe ~= nil
           if config.recursion_output_mode == "all" then
             diagnostic.outputs = detail and detail.outputs or {}
           elseif detail then
@@ -894,9 +1142,26 @@ function Mode.calculate(record)
     record.supermarket_order_diagnostics = diagnostics
   end
 
+  -- 已启动订单的前两份缺料快照只用于确认，不撤销当前信号，也不累计普通超时。
+  if linked_shortage_protected and (record.recursion_linked_last_outputs
+    or previous_output_key and previous_output and not outputs[previous_output_key]) then
+    local held_outputs = record.recursion_linked_last_outputs
+      or {[previous_output_key] = previous_output}
+    if previous_output_key and previous_output then
+      record.selected_recursion_output = previous_output_key
+      record.recursion_output_count = previous_output.count
+    end
+    if config.recursion_output_mode ~= "all" then record.detail_outputs = held_outputs end
+    update_diagnostics(held_outputs)
+    return held_outputs
+  end
+
   if config.recursion_output_mode == "all" then
     reset_output_state(record)
     update_diagnostics(outputs)
+    if validation_mode == Config.inventory_validation.linked then
+      record.recursion_linked_last_outputs = outputs
+    end
     return outputs
   end
 
@@ -917,6 +1182,9 @@ function Mode.calculate(record)
       local held_outputs = {[previous_output_key] = previous_output}
       record.detail_outputs = held_outputs
       update_diagnostics(held_outputs)
+      if validation_mode == Config.inventory_validation.linked then
+        record.recursion_linked_last_outputs = held_outputs
+      end
       return held_outputs
     end
     record.recursion_material_wait_output = nil
@@ -965,6 +1233,10 @@ function Mode.calculate(record)
     else
       local unchanged_ticks = game.tick - (record.recursion_output_changed_tick or game.tick)
       if unchanged_ticks >= timeout * 60 then
+        if validation_mode == Config.inventory_validation.none and sequential
+          and #plan.roots > 1 and Mode.defer_current_order(record, record.recursion_order_key) then
+          return Mode.calculate(record)
+        end
         local keys = {}
         for _, value in ipairs(Util.sorted_outputs(outputs)) do keys[#keys + 1] = value.key end
         -- 只有当前一项时，“轮换”不能再次沿用同一锁定项；先解锁并立即重算，
@@ -986,6 +1258,9 @@ function Mode.calculate(record)
   -- 与生产订单一致，只把 single 当前输出写入无线路的详细模式代理。
   record.detail_outputs = final_outputs
   update_diagnostics(final_outputs)
+  if validation_mode == Config.inventory_validation.linked then
+    record.recursion_linked_last_outputs = final_outputs
+  end
   return final_outputs
 end
 

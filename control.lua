@@ -11,6 +11,7 @@ local Gui = require("scripts.gui")                     -- GUI 模块：只负责
 local SignalPicker = require("scripts.signal_picker") -- 条件信号与常量共用的原版风格选择器。
 local Config = require("scripts.config")               -- 配置模块：默认值、模式常量和外部数据校验。
 local Util = require("scripts.common_util")            -- 通用工具：输出排序等无状态功能。
+local OrderTarget = require("scripts.order_target")    -- 两种订单模式共用的配方覆盖与多产物库存目标。
 local MODES = require("scripts.mode_registry")          -- 模式注册表：统一调度彼此独立的算法模块。
 local MODE_PRODUCTION_ORDER = Config.mode.production_order
 local MODE_SUPERMARKET_ORDER = Config.mode.supermarket_order
@@ -18,6 +19,8 @@ local MODE_RECIPE_QUERY = Config.mode.recipe_query
 local MODE_INVENTORY_QUERY = Config.mode.inventory_query
 local MODE_SWAP_ORDER = Config.mode.swap_order
 local MAX_PROXY_SIGNALS = 65535                    -- Factorio 常量运算器筛选索引的 uint16 上限。
+local DOUBLE_CLICK_TICKS = 30                      -- 0.5 秒：等待订单左键双击判定窗口。
+local refresh_open_order_targets                    -- 研究事件发生时刷新仍打开的配方选择窗口。
 
 
 ---取得并初始化本模组的持久状态。
@@ -27,6 +30,7 @@ local function state()
   -- 防御开发期脚本曾写入错误类型的半旧 storage；只依赖 `or {}` 无法修复 truthy 字符串。
   if type(storage.combinators) ~= "table" then storage.combinators = {} end
   if type(storage.player_gui) ~= "table" then storage.player_gui = {} end
+  if type(storage.signal_clicks) ~= "table" then storage.signal_clicks = {} end
   return storage
 end
 
@@ -85,12 +89,13 @@ local function restore_mode_states(record, states)
   for name, mode in pairs(MODES) do mode.restore_state(record, states[name]) end
 end
 
----取得当前模式写给绿色输入槽位的诊断，避免其他模式显示残留原因。
+---取得当前模式写给输入槽位的诊断，避免其他模式显示残留原因。
 ---@param record table 组合器记录。
 ---@return table|nil diagnostics 当前模式诊断。
 local function current_input_diagnostics(record)
   if record.config.mode == MODE_PRODUCTION_ORDER then return record.production_order_diagnostics end
   if record.config.mode == MODE_SUPERMARKET_ORDER then return record.supermarket_order_diagnostics end
+  if record.config.mode == MODE_SWAP_ORDER then return record.swap_order_diagnostics end
   return nil
 end
 
@@ -225,6 +230,13 @@ end
 ---@return nil
 local function remove(entity)
   if not (entity and entity.valid and entity.unit_number) then return end
+  for player_index, unit in pairs(state().player_gui) do
+    if unit == entity.unit_number then
+      local player = game.get_player(player_index)
+      if player then Gui.close(player) end
+      state().player_gui[player_index] = nil
+    end
+  end
   destroy_proxies(state().combinators[entity.unit_number])
   state().combinators[entity.unit_number] = nil
 end
@@ -262,22 +274,35 @@ end
 ---@param outputs table 当前输出集合。
 ---@return nil
 local function update_hover_tooltip(record, outputs)
-  local parts = {}
-  local signature_parts = {}
-  for _, value in ipairs(Util.sorted_outputs(outputs)) do
-    local entry = value.entry
-    signature_parts[#signature_parts + 1] = value.key .. "=" .. tostring(entry.count)
-    local signal_type = entry.signal.type or "item"
-    local tag_type = signal_type == "virtual" and "virtual-signal" or signal_type
-    local quality = signal_type == "item" and Util.quality_name(entry.signal.quality) or nil
-    local quality_part = quality and quality ~= "normal" and ",quality=" .. quality or ""
-    parts[#parts + 1] = "[" .. tag_type .. "=" .. entry.signal.name
-      .. quality_part .. "] " .. entry.count
+  local function format_entries(entries, signature_prefix)
+    local parts, signature_parts = {}, {}
+    for _, value in ipairs(Util.sorted_outputs(entries)) do
+      local entry = value.entry
+      signature_parts[#signature_parts + 1] = signature_prefix .. value.key .. "=" .. tostring(entry.count)
+      local signal_type = entry.signal.type or "item"
+      local tag_type = signal_type == "virtual" and "virtual-signal" or signal_type
+      local quality = signal_type == "item" and Util.quality_name(entry.signal.quality) or nil
+      local quality_part = quality and quality ~= "normal" and ",quality=" .. quality or ""
+      parts[#parts + 1] = "[" .. tag_type .. "=" .. entry.signal.name
+        .. quality_part .. "] " .. entry.count
+    end
+    return #parts > 0 and table.concat(parts, "  ") or {"bmsc.no-output"}, signature_parts
+  end
+
+  local content, signature_parts
+  if outputs.separated == true then
+    local red, red_signature = format_entries(outputs.red or {}, "red:")
+    local green, green_signature = format_entries(outputs.green or {}, "green:")
+    content = {"bmsc.output-signals-separated", red, green}
+    signature_parts = {"separated"}
+    for _, part in ipairs(red_signature) do signature_parts[#signature_parts + 1] = part end
+    for _, part in ipairs(green_signature) do signature_parts[#signature_parts + 1] = part end
+  else
+    content, signature_parts = format_entries(outputs, "")
   end
   local signature = table.concat(signature_parts, "|")
   -- set_tooltip_field 会修改实体运行时状态；输出未变化时直接复用旧字段，避免重复写入。
   if record.tooltip_output_signature == signature then return end
-  local content = #parts > 0 and table.concat(parts, "  ") or {"bmsc.no-output"}
   record.output_tooltip_id = record.entity.set_tooltip_field{
     id = record.output_tooltip_id, name = {"bmsc.output-signals"}, value = content, order = 31
   }
@@ -410,16 +435,7 @@ local function write_outputs(record, outputs)
       record.detail_proxy, record.detail_outputs or {}, record.proxy_output_cache.detail)
   end
 
-  local tooltip_outputs = outputs
-  if separated then
-    tooltip_outputs = {}
-    for _, wire_outputs in pairs({red_outputs or {}, green_outputs or {}}) do
-      for _, entry in pairs(wire_outputs) do
-        Util.add_output(tooltip_outputs, entry.signal, entry.count)
-      end
-    end
-  end
-  update_hover_tooltip(record, tooltip_outputs)
+  update_hover_tooltip(record, outputs)
 end
 
 local function timeout_elapsed_seconds(start_tick, timeout, active)
@@ -544,6 +560,7 @@ script.on_event(research_events, function(event)
       invalidate_all_recipe_plans(record)
     end
   end
+  if refresh_open_order_targets then refresh_open_order_targets(force) end
 end)
 
 -- GUI 事件：拦截原版选择运算器窗口，改为本模组自己的参数窗口。
@@ -557,7 +574,8 @@ script.on_event(defines.events.on_gui_opened, function(event)
     -- 做一次迁移，不能只依赖下一次定时计算来修复配置。
     record.config = normalize_runtime_config(record.config)
     Gui.open(
-      player, event.entity, record.config, record.gui_output_networks, current_input_diagnostics(record))
+      player, event.entity, record.config, record.gui_output_networks, current_input_diagnostics(record),
+      MODES[MODE_INVENTORY_QUERY].is_available())
     Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
       record.production_timeout_condition_results)
     Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
@@ -569,14 +587,27 @@ script.on_event(defines.events.on_gui_opened, function(event)
 end)
 script.on_event(defines.events.on_gui_closed, function(event)
   if SignalPicker.on_closed(event) then return end
+  if event.element and event.element.valid and event.element.name == Gui.order_target_name then
+    local player = game.get_player(event.player_index)
+    -- Esc/E 会把 opened 清空；若玩家正在打开别的实体，则不把后方主窗口抢回前台。
+    local restore_main = player.opened == nil or player.opened == event.element
+    Gui.close_order_target(player, restore_main)
+    if not restore_main then
+      Gui.destroy_background(player)
+      state().player_gui[event.player_index] = nil
+    end
+    return
+  end
   if not (event.element and event.element.valid and event.element.name == Gui.name) then return end
 
-  -- 打开条件选择器会暂时替换 player.opened；主窗口留在后方，选择结束后继续编辑。
-  if SignalPicker.is_open(game.get_player(event.player_index)) then return end
+  -- 条件选择器和订单目标子窗口都会暂时替换 player.opened；主窗口留在后方继续编辑。
+  local player = game.get_player(event.player_index)
+  local order_target = player and player.gui.screen[Gui.order_target_name]
+  if SignalPicker.is_open(player) or order_target and order_target.valid then return end
 
   -- player.opened 使 E、Esc、打开其他实体等操作都会进入这里，行为与原版实体窗口一致。
   state().player_gui[event.player_index] = nil
-  Gui.hide_network_popup(game.get_player(event.player_index))
+  Gui.hide_network_popup(player)
   event.element.destroy()
 end)
 
@@ -586,6 +617,95 @@ end)
 local function current_record(player_index)
   local unit = state().player_gui[player_index]
   return unit and state().combinators[unit]
+end
+
+local function signal_from_tags(tags)
+  return tags and type(tags.bmsc_signal_name) == "string" and Util.make_signal(
+    tags.bmsc_signal_type, tags.bmsc_signal_name, tags.bmsc_signal_quality) or nil
+end
+
+---按玩家记录上次普通左键点击，避免多人同时查看同一运算器时互相触发双击。
+---@param player_index uint 玩家索引。
+---@param record table 组合器记录。
+---@param signal_key string 被点击的订单信号键。
+---@return boolean double_clicked 同一玩家在时限内再次点击同一订单时返回 true。
+local function signal_double_clicked(player_index, record, signal_key)
+  local clicks = state().signal_clicks
+  local previous = clicks[player_index]
+  local double_clicked = previous and previous.unit_number == record.entity.unit_number
+    and previous.signal_key == signal_key and game.tick - previous.tick <= DOUBLE_CLICK_TICKS
+  clicks[player_index] = double_clicked and nil
+    or {unit_number = record.entity.unit_number, signal_key = signal_key, tick = game.tick}
+  return double_clicked == true
+end
+
+local function order_target_entry(record, source_key)
+  if type(record.config.order_targets) ~= "table" then record.config.order_targets = {} end
+  local entry = record.config.order_targets[source_key]
+  if type(entry) ~= "table" then entry = {products = {}}; record.config.order_targets[source_key] = entry end
+  if type(entry.products) ~= "table" then entry.products = {} end
+  return entry
+end
+
+local function copy_products(products)
+  local result = {}
+  for _, product in ipairs(products or {}) do
+    result[#result + 1] = Util.make_signal(product.type, product.name, product.quality)
+  end
+  return result
+end
+
+local function open_order_target(player, record, order_signal, order_count)
+  local recipe_query = record.config.mode == MODE_RECIPE_QUERY
+  local target = OrderTarget.resolve(
+    record.entity.force, record.config.production_machine, order_signal, record.config,
+    recipe_query and {ignore_research = true} or nil)
+  local recipes = OrderTarget.available_recipes(
+    record.entity.force, record.config.production_machine, order_signal, target.configured_recipe)
+  local enabled = {}
+  for _, recipe in ipairs(recipes) do
+    local force_recipe = record.entity.force.recipes[recipe.name]
+    enabled[recipe.name] = force_recipe and force_recipe.enabled == true or false
+  end
+  if order_signal.type == "recipe" then
+    local force_recipe = record.entity.force.recipes[order_signal.name]
+    enabled[order_signal.name] = force_recipe and force_recipe.enabled == true or false
+  end
+  Gui.open_order_target(player, order_signal, order_count, target, recipes,
+    {show_products = not recipe_query, enabled_recipes = enabled})
+end
+
+refresh_open_order_targets = function(force)
+  for player_index, unit_number in pairs(state().player_gui) do
+    local record = state().combinators[unit_number]
+    local player = game.get_player(player_index)
+    local popup = player and player.gui.screen[Gui.order_target_name]
+    if record and record.entity and record.entity.valid and record.entity.force == force
+      and popup and popup.valid then
+      local order_signal = signal_from_tags(popup.tags)
+      if order_signal then open_order_target(player, record, order_signal, popup.tags.bmsc_order_count or 0) end
+    end
+  end
+end
+
+---订单目标改变后只失效真正依赖配方树的超市缓存；生产订单下一次计算可直接读取新配置。
+local function apply_order_target_change(player, record, order_signal, order_count)
+  MODES[MODE_SUPERMARKET_ORDER].invalidate_plan(record)
+  local mode = MODES[record.config.mode]
+  if mode then write_outputs(record, mode.calculate(record)) end
+  Gui.refresh_connection_status(
+    player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+  open_order_target(player, record, order_signal, order_count)
+end
+
+local function select_order_recipe(player, record, order_signal, order_count, recipe_name)
+  local entry = order_target_entry(record, Util.signal_key(order_signal))
+  entry.recipe = recipe_name
+  -- 切换配方时只保留新配方仍拥有的产物；全部失效则由共享解析回退到订单产品。
+  local target = OrderTarget.resolve(
+    record.entity.force, record.config.production_machine, order_signal, record.config)
+  entry.products = copy_products(target.products)
+  apply_order_target_change(player, record, order_signal, order_count)
 end
 
 -- 网络信息悬浮事件：GUI 模块负责生成/销毁信号槽面板，控制层只提供当前实体。
@@ -618,6 +738,7 @@ script.on_event(defines.events.on_gui_elem_changed, function(event)
       local remembered_order = record.config.remember_order and record.remembered_order or nil
       reset_all_modes(record)
       record.remembered_order = remembered_order
+      Gui.close_order_target(game.get_player(event.player_index), true)
       -- 参数和相关运行缓存已经立即更新；线路结果统一留到下一次全局刷新周期重算。
     end
   end
@@ -821,6 +942,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
       [event.element.selected_index] or MODE_PRODUCTION_ORDER
     reset_all_modes(record)
     sync_mode_visual(record)
+    Gui.close_order_target(game.get_player(event.player_index), true)
 
     -- 模式参数属于同一个窗口；像原版一样随下拉选项即时出现或隐藏。
     Gui.show_mode_details(event.element, record.config.mode)
@@ -855,7 +977,11 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     if record then
       record.config.swap_output_mode = ({"fluid", "item", "all", "all_with_signals"})
         [event.element.selected_index] or "fluid"
-      reset_swap_timer(record)
+      -- 类型过滤会改变候选集合；立即重新选择并刷新面板，不能暂留旧类型的线路输出。
+      MODES[MODE_SWAP_ORDER].clear(record)
+      write_outputs(record, MODES[MODE_SWAP_ORDER].calculate(record))
+      Gui.refresh_connection_status(game.get_player(event.player_index), record.entity,
+        record.gui_output_networks, current_input_diagnostics(record))
     end
     return
   end
@@ -874,6 +1000,21 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     -- 改变输出策略时解除旧锁定，下一运算周期会按新策略重新选择结果。
     MODES[MODE_SUPERMARKET_ORDER].reset(record)
     Gui.set_recursion_single_options_visible(event.element, record.config.recursion_output_mode == "single")
+    return
+  end
+  if event.element.name == "bmsc-inventory-validation" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    local available = MODES[MODE_INVENTORY_QUERY].is_available()
+    local values = available
+      and {Config.inventory_validation.inventory, Config.inventory_validation.linked,
+        Config.inventory_validation.none}
+      or {Config.inventory_validation.inventory, Config.inventory_validation.none}
+    record.config.inventory_validation = values[event.element.selected_index]
+      or Config.inventory_validation.inventory
+    MODES[MODE_SUPERMARKET_ORDER].reset(record)
+    -- 库存来源会改变整张订单能否输出；立即清空旧代理，等待下一轮按新来源重算。
+    write_outputs(record, {})
     return
   end
   if event.element.name == "bmsc-sequential-production" then
@@ -921,6 +1062,43 @@ script.on_event(defines.events.on_gui_click, function(event)
   -- 仅处理主 GUI 输入/输出面板中的信号图标；不改变槽位控件和数字角标布局。
   -- 普通 sprite-button 不会自动执行工厂百科快捷操作，因此显式补上原版 Alt+左键行为。
   local tags = event.element.tags or {}
+  if event.element.name == "bmsc-order-target-close" then
+    Gui.close_order_target(player, true)
+    return
+  end
+  if event.element.name == "bmsc-order-target-auto-recipe" or tags.bmsc_order_target_recipe then
+    local order_signal = signal_from_tags(tags)
+    if record and order_signal then
+      select_order_recipe(player, record, order_signal, tags.bmsc_order_count or 0,
+        tags.bmsc_order_target_recipe or nil)
+    end
+    return
+  end
+  if tags.bmsc_order_target_product then
+    local popup = player.gui.screen[Gui.order_target_name]
+    local order_signal = popup and popup.valid and signal_from_tags(popup.tags)
+    local product = signal_from_tags(tags)
+    if not (record and order_signal and product) then return end
+    local target = OrderTarget.resolve(
+      record.entity.force, record.config.production_machine, order_signal, record.config)
+    local clicked_key = Util.signal_key(product)
+    local selected, clicked_selected = {}, false
+    for _, current in ipairs(target.products) do
+      if Util.signal_key(current) == clicked_key then
+        clicked_selected = true
+      else
+        selected[#selected + 1] = current
+      end
+    end
+    -- 零个库存条件会让订单无条件完成，因此最后一个选中项不能取消。
+    if not clicked_selected then selected[#selected + 1] = product end
+    if selected[1] then
+      local entry = order_target_entry(record, target.source_key)
+      entry.products = copy_products(selected)
+      apply_order_target_change(player, record, order_signal, popup.tags.bmsc_order_count or 0)
+    end
+    return
+  end
   if tags.bmsc_swap_operand and tags.bmsc_condition_set and record then
     local conditions = conditions_for(record, tags.bmsc_condition_set)
     local condition = conditions and conditions[tags.bmsc_swap_condition]
@@ -950,11 +1128,30 @@ script.on_event(defines.events.on_gui_click, function(event)
     return
   end
   if tags.bmsc_signal_panel_icon then
-    if event.button == defines.mouse_button_type.right and tags.bmsc_signal_side == "input"
+    if event.shift and event.button == defines.mouse_button_type.left
+      and tags.bmsc_signal_side == "input" and record
+      and ((tags.bmsc_signal_color == "green" and (record.config.mode == MODE_PRODUCTION_ORDER
+        or record.config.mode == MODE_SUPERMARKET_ORDER))
+        or record.config.mode == MODE_RECIPE_QUERY) then
+      local order_signal = signal_from_tags(tags)
+      if order_signal and Util.is_recipe_input(order_signal) then
+        open_order_target(player, record, order_signal, event.element.number or 0)
+      end
+    elseif event.button == defines.mouse_button_type.right and tags.bmsc_signal_side == "input"
       and tags.bmsc_signal_color == "green"
       and record and record.config.mode == MODE_SUPERMARKET_ORDER
       and MODES[MODE_SUPERMARKET_ORDER].defer_current_order(record, tags.bmsc_signal_key) then
       -- defer_current_order 已先清除旧输出选择，因此这次重算不会进入原料等待门。
+      write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
+      Gui.refresh_connection_status(
+        player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+    elseif event.button == defines.mouse_button_type.left and not event.alt
+      and not event.control and not event.shift and tags.bmsc_signal_side == "input"
+      and tags.bmsc_signal_color == "green"
+      and record and record.config.mode == MODE_SUPERMARKET_ORDER
+      and signal_double_clicked(event.player_index, record, tags.bmsc_signal_key)
+      and MODES[MODE_SUPERMARKET_ORDER].prioritize_waiting_order(record, tags.bmsc_signal_key) then
+      -- 与右键后移一样立即重算，双击选中的等待订单不继承旧输出的原料等待。
       write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
       Gui.refresh_connection_status(
         player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
@@ -994,6 +1191,8 @@ script.on_event(defines.events.on_gui_click, function(event)
   if event.element.name == "bmsc-clear-swap" and record then
     MODES[MODE_SWAP_ORDER].clear(record)
     write_outputs(record, MODES[MODE_SWAP_ORDER].calculate(record))
+    Gui.refresh_connection_status(
+      player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
     return
   end
   if event.element.name == "bmsc-description-toggle" then
@@ -1027,16 +1226,6 @@ script.on_event(defines.events.on_gui_checked_state_changed, function(event)
     if record then
       record.config.swap_loop = event.element.state
       reset_swap_timer(record)
-    end
-    return
-  end
-  if event.element.name == "bmsc-recursion-strict-validation" then
-    local record = current_record(event.player_index)
-    if record then
-      record.config.recursion_strict_validation = event.element.state
-      MODES[MODE_SUPERMARKET_ORDER].reset(record)
-      -- 严格校验会改变整张订单能否输出；立即清空旧代理，避免在下个刷新周期前继续发送旧信号。
-      write_outputs(record, {})
     end
     return
   end
@@ -1091,7 +1280,8 @@ local function apply_pasted_config(destination, source_config)
     if unit == destination.entity.unit_number then
       local player = game.get_player(player_index)
       if player then
-        Gui.open(player, destination.entity, destination.config, {}, nil)
+        Gui.open(player, destination.entity, destination.config, {}, nil,
+          MODES[MODE_INVENTORY_QUERY].is_available())
         state().player_gui[player_index] = unit
       end
     end

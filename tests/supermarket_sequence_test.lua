@@ -99,6 +99,41 @@ assert(deferred_record.recursion_order_key == "item:b:normal")
 assert(deferred["item:b:normal"].count == 20)
 assert(deferred_record.recursion_material_wait_tick == nil)
 
+-- 左键双击的 GUI 分发最终调用此入口：只有等待项可被立即提升。
+assert(not Mode.prioritize_waiting_order(deferred_record, "item:b:normal"))
+assert(Mode.prioritize_waiting_order(deferred_record, "item:a:normal"))
+local prioritized = Mode.calculate(deferred_record)
+assert(deferred_record.recursion_order_key == "item:a:normal")
+assert(prioritized["item:a:normal"].count == 10)
+assert(deferred_record.recursion_material_wait_tick == nil)
+
+-- 非顺序 single 也把各根订单映射到自己的可生产候选，支持同样的后移和置顶交互。
+orders = {
+  {signal = {type = "item", name = "a", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "circuit", quality = "normal"}, count = 10}
+}
+inventory = {
+  {signal = {type = "item", name = "iron", quality = "normal"}, count = 1},
+  {signal = {type = "item", name = "wire", quality = "normal"}, count = 31},
+  {signal = {type = "item", name = "plate", quality = "normal"}, count = 11}
+}
+local nonsequential_record = {entity = entity, config = {
+  production_machine = "assembler", recursion_output_mode = "single",
+  sequential_production = false, recurise_depth = 0, recursion_timeout = 0,
+  recursion_material_wait_time = 10, recursion_material_demand_rate = 0,
+  recursion_material_retention_rate = 0
+}}
+assert(Mode.calculate(nonsequential_record)["item:a:normal"].count == 10)
+assert(nonsequential_record.recursion_order_key == "item:a:normal")
+assert(nonsequential_record.supermarket_order_diagnostics["item:circuit:normal"].kind
+  == "waiting_for_order")
+assert(Mode.prioritize_waiting_order(nonsequential_record, "item:circuit:normal"))
+assert(Mode.calculate(nonsequential_record)["item:circuit:normal"].count == 10)
+assert(nonsequential_record.recursion_material_wait_tick == nil)
+assert(Mode.defer_current_order(nonsequential_record, "item:circuit:normal"))
+assert(Mode.calculate(nonsequential_record)["item:a:normal"].count == 10)
+assert(nonsequential_record.recursion_material_wait_tick == nil)
+
 orders = {
   {signal = {type = "item", name = "a", quality = "normal"}, count = 10},
   {signal = {type = "item", name = "b", quality = "normal"}, count = 10}
@@ -535,5 +570,65 @@ strict_toggle_record.config.recursion_strict_validation = true
 Mode.reset(strict_toggle_record)
 assert(Mode.calculate(strict_toggle_record)["item:stone-brick:normal"] == nil)
 assert(strict_toggle_record.supermarket_order_diagnostics["item:stone-brick:normal"].kind == "no_recipe")
+
+-- “不校验”只读取产品完成量，原料默认满足并直接输出根订单；超时后顺序切到下一单。
+orders = {
+  {signal = {type = "item", name = "a", quality = "normal"}, count = 10},
+  {signal = {type = "item", name = "b", quality = "normal"}, count = 10}
+}
+inventory = {}
+game.tick = 0
+local unchecked_record = {entity = entity, config = {
+  production_machine = "assembler", inventory_validation = "none",
+  recursion_output_mode = "single", sequential_production = true,
+  recurise_depth = 0, recursion_timeout = 1, recursion_timeout_monitor_item_changes = false,
+  recursion_additional_production_rate = 0
+}}
+local unchecked = Mode.calculate(unchecked_record)
+assert(unchecked["item:a:normal"].count == 10 and unchecked["item:iron:normal"] == nil)
+game.tick = 60
+local unchecked_next = Mode.calculate(unchecked_record)
+assert(unchecked_next["item:b:normal"].count == 10)
+
+-- 自动关联库存：新订单等待首份快照；共享区与负红线相加；已输出订单连续三份缺料
+-- 后才进入原料等待时间，查询空窗本身保持旧输出。
+local InventoryQuery = require("scripts.modes.inventory_query")
+local original_available = InventoryQuery.is_available
+local original_shared = InventoryQuery.get_shared_inventory
+InventoryQuery.is_available = function() return true end
+local linked_snapshot, linked_generation
+InventoryQuery.get_shared_inventory = function()
+  return linked_snapshot, linked_generation
+end
+orders = {{signal = {type = "item", name = "a", quality = "normal"}, count = 10}}
+inventory = {{signal = {type = "item", name = "iron", quality = "normal"}, count = -1}}
+game.tick = 0
+local linked_record = {entity = entity, config = {
+  production_machine = "assembler", inventory_validation = "linked",
+  recursion_output_mode = "single", sequential_production = true,
+  recurise_depth = 0, recursion_timeout = 0, recursion_additional_production_rate = 0,
+  recursion_material_demand_rate = 10, recursion_material_retention_rate = 1,
+  recursion_material_wait_time = 1
+}}
+assert(next(Mode.calculate(linked_record)) == nil)
+assert(linked_record.supermarket_order_diagnostics["item:a:normal"].kind == "inventory_query_pending")
+linked_snapshot = {['item:a:normal'] = 0, ['item:iron:normal'] = 12}
+linked_generation = 1
+assert(Mode.calculate(linked_record)["item:a:normal"].count == 10)
+linked_snapshot = nil
+game.tick = 30
+assert(Mode.calculate(linked_record)["item:a:normal"].count == 10)
+assert(linked_record.supermarket_order_diagnostics["item:a:normal"].kind == "inventory_query_pending")
+linked_snapshot = {['item:a:normal'] = 0, ['item:iron:normal'] = 10}
+for generation = 2, 4 do
+  linked_generation = generation
+  game.tick = generation * 120
+  assert(Mode.calculate(linked_record)["item:a:normal"].count == 10)
+end
+game.tick = 541
+assert(next(Mode.calculate(linked_record)) == nil)
+assert(linked_record.supermarket_order_diagnostics["item:a:normal"].kind == "strict_materials")
+InventoryQuery.is_available = original_available
+InventoryQuery.get_shared_inventory = original_shared
 
 print("supermarket sequential progress: ok")

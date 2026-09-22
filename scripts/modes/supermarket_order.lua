@@ -6,7 +6,9 @@ local Conditions = require("scripts.conditions")
 local OrderTarget = require("scripts.order_target")
 local Config = require("scripts.config")
 local InventoryQuery = require("scripts.modes.inventory_query")
-local PLAN_REVISION = 18
+local Policy = require("scripts.recipe_policy")
+local Network = require("scripts.production_network")
+local PLAN_REVISION = 19
 local LINKED_SHORTAGE_CONFIRMATIONS = 3
 local Mode = {
   name = "supermarket_order",                        -- 模式注册名，必须与 config.lua 的值一致。
@@ -152,6 +154,8 @@ end
 ---@return table state 可写入 storage 的纯 Lua 数据。
 function Mode.save_state(record)
   return {
+    network_requests = record.network_requests,
+    network_active = record.network_active,
     selected_output = record.selected_recursion_output,
     output_count = record.recursion_output_count,
     changed_tick = record.recursion_output_changed_tick,
@@ -175,6 +179,8 @@ end
 ---@return nil
 function Mode.restore_state(record, saved)
   saved = saved or {}
+  record.network_requests = saved.network_requests
+  record.network_active = saved.network_active
   record.selected_recursion_output = saved.selected_output
   record.recursion_output_signal = nil
   record.recursion_output_target = nil
@@ -198,7 +204,7 @@ end
 ---运输原料时在父产品和原料之间振荡。timeout 可在输出数量长期不变时轮换到下一个结果。
 ---@param record table 组合器记录，必须包含 entity、config 和本模式运行状态。
 ---@return table outputs 标准输出集合，由 control.lua 统一负责写入线路。
-function Mode.calculate(record)
+local function calculate_local(record)
   -- control.lua 正常会先迁移配置；这里仍允许测试桩或热加载中的残缺记录进入，所有缺省
   -- 字段都按最保守语义处理，避免一次坏记录中断同一 on_nth_tick 内其他运算器。
   local config = type(record.config) == "table" and record.config or {}
@@ -241,13 +247,15 @@ function Mode.calculate(record)
   --   * 绿线表示订单，正数物品/流体才进入配方树。
   -- get_signals 可能返回同一信号的多项，Util.read_network 会先按类型、名称、品质合并。
   local inputs = Conditions.read_inputs(record.entity)
+  if record.network_inputs then inputs = record.network_inputs end
   local observed_inventory = inputs.red
   local raw_demands = inputs.entries.green
   local timeout = tonumber(config.recursion_timeout) or 0
   local additional_rate = math.max(0, tonumber(config.recursion_additional_production_rate) or 0)
   local material_demand_rate = math.max(0, tonumber(config.recursion_material_demand_rate) or 1)
   local material_retention_rate = math.max(0, tonumber(config.recursion_material_retention_rate) or 0)
-  local timeout_reset_active, condition_results = Conditions.evaluate(config.recursion_timeout_conditions, inputs)
+  local timeout_reset_active, condition_results = Conditions.evaluate(config.recursion_timeout_conditions,
+    record.network_timeout_inputs or inputs)
   record.recursion_timeout_condition_results = condition_results
   timeout_reset_active = timeout > 0 and timeout_reset_active
   local reset_keys = Conditions.signal_keys(config.recursion_timeout_conditions, "green")
@@ -255,7 +263,7 @@ function Mode.calculate(record)
   -- 控制信号只负责刷新超时起点，不参与配方树和订单变化签名。
   for _, demand in pairs(raw_demands or {}) do
     if type(demand) == "table" and demand.signal and demand.signal.name
-      and type(demand.count) == "number" and not reset_keys[Util.signal_key(demand.signal)] then
+      and type(demand.count) == "number" and (record.network_force_active or not reset_keys[Util.signal_key(demand.signal)]) then
       demands[#demands + 1] = demand
     end
   end
@@ -263,11 +271,35 @@ function Mode.calculate(record)
 
   ---订单签名只包含会参与计算的正数产品或配方信号；数量或种类变化都会触发重建。
   local signature_parts = {}
+  local policy_choices, policy_parts = {}, {}
+  for key, entries in pairs(config.recipe_policies or {}) do
+    local kind, name, quality = key:match("^([^:]+):([^:]+):?(.*)$")
+    if kind and name and entries[1] then
+      local signal = Util.make_signal(kind, name, quality ~= "" and quality or nil)
+      local recipe, entry = Policy.choose(record, signal,
+        validation_mode == Config.inventory_validation.linked and record.policy_inventory or observed_inventory)
+      policy_choices[key] = {recipe = recipe, entry = entry}
+      policy_parts[#policy_parts + 1] = key .. "=" .. (recipe and recipe.name or "blocked")
+        .. ":" .. tostring(entry and entry.demand) .. ":" .. tostring(entry and entry.retention)
+    end
+  end
+  table.sort(policy_parts)
+  signature_parts[#signature_parts + 1] = table.concat(policy_parts, "|")
   local resolved_targets = {}
   for _, demand in ipairs(demands) do
     if Util.is_recipe_input(demand.signal) and demand.count > 0 then
       local key = Util.signal_key(demand.signal)
       local target = OrderTarget.resolve(record.entity.force, config.production_machine, demand.signal, config)
+      local choice = target.signal and policy_choices[Util.signal_key(target.signal)]
+      if choice and demand.signal.type ~= "recipe" then
+        if choice.recipe then
+          target = OrderTarget.resolve(record.entity.force, config.production_machine, demand.signal, config,
+            {policy_recipe = choice.recipe.name})
+        end
+        target.recipe = choice.recipe
+        target.blocked = not choice.recipe
+        target.signature = target.signature .. ":policy=" .. (choice.recipe and choice.recipe.name or "blocked")
+      end
       resolved_targets[key] = target
       signature_parts[#signature_parts + 1] = key .. "=" .. tostring(demand.count)
         .. "@" .. tostring(target.signature)
@@ -285,7 +317,7 @@ function Mode.calculate(record)
     if not nodes then nodes = {}; terminal_nodes_by_level[node.level] = nodes end
     nodes[#nodes + 1] = node
   end
-  local function build_plan_node(signal, amount, level, ancestors, specified_recipe)
+  local function build_plan_node(signal, amount, level, ancestors, specified_recipe, fixed_recipe)
     maximum_plan_level = math.max(maximum_plan_level, level)
     local normalized = Util.make_signal(signal.type, signal.name, signal.quality)
     local key = Util.signal_key(normalized)
@@ -303,6 +335,11 @@ function Mode.calculate(record)
       or Util.machine_material_layer(normalized, config.production_machine) > 1
     local recipe = specified_recipe or (node.machine_craftable and
       Util.find_recipe(record.entity.force, normalized, config.production_machine) or nil)
+    local choice = not fixed_recipe and policy_choices[key] or nil
+    if choice then recipe = choice.recipe end
+    if choice and choice.entry then
+      node.demand_rate, node.retention_rate = choice.entry.demand, choice.entry.retention
+    end
     local product_amount = recipe and Util.recipe_product_amount(recipe, normalized) or 0
     if not recipe or product_amount <= 0 then
       remember_terminal_node(node)
@@ -312,6 +349,9 @@ function Mode.calculate(record)
     -- storage 不能保存 Factorio 的 LuaRecipePrototype，所以节点只保存配方名称、一次
     -- 产量以及从 recipe.ingredients 抄出的普通 Lua 子节点；后续刷新只遍历这份纯数据。
     node.recipe_name = recipe.name
+    if config.schema_revision and config.schema_revision >= 16 then
+      node.output_signal = Util.make_signal("recipe", recipe.name)
+    end
     node.product_amount = product_amount
     ancestors[key] = true
     for _, ingredient in ipairs(recipe.ingredients or {}) do
@@ -358,7 +398,7 @@ function Mode.calculate(record)
         local signal, specified_recipe = target and target.signal, target and target.recipe
         if signal and not (target and target.blocked)
           and (demand.signal.type ~= "recipe" or specified_recipe) then
-          local root = build_plan_node(signal, demand.count, 1, {}, specified_recipe)
+          local root = build_plan_node(signal, demand.count, 1, {}, specified_recipe, demand.signal.type == "recipe")
           root.source_key = Util.signal_key(demand.signal)
           root.validation_products = target.products
           root.manual_recipe = target.manual_recipe
@@ -367,7 +407,7 @@ function Mode.calculate(record)
           -- 使下游机器能够识别玩家明确指定的制造路径。
           if demand.signal.type == "recipe" then
             root.output_signal = Util.make_signal("recipe", demand.signal.name)
-          elseif target.manual_recipe then
+          elseif target.manual_recipe and not policy_choices[Util.signal_key(signal)] then
             root.output_signal = Util.make_signal("recipe", target.manual_recipe)
           end
           plan.roots[#plan.roots + 1] = root
@@ -407,6 +447,15 @@ function Mode.calculate(record)
     record.recursion_inventory_shortages = nil
     record.recursion_inventory_generation = nil
   end
+  if record.network_inventory_deductions then
+    local available = {}
+    for key, count in pairs(observed_inventory) do
+      available[key] = math.max(0, count - (record.network_inventory_deductions[key] or 0))
+    end
+    observed_inventory = available
+  end
+  record.policy_inventory = observed_inventory
+  record.network_observed_inventory = observed_inventory
 
   -- 库存参与每一层的逐项抵扣，所以库存数量变化时需要重新计算各深度快照；排序后的
   -- 签名让 pairs 的不稳定遍历顺序不会制造无意义的缓存失效。
@@ -449,7 +498,7 @@ function Mode.calculate(record)
       if not node.recipe_name then return end
       for _, child in ipairs(node.children) do
         local stock = math.max(0, observed_inventory[Util.signal_key(child.signal)] or 0)
-        local threshold = child.amount * material_demand_rate
+        local threshold = child.amount * (node.demand_rate or material_demand_rate)
         if stock <= threshold then
           local recipe = child.recipe_name and prototypes.recipe[child.recipe_name]
           if recipe and surface_conditions_met(record.entity.surface, recipe.surface_conditions) then
@@ -529,7 +578,7 @@ function Mode.calculate(record)
     if validates_inventory then
       -- 当前项运行时仍为队列中其他订单保留具体校验原因，避免输入悬浮框退化为“等待中”。
       for _, root in ipairs(plan.roots) do
-        local target = active_orders[root.source_key]
+        local target = (record.network_force_active or active_orders[root.source_key])
           and root.amount * (1 + additional_rate) or root.amount
         if not root_status(root, target).satisfied then
           strict_order_diagnostics[root.source_key] = strict_order_diagnostic(root)
@@ -545,7 +594,7 @@ function Mode.calculate(record)
     for _ = 1, root_count do
       local root = plan.roots[sequence_index]
       local extended_target = root.amount * (1 + additional_rate)
-      local target = active_orders[root.source_key] and extended_target or root.amount
+      local target = (record.network_force_active or active_orders[root.source_key]) and extended_target or root.amount
       if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostics[root.source_key]
         if diagnostic then
@@ -574,7 +623,7 @@ function Mode.calculate(record)
     -- 非顺序模式允许多个订单同时处于迟滞区间：库存低于基础目标时启动，达到扩展目标后退出。
     for _, root in ipairs(plan.roots) do
       local extended_target = root.amount * (1 + additional_rate)
-      local target = active_orders[root.source_key] and extended_target or root.amount
+      local target = (record.network_force_active or active_orders[root.source_key]) and extended_target or root.amount
       if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostic(root)
         if diagnostic then
@@ -638,7 +687,7 @@ function Mode.calculate(record)
       if within_depth and node.recipe_name and not node.cyclic then
         for _, child in ipairs(node.children) do
           local child_stock = math.max(0, observed_inventory[Util.signal_key(child.signal)] or 0)
-          if child_stock < child.amount * material_retention_rate then
+          if child_stock <= child.amount * (node.retention_rate or material_retention_rate) then
             selected_materials_insufficient = true
             return
           end
@@ -747,8 +796,9 @@ function Mode.calculate(record)
       if not node.recipe_name then return end
 
       local crafts = math.ceil(output_count / node.product_amount)
-      local material_rate = gate_kind == "retention" and material_retention_rate or material_demand_rate
-      local comparator = gate_kind == "retention" and ">=" or ">"
+      local material_rate = gate_kind == "retention" and (node.retention_rate or material_retention_rate)
+        or (node.demand_rate or material_demand_rate)
+      local comparator = ">"
       for _, child in ipairs(node.children) do
         local child_key = Util.signal_key(child.signal)
         local stock = math.max(0, observed_inventory[child_key] or 0)
@@ -808,7 +858,7 @@ function Mode.calculate(record)
         if node.cyclic or not node.recipe_name or reaches_limit then return false end
         for _, child in ipairs(node.children) do
           local child_stock = math.max(0, observed_inventory[Util.signal_key(child.signal)] or 0)
-          if child_stock < child.amount * material_retention_rate then return material_wait_active end
+          if child_stock <= child.amount * (node.retention_rate or material_retention_rate) then return false end
         end
         return true
       end
@@ -882,13 +932,14 @@ function Mode.calculate(record)
         return
       end
 
-      local material_rate = selected and material_retention_rate or material_demand_rate
+      local material_rate = selected and (node.retention_rate or material_retention_rate)
+        or (node.demand_rate or material_demand_rate)
       local direct_materials_ready = true
       local insufficient_children = {}
       for _, child in ipairs(node.children) do
         local child_stock = math.max(0, inventory[Util.signal_key(child.signal)] or 0)
         local threshold = child.amount * material_rate
-        local insufficient = selected and child_stock < threshold or not selected and child_stock <= threshold
+        local insufficient = child_stock <= threshold
         if insufficient then
           direct_materials_ready = false
           insufficient_children[Util.signal_key(child.signal)] = true
@@ -1235,7 +1286,7 @@ function Mode.calculate(record)
       if unchanged_ticks >= timeout * 60 then
         if validation_mode == Config.inventory_validation.none and sequential
           and #plan.roots > 1 and Mode.defer_current_order(record, record.recursion_order_key) then
-          return Mode.calculate(record)
+          return calculate_local(record)
         end
         local keys = {}
         for _, value in ipairs(Util.sorted_outputs(outputs)) do keys[#keys + 1] = value.key end
@@ -1243,7 +1294,7 @@ function Mode.calculate(record)
         -- 让它重新通过材料需求倍率，或自然下移到真正缺少的生产链节点。
         if #keys == 1 and keys[1] == selected_key then
           reset_output_state(record)
-          return Mode.calculate(record)
+          return calculate_local(record)
         end
         local next_key = keys[1]
         for index, key in ipairs(keys) do
@@ -1262,6 +1313,12 @@ function Mode.calculate(record)
     record.recursion_linked_last_outputs = final_outputs
   end
   return final_outputs
+end
+
+function Mode.calculate(record)
+  record.network_reserved = record.network_reserved or {}
+  record.network_protected = record.network_protected or {}
+  return Network.calculate(record, calculate_local)
 end
 
 return Mode

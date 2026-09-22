@@ -15,6 +15,10 @@ GuiStyles.apply()
 -- 背包、配方和实体信息界面共同使用的自定义图标。
 -- 背包、配方与百科使用横向放大的专用图标；世界实体仍由 EntityGraphics 独立控制。
 local ENTITY_ICON = "__market-selector-combinator__/graphics/icons/market-selector-combinator-horizontal.png"
+data:extend({{
+  type = "shortcut", name = "bmsc-production-network", action = "lua", style = "blue",
+  icon = ENTITY_ICON, icon_size = 64, small_icon = ENTITY_ICON, small_icon_size = 64
+}})
 
 -- 复制选择器组合器的原型作为基础，然后修改为我们需要的实体
 local entity = table.deepcopy(data.raw["selector-combinator"]["selector-combinator"])

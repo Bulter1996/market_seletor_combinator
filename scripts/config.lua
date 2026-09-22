@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 15
+Config.schema_revision = 16
 
 Config.mode = {
   production_order = "production_order",
@@ -89,6 +89,12 @@ function Config.default()
     mode = Config.mode.supermarket_order,          -- 参数：当前操作模式。
     production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
     order_targets = {},                          -- 参数：输入信号共享配方，以及订单模式的库存校验产物。
+    recipe_policies = {},                        -- 同一组合器按材料键共享候选配方与迟滞参数。
+    network_publish = false,
+    network_accept = false,
+    network_export = false,
+    network_import = false,
+    network_priority = 0,
     multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
     recipe_query_cache_grid_number = 0,           -- 参数：多配方查询可占用的原料缓存格数。
     query_type = Config.query_type.all,            -- 参数：共享库存查询包含流体、物品或两者。
@@ -165,6 +171,24 @@ function Config.normalize(source)
   end
   if type(source.production_machine) == "string" then config.production_machine = source.production_machine end
   config.order_targets = normalize_order_targets(source.order_targets)
+  for _, field in ipairs({"network_publish", "network_accept", "network_export", "network_import"}) do
+    config[field] = source[field] == true
+  end
+  config.network_priority = math.max(-2147483648, math.min(2147483647, tonumber(source.network_priority) or 0))
+  for key, entries in pairs(type(source.recipe_policies) == "table" and source.recipe_policies or {}) do
+    if type(key) == "string" and type(entries) == "table" then
+      local normalized, seen = {}, {}
+      for _, entry in ipairs(entries) do
+        if type(entry) == "table" and type(entry.recipe) == "string" and not seen[entry.recipe] then
+          local retention = math.max(0, tonumber(entry.retention) or 1)
+          normalized[#normalized + 1] = {recipe = entry.recipe, priority = tonumber(entry.priority) or 0,
+            demand = math.max(retention + 0.001, tonumber(entry.demand) or 10), retention = retention}
+          seen[entry.recipe] = true
+        end
+      end
+      if normalized[1] then config.recipe_policies[key] = normalized end
+    end
+  end
   if type(source.multiple_recipe_support) == "boolean" then
     config.multiple_recipe_support = source.multiple_recipe_support
   end

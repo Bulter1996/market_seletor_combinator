@@ -75,6 +75,11 @@ function OrderTarget.resolve(force, machine_name, order_signal, config, options)
   if not locked then
     recipe = configured_recipe and machine_supported and configured_recipe or automatic_recipe
   end
+  -- 递归策略在机器、科技和库存检查后传入已选配方；产物条件必须随实际配方解析。
+  if options.policy_recipe then
+    recipe = prototypes.recipe[options.policy_recipe]
+    locked = false
+  end
   local manual_valid = recipe ~= nil and recipe == configured_recipe
 
   local quality = order_signal.type == "item" and Util.quality_name(order_signal.quality)

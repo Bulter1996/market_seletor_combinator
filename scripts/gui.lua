@@ -5,6 +5,7 @@
 local Gui = {}
 local Config = require("scripts.config")               -- 只读取模式常量，避免 GUI 重复维护内部字符串。
 local Util = require("scripts.common_util")            -- 复用稳定信号键，将生产诊断绑定到对应绿色输入。
+local NetworkGui = require("scripts.network_gui")     -- Factorio 仅允许在 control.lua 加载阶段 require。
 
 Gui.name = "bmsc-window"                              -- 参数：窗口唯一名称，供 control.lua 识别事件来源。
 Gui.order_target_name = "bmsc-order-target-window"    -- 参数：Shift+左键打开的配方与库存校验子窗口。
@@ -981,6 +982,8 @@ function Gui.show_mode_details(source_element, mode)
   local content = window and window["bmsc-content"]
   if not content then return end
   local production_details = content["bmsc-production-details"]
+  local network_settings = content["bmsc-network-settings"]
+  if network_settings then network_settings.visible = mode == Gui.supermarket_order end
   local recursion_details = content["bmsc-recursion-details"]
   local recipe_query_details = content["bmsc-recipe-query-details"]
   local inventory_query_details = content["bmsc-inventory-query-details"]
@@ -1303,6 +1306,7 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   content.style.left_padding = 2
   content.style.right_padding = 4
   content.style.maximal_height = math.max(120, maximum_window_height - 40)
+  NetworkGui.settings(content, entity, config)
 
   local connections = content.add{type = "table", name = "bmsc-connections", column_count = 5}
   connections.style.horizontally_stretchable = true

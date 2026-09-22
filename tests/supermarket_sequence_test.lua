@@ -291,13 +291,13 @@ assert(wire_ingredient.stock == 11 and wire_ingredient.shortage == 70)
 assert(wire_ingredient.start_threshold == 10 and wire_ingredient.threshold_comparator == ">"
   and wire_ingredient.start_ready == true)
 
-inventory[3].count = 5
+inventory[3].count = 6
 local retained = Mode.calculate(hysteresis_record)
 assert(retained["item:wire:normal"].count == 81)
 local retained_stage = hysteresis_record.supermarket_order_diagnostics["item:circuit:normal"].stage
 assert(retained_stage.gate_kind == "retention" and retained_stage.start_ready == true)
 assert(retained_stage.ingredients[1].start_threshold == 5
-  and retained_stage.ingredients[1].threshold_comparator == ">=")
+  and retained_stage.ingredients[1].threshold_comparator == ">")
 
 -- 已启动的铜丝在等于扩展目标 90 时仍继续输出，达到 91 才停止。
 inventory[1].count = 90
@@ -318,7 +318,7 @@ inventory = {
 }
 local circuit_stage = Mode.calculate(hysteresis_record)
 assert(circuit_stage["item:circuit:normal"].count == 30)
-inventory[1].count = 15
+inventory[1].count = 16
 inventory[2].count = 11
 assert(Mode.calculate(hysteresis_record)["item:circuit:normal"].count == 30)
 inventory[1].count = 14

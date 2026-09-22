@@ -12,6 +12,8 @@ local SignalPicker = require("scripts.signal_picker") -- 条件信号与常量�
 local Config = require("scripts.config")               -- 配置模块：默认值、模式常量和外部数据校验。
 local Util = require("scripts.common_util")            -- 通用工具：输出排序等无状态功能。
 local OrderTarget = require("scripts.order_target")    -- 两种订单模式共用的配方覆盖与多产物库存目标。
+local ProductionNetwork = require("scripts.production_network")
+local NetworkGui = require("scripts.network_gui")
 local MODES = require("scripts.mode_registry")          -- 模式注册表：统一调度彼此独立的算法模块。
 local MODE_PRODUCTION_ORDER = Config.mode.production_order
 local MODE_SUPERMARKET_ORDER = Config.mode.supermarket_order
@@ -474,6 +476,12 @@ local function update_all()
   for _, mode in pairs(MODES) do
     if mode.prepare then mode.prepare(state().combinators) end
   end
+  for _, record in pairs(state().combinators) do
+    if record.config and record.config.schema_revision ~= Config.schema_revision then
+      record.config = normalize_runtime_config(record.config)
+    end
+  end
+  ProductionNetwork.prepare(state().combinators)
   for unit, record in pairs(state().combinators) do
     if record.entity and record.entity.valid then
       -- 原生 select/max 在超市订单模式下本身会产生一个最大值信号；必须先重新屏蔽，
@@ -483,6 +491,11 @@ local function update_all()
     else
       destroy_proxies(record)
       state().combinators[unit] = nil
+    end
+  end
+  for _, player in pairs(game.connected_players) do
+    if player.gui.screen[NetworkGui.name] and game.tick % 60 == 0 then
+      NetworkGui.refresh_network(player, state().combinators)
     end
   end
   for player_index, unit in pairs(state().player_gui) do
@@ -586,6 +599,10 @@ script.on_event(defines.events.on_gui_opened, function(event)
   end
 end)
 script.on_event(defines.events.on_gui_closed, function(event)
+  if event.element and event.element.valid and event.element.name == NetworkGui.name then
+    event.element.destroy()
+    return
+  end
   if SignalPicker.on_closed(event) then return end
   if event.element and event.element.valid and event.element.name == Gui.order_target_name then
     local player = game.get_player(event.player_index)
@@ -656,6 +673,11 @@ local function copy_products(products)
 end
 
 local function open_order_target(player, record, order_signal, order_count)
+  if record.config.mode == MODE_SUPERMARKET_ORDER then
+    MODES[MODE_SUPERMARKET_ORDER].calculate(record)
+    NetworkGui.open_tree(player, record, order_signal, order_count)
+    return
+  end
   local recipe_query = record.config.mode == MODE_RECIPE_QUERY
   local target = OrderTarget.resolve(
     record.entity.force, record.config.production_machine, order_signal, record.config,
@@ -855,6 +877,7 @@ local function invalidate_numeric_runtime_state(record, element_name)
 end
 
 script.on_event(defines.events.on_gui_text_changed, function(event)
+  if NetworkGui.on_text(event, state().combinators) then return end
   if SignalPicker.on_text_changed(event) then return end
   local record = current_record(event.player_index)
   local value = tonumber(event.element.text)
@@ -1035,6 +1058,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   end
 end)
 script.on_event(defines.events.on_gui_click, function(event)
+  if NetworkGui.on_click(event, state().combinators) then return end
   local player = game.get_player(event.player_index)
   local record = current_record(event.player_index)
 
@@ -1221,6 +1245,7 @@ script.on_event(defines.events.on_gui_click, function(event)
 end)
 
 script.on_event(defines.events.on_gui_checked_state_changed, function(event)
+  if NetworkGui.on_checked(event, state().combinators) then return end
   if event.element.name == "bmsc-swap-loop" then
     local record = current_record(event.player_index)
     if record then
@@ -1310,6 +1335,14 @@ if defines.events.on_blueprint_settings_pasted then
 end
 
 -- 运算间隔也是 30 时用同一个处理器顺序刷新，避免为同一周期重复注册。
+script.on_event(defines.events.on_lua_shortcut, function(event)
+  if event.prototype_name == "bmsc-production-network" then
+    local player = game.get_player(event.player_index)
+    local frame = player.gui.screen[NetworkGui.name]
+    if frame then frame.destroy() else NetworkGui.open_network(player, state().combinators) end
+  end
+end)
+
 if TICK_INTERVAL == 30 then
   script.on_nth_tick(30, function()
     update_all()

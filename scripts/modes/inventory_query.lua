@@ -298,6 +298,14 @@ function Mode.prepare(records)
             request.signals[key] = signal
           end
         end
+        if linked_supermarket then
+          for _, task in ipairs(record.network_assignments or {}) do
+            local plan = task.execution and task.execution.supermarket_order_plan
+            if plan then
+              for key, signal in pairs(Mode.supermarket_signals(plan)) do request.signals[key] = signal end
+            end
+          end
+        end
       end
     end
   end

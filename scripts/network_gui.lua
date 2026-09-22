@@ -768,7 +768,9 @@ function UI.on_text(event, records)
 end
 
 function UI.settings(parent, entity, config)
-  local group = parent.add{type = "flow", name = "bmsc-network-settings", direction = "vertical"}
+  local group = parent.add{type = "frame", name = "bmsc-network-settings",
+    style = "inside_shallow_frame_with_padding", direction = "vertical"}
+  group.style.horizontally_stretchable = true
   group.visible = config.mode == "supermarket_order"
   group.add{type = "label", caption = {"bmsc-net.title"}, style = "heading_2_label"}
   for _, field in ipairs({"network_publish", "network_accept", "network_export", "network_import"}) do

@@ -2,22 +2,48 @@ package.path = "./?.lua;" .. package.path
 local Gui = require("scripts.gui")
 local UI = require("scripts.network_gui")
 local Mode = require("scripts.modes.supermarket_order")
+local Config = require("scripts.config")
 
 -- 模拟 Factorio：control.lua 解析结束后，即便模块已缓存，也不得 require。
 local original_require = require
 require = function() error("runtime require is forbidden") end
 local function element()
-  local e = {valid = true, style = {}, children = {}}
+  -- Factorio 为 `element.style = "..."` 保留 LuaStyle 对象；测试替身也要让
+  -- 后续的 `element.style.width = ...` 继续可用。
+  local e = {valid = true, _style = {}, children = {}, tags = {}}
+  setmetatable(e, {
+    __index = function(t, key)
+      if key == "style" then return rawget(t, "_style") end
+    end,
+    __newindex = function(t, key, value)
+      if key == "style" then
+        rawset(t, "style_name", value)
+      else
+        rawset(t, key, value)
+      end
+    end
+  })
   e.add = function(spec)
     local child = element()
-    child.name, child.type, child.number, child.tags, child.caption = spec.name, spec.type, spec.number, spec.tags, spec.caption
+    child.name, child.type, child.number, child.tags, child.caption = spec.name, spec.type, spec.number, spec.tags or {}, spec.caption
+    child.text, child.selected_index, child.items = spec.text, spec.selected_index, spec.items
+    child.direction = spec.direction
     child.sprite, child.tooltip, child.elem_tooltip, child.style_name = spec.sprite, spec.tooltip, spec.elem_tooltip, spec.style
+    child.visible = spec.visible ~= false
+    child.enabled = spec.enabled ~= false
+    child.state = spec.state == true
+    child.toggled = spec.toggled == true
+    child.parent = e
     e.children[#e.children + 1] = child
     if spec.name then e[spec.name] = child end
     return child
   end
   e.force_auto_center = function() end
   e.destroy = function() e.valid = false end
+  e.clear = function()
+    for _, child in ipairs(e.children) do if child.name then e[child.name] = nil end end
+    e.children = {}
+  end
   return e
 end
 local force = {index = 1}
@@ -26,11 +52,13 @@ local player = {index = 1, force = force, gui = {screen = element()},
   display_scale = 1, display_resolution = {width = 1920, height = 1080},
   mod_settings = { ["bmsc-policy-gui-opacity"] = {value = "60"} },
   print = function(message) messages[#messages + 1] = message end}
-local record = {entity = {valid = true, force = force, unit_number = 1},
-  config = {production_machine = "assembling-machine-1", recurise_depth = 0,
-    order_targets = {}, recipe_policies = {plate = {{recipe = "plate", priority = 0, demand = 2, retention = 1}}}}}
+local record = {entity = {valid = true, force = force, unit_number = 1, combinator_description = "",
+  get_wire_connector = function() return {connection_count = 0} end},
+  config = Config.default()}
+record.config.recipe_policies = {plate = {{recipe = "plate", priority = 0, demand = 2, retention = 1}}}
 game = {get_player = function() return player end}
-defines = {mouse_button_type = {left = 1, right = 2}}
+defines = {mouse_button_type = {left = 1, right = 2}, wire_connector_id = {
+  combinator_input_red = 1, combinator_input_green = 2, combinator_output_red = 3, combinator_output_green = 4}}
 storage = {bmsc_network_views = {[1] = {unit = 1, signal = {type = "item", name = "plate"}, count = 1}}}
 prototypes = {
   item = {plate = {localised_name = "Plate"}, ore = {localised_name = "Ore"}},
@@ -177,6 +205,114 @@ local reached_settings = {}
 UI.settings = function() error(reached_settings) end
 local ok, err = pcall(Gui.open, player, record.entity, record.config)
 assert(not ok and err == reached_settings, "main window must reach network settings without runtime require")
+UI.settings = settings
+
+-- 主窗口默认是运行页；页面切换不得重建配置控件，也不能把纯界面状态写进实体配置。
+local rebuild_conditions = Gui.rebuild_conditions
+-- 这个轻量 GUI 模拟器不能复现 Factorio 对 `element.style = "..."` 的代理赋值；
+-- 页面结构断言不依赖条件行本身，因此在此处跳过条件行的具体渲染。
+Gui.rebuild_conditions = function() end
+local main = Gui.open(player, record.entity, record.config, nil, nil, {
+  current = {stage = {signal = {type = "item", name = "plate"}, target = 100, stock = 25,
+    single_output = true, product_output = true, ingredients = {
+      {required = 10, stock = 12, demand_ready = true}}},
+    product = {signal = {type = "item", name = "plate"}, target = 100, stock = 25, remaining = 75}},
+  next = nil, source = "local"})
+local content = main["bmsc-content"]
+local runtime_column = content["bmsc-runtime-column"]
+local config_column = content["bmsc-config-column"]
+local runtime_page = runtime_column["bmsc-runtime-page"]
+local config_page = config_column["bmsc-config-page"]
+assert(content.type == "flow" and content.direction == "horizontal",
+  "main content must be a horizontal layout container, not one shared vertical scroll pane")
+assert(runtime_page.visible and not config_column.visible,
+  "main window must open with the parameter column collapsed")
+assert(main.style.width == 720,
+  "a collapsed configuration page must keep the runtime window compact")
+assert(runtime_page["bmsc-signals"], "runtime page must own the shared signal panel")
+local work_grid = runtime_page["bmsc-work-panel"]["bmsc-work-grid"]
+assert(work_grid["bmsc-work-production-target"].caption == "100"
+  and work_grid["bmsc-work-production-remaining"].caption == "75"
+  and work_grid["bmsc-work-production-stock"].caption == "25",
+  "current production must keep target, shortage, and stock in fixed numeric columns")
+assert(work_grid["bmsc-work-next-kind"].caption == ""
+  and work_grid["bmsc-work-next-separator-one"].caption == ""
+  and work_grid["bmsc-work-next-separator-two"].caption == "",
+  "an absent next order must retain its row but leave every visible field empty")
+local signal_panel = Gui.add_signal_panel(element(), player)
+Gui.refresh_signal_panel(signal_panel, {
+  {color = "red", signals = {{signal = {type = "item", name = "plate"}, count = 3}}},
+  {color = "green", signals = {{signal = {type = "item", name = "plate"}, count = 7}}}
+}, {}, {})
+local input_slots = signal_panel["bmsc-input-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
+assert(#input_slots.children == 1 and input_slots.children[1].number == 10
+  and input_slots.children[1].tags.bmsc_signal_color == "green",
+  "the same red and green signal must render once with the combined count and retain green input actions")
+assert(not content["bmsc-production-details"], "configuration details must not remain direct content children")
+local closed, config_open = Gui.show_page(main["bmsc-page-switcher"]["bmsc-page-config"], "config")
+assert(not closed and config_open,
+  "opening the configuration drawer must report its player-persisted visual state")
+assert(runtime_page.visible and config_column.visible,
+  "configuration drawer must leave the runtime panel visible")
+assert(main.style.width == 1280,
+  "opening the configuration page must expand the window to its available width")
+assert(config_page["bmsc-production-details"],
+  "configuration page must retain the existing production settings")
+assert(config_page["bmsc-network-settings"] and config_page["bmsc-network-settings"].type == "frame",
+  "network settings must remain an independent configuration component")
+local order_settings = config_page["bmsc-recursion-details"]["bmsc-recursion-settings"]
+local timeout_settings = config_page["bmsc-recursion-details"]["bmsc-recursion-timeout-settings"]
+assert(order_settings and timeout_settings,
+  "supermarket order parameters and timeout settings must be separate GUI components")
+local order_fields = order_settings["bmsc-recursion-fields"]
+local generation = order_fields["bmsc-recursion-additional-controls"]
+local material_range = order_fields["bmsc-recursion-material-controls"]
+assert(generation["bmsc-recursion-additional-min"].enabled == false
+  and generation["bmsc-recursion-additional"],
+  "generation rate must expose a disabled zero lower bound and editable upper value")
+assert(material_range["bmsc-recursion-material-retention"]
+  and material_range["bmsc-recursion-material"],
+  "material rate must expose retention and demand as one two-sided control")
+assert(order_fields["bmsc-restart-sequence"]
+  and order_fields["bmsc-recursion-output-controls"]["bmsc-sequential-production"].type == "checkbox",
+  "sequential production must be a checkbox next to the single-output selector")
+local valid, demand, retention = Gui.validate_material_rate_inputs(material_range["bmsc-recursion-material"])
+assert(valid and demand == 10 and retention == 1,
+  "two-sided material rate inputs must retain the existing demand-greater-than-retention validation")
+Gui.set_recursion_single_options_visible(order_fields["bmsc-recursion-output-controls"]["bmsc-recursion-output"], false)
+assert(not timeout_settings.visible and not order_fields["bmsc-recursion-output-controls"]["bmsc-sequential-production"].visible,
+  "All output must hide the timeout component and sequential checkbox together")
+Gui.set_recursion_single_options_visible(order_fields["bmsc-recursion-output-controls"]["bmsc-recursion-output"], true)
+assert(timeout_settings.visible and order_fields["bmsc-recursion-output-controls"]["bmsc-sequential-production"].visible,
+  "Single output must restore the timeout component and sequential checkbox")
+local reopened, config_closed = Gui.show_page(main["bmsc-page-switcher"]["bmsc-page-config"], "config")
+assert(reopened and not config_closed and main.style.width == 720,
+  "closing the configuration drawer must refresh runtime and restore compact width")
+
+local remembered_main = Gui.open(player, record.entity, record.config, nil, nil, nil, nil, true)
+assert(remembered_main.style.width == 1280
+  and remembered_main["bmsc-content"]["bmsc-config-column"].visible,
+  "a caller-provided player preference must reopen the configuration page expanded")
+
+-- 逻辑宽度不足双栏最小值时，配置必须作为覆盖层打开，不能再挤压运行面板。
+player.display_resolution = {width = 1000, height = 1080}
+local narrow_main = Gui.open(player, record.entity, record.config)
+local narrow_content = narrow_main["bmsc-content"]
+local overlay = player.gui.screen[Gui.config_overlay_name]
+assert(not narrow_content["bmsc-config-column"] and overlay and not overlay.visible,
+  "narrow screens must keep configuration outside the runtime layout until requested")
+assert(not Gui.show_page(narrow_main["bmsc-page-switcher"]["bmsc-page-config"], "config")
+  and overlay.visible and overlay["bmsc-content"]["bmsc-config-column"] and narrow_main.style.width == 920,
+  "opening configuration on a narrow screen must show the standalone overlay")
+narrow_main.location = {x = 100, y = 20}
+Gui.sync_config_overlay_location(narrow_main)
+assert(overlay.location.x == 100 and overlay.location.y == 76,
+  "the narrow-screen configuration overlay must follow a dragged main window")
+assert(Gui.show_page(narrow_main["bmsc-page-switcher"]["bmsc-page-config"], "config")
+  and not overlay.visible and narrow_main.style.width == 720,
+  "closing the narrow-screen overlay must request a runtime refresh")
+player.display_resolution = {width = 1920, height = 1080}
+Gui.rebuild_conditions = rebuild_conditions
 UI.settings = settings
 
 local calculate, invalidate, open_tree, open_policy = Mode.calculate, Mode.invalidate_plan, UI.open_tree, UI.open_policy

@@ -52,6 +52,7 @@ function Mode.reset(record)
   record.supermarket_active_orders = nil
   record.supermarket_order_candidates = nil
   record.supermarket_order_diagnostics = nil
+  record.supermarket_next_order_key = nil
   record.supermarket_sequence_completed_orders = nil
   record.recursion_timeout_condition_results = nil
   record.recursion_inventory_pending_tick = nil
@@ -811,6 +812,7 @@ local function calculate_local(record)
             required = 0,
             stock = stock,
             start_threshold = threshold,
+            demand_ready = stock > child.amount * (node.demand_rate or material_demand_rate),
             threshold_comparator = comparator,
             start_ready = true,
             _node = child
@@ -822,6 +824,8 @@ local function calculate_local(record)
         ingredient.required = ingredient.required + child.amount * crafts
         ingredient.stock = math.min(ingredient.stock, stock)
         ingredient.start_threshold = math.max(ingredient.start_threshold, threshold)
+        ingredient.demand_ready = ingredient.demand_ready
+          and stock > child.amount * (node.demand_rate or material_demand_rate)
         ingredient.start_ready = ingredient.start_ready and ready
         stage.start_ready = stage.start_ready and ready
       end
@@ -1160,6 +1164,15 @@ local function calculate_local(record)
           stock = status.products[1] and status.products[1].stock or 0, products = status.products}
           or {kind = "supermarket_expanding"}
       end
+      if diagnostic and target and target.products then
+        local status = OrderTarget.inventory_status(target.products, observed_inventory, demand.count)
+        local product = status.products[1]
+        diagnostic.order = {signal = Util.make_signal(demand.signal.type, demand.signal.name, demand.signal.quality),
+          count = demand.count}
+        diagnostic.product = product and {signal = Util.make_signal(
+          product.signal.type, product.signal.name, product.signal.quality),
+          target = product.target, stock = product.stock, remaining = product.remaining} or nil
+      end
       if diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
         or diagnostic.kind == "supermarket_expanding") then
         local root = roots_by_source[source_key]
@@ -1191,6 +1204,22 @@ local function calculate_local(record)
       diagnostics[source_key] = diagnostic
     end
     record.supermarket_order_diagnostics = diagnostics
+    record.supermarket_next_order_key = nil
+    if sequential and active_order_key then
+      local active_index
+      for index, root in ipairs(plan.roots) do
+        if root.source_key == active_order_key then active_index = index; break end
+      end
+      if active_index then
+        for offset = 1, #plan.roots - 1 do
+          local root = plan.roots[(active_index - 1 + offset) % #plan.roots + 1]
+          if diagnostics[root.source_key] and diagnostics[root.source_key].kind == "waiting_for_order" then
+            record.supermarket_next_order_key = root.source_key
+            break
+          end
+        end
+      end
+    end
   end
 
   -- 已启动订单的前两份缺料快照只用于确认，不撤销当前信号，也不累计普通超时。

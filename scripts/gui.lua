@@ -8,6 +8,7 @@ local Util = require("scripts.common_util")            -- 复用稳定信号键�
 local NetworkGui = require("scripts.network_gui")     -- Factorio 仅允许在 control.lua 加载阶段 require。
 
 Gui.name = "bmsc-window"                              -- 参数：窗口唯一名称，供 control.lua 识别事件来源。
+Gui.config_overlay_name = "bmsc-config-overlay"       -- 窄屏时独立悬浮的参数栏，不挤压运行面板。
 Gui.order_target_name = "bmsc-order-target-window"    -- 参数：Shift+左键打开的配方与库存校验子窗口。
 Gui.network_info_name = "bmsc-network-info"           -- 参数：网络信息图标名称前缀；实际名称会追加颜色和网络编号。
 Gui.network_popup_name = "bmsc-network-popup"         -- 参数：仿原版网络信号悬浮面板的唯一名称。
@@ -16,6 +17,29 @@ Gui.supermarket_order = Config.mode.supermarket_order  -- 参数：超市订单�
 Gui.recipe_query = Config.mode.recipe_query            -- 参数：配方查询模式标识，只用于决定参数区是否可见。
 Gui.inventory_query = Config.mode.inventory_query      -- 参数：共享库存查询模式标识，只用于决定参数区是否可见。
 Gui.swap_order = Config.mode.swap_order                -- 参数：切换订单模式标识，只用于决定参数区是否可见。
+
+local function mode_caption(mode)
+  return ({
+    [Gui.production_order] = {"bmsc.production-order"},
+    [Gui.supermarket_order] = {"bmsc.supermarket-order"},
+    [Gui.recipe_query] = {"bmsc.recipe-query"},
+    [Gui.inventory_query] = {"bmsc.inventory-query"},
+    [Gui.swap_order] = {"bmsc.swap-order"}
+  })[mode] or {"bmsc.production-order"}
+end
+
+---模式说明只在鼠标停留时出现；配置栏不再为帮助文字预留多行高度。
+---@param mode string 当前模式。
+---@return LocalisedString tooltip 当前模式的完整说明。
+local function mode_tooltip(mode)
+  return ({
+    [Gui.production_order] = {"bmsc.mode-tooltip-production-order"},
+    [Gui.supermarket_order] = {"bmsc.mode-tooltip-supermarket-order"},
+    [Gui.recipe_query] = {"bmsc.mode-tooltip-recipe-query"},
+    [Gui.inventory_query] = {"bmsc.mode-tooltip-inventory-query"},
+    [Gui.swap_order] = {"bmsc.mode-tooltip-swap-order"}
+  })[mode] or {"bmsc.mode-tooltip-production-order"}
+end
 -- 参数：每一种数值参数自己的吸附档位。
 -- Factorio 原生离散滑块只能等距吸附，因此滑块内部仍使用 1~6 的索引，再由这里映射实际值。
 -- 后续新增参数时，只需在本表增加“输入框名称 → 档位数组”，无需修改通用滑块函数。
@@ -152,6 +176,23 @@ local function signal_localised_label(signal)
     or signal_type == "recipe" and prototypes.recipe or prototypes.item
   local prototype = prototype_group and prototype_group[signal.name]
   return {"", "[img=" .. signal_sprite_path(signal) .. "] ", prototype and prototype.localised_name or signal.name}
+end
+
+local function signal_localised_name(signal)
+  local group = signal.type == "fluid" and prototypes.fluid
+    or signal.type == "virtual" and prototypes.virtual_signal or prototypes.item
+  local prototype = group and group[signal.name]
+  return prototype and prototype.localised_name or signal.name
+end
+
+---按名称查找任意深度的 GUI 子元素；页面分组后，参数控件不再都是内容区直属子元素。
+local function find_descendant(parent, name)
+  if not parent then return nil end
+  if parent.name == name then return parent end
+  for _, child in ipairs(parent.children) do
+    local found = find_descendant(child, name)
+    if found then return found end
+  end
 end
 
 ---用平衡树连接本地化片段，避免逐项追加形成超过 Factorio 20 层限制的深链。
@@ -411,36 +452,40 @@ local function apply_diagnostic_signal_style(slot, color, diagnostic)
   end
 end
 
----把输入/输出两侧的红绿网络信号展开成稳定排序的槽位数组。
----同一信号同时出现在红、绿网络时保留两个槽位，以不同线路底色明确区分来源。
+---把输入/输出两侧的红绿网络信号合并成稳定排序的槽位数组。
+---同一信号在两条线路上只显示一次，数量为两侧相加，避免无意义的重复图标。
 ---@param networks table `get_side_networks` 返回的网络数组。
----@param diagnostics table|nil 以 Util.signal_key 为键的输入诊断；all_colors 可应用到红色槽位。
----@return table entries 每项包含 color、signal、count、sprite 和稳定 key。
+---@param diagnostics table|nil 以 Util.signal_key 为键的输入诊断。
+---@return table entries 每项包含展示线路、signal、count、sprite 和稳定 key。
 local function collect_signal_entries(networks, diagnostics)
-  local entries = {}
+  local by_key = {}
   for _, network in ipairs(networks) do
     for _, value in pairs(network.signals) do
       if value.signal and value.signal.name then
-        local quality = type(value.signal.quality) == "string" and value.signal.quality
-          or (value.signal.quality and value.signal.quality.name)
-        local sprite = signal_sprite_path(value.signal)
-        local diagnostic = diagnostics and diagnostics[Util.signal_key(value.signal)] or nil
-        if network.color ~= "green" and not (diagnostic and diagnostic.all_colors) then diagnostic = nil end
-        entries[#entries + 1] = {
-          color = network.color,
-          signal = value.signal,
-          count = value.count,
-          sort_priority = tonumber(value.sort_priority) or 0,
-          diagnostic = diagnostic,
-          diagnostic_priority = diagnostic and diagnostic_signal_priority(diagnostic) or 0,
-          sprite = sprite,
-          key = network.color .. "|" .. sprite .. "|" .. (quality or "normal")
-        }
+        local key = Util.signal_key(value.signal)
+        local entry = by_key[key]
+        if not entry then
+          entry = {signal = value.signal, count = 0, sort_priority = tonumber(value.sort_priority) or 0,
+            diagnostic = diagnostics and diagnostics[key] or nil, key = key,
+            has_green = false, has_red = false}
+          by_key[key] = entry
+        end
+        entry.count = entry.count + (value.count or 0)
+        entry.sort_priority = math.max(entry.sort_priority, tonumber(value.sort_priority) or 0)
+        entry.has_green = entry.has_green or network.color == "green"
+        entry.has_red = entry.has_red or network.color == "red"
       end
     end
   end
+  local entries = {}
+  for _, entry in pairs(by_key) do
+    -- 交互沿用绿色线路：订单选择、Shift 操作仍能在合并后的槽位正常触发。
+    entry.color = entry.has_green and "green" or "red"
+    entry.diagnostic_priority = entry.diagnostic and diagnostic_signal_priority(entry.diagnostic) or 0
+    entry.sprite = signal_sprite_path(entry.signal)
+    entries[#entries + 1] = entry
+  end
   table.sort(entries, function(a, b)
-    if a.color ~= b.color then return a.color < b.color end
     if a.diagnostic_priority ~= b.diagnostic_priority then
       return a.diagnostic_priority > b.diagnostic_priority
     end
@@ -451,7 +496,7 @@ local function collect_signal_entries(networks, diagnostics)
 end
 
 ---更新一个常驻信号子面板。
----只有信号种类、品质或线路颜色变化时才重建槽位；通常的数值变化只写 `number`，
+---只有信号种类、品质或排序变化时才重建槽位；通常的数值变化只写 `number`，
 ---从而避免周期性 clear/destroy 带来的 GUI 分配、悬浮中断和额外 UPS 消耗。
 ---@param section LuaGuiElement “输入信号”或“输出信号”的子 frame。
 ---@param networks table 当前侧的红绿网络。
@@ -459,72 +504,54 @@ end
 ---@return nil
 local function refresh_signal_section(section, networks, diagnostics)
   local entries = collect_signal_entries(networks, diagnostics)
-  local by_color = {red = {}, green = {}}
   local signature_parts = {}
   for _, entry in ipairs(entries) do
     -- 优先级也属于布局签名；同一组信号的顺序改变时需要重排槽位，而不只是更新数字。
     signature_parts[#signature_parts + 1] = tostring(entry.diagnostic_priority) .. "|"
       .. tostring(entry.sort_priority) .. "|" .. entry.key
-    by_color[entry.color][#by_color[entry.color] + 1] = entry
   end
   local signature = table.concat(signature_parts, "\n")
   local scroll = section["bmsc-signal-scroll"]
   if not (scroll and scroll.valid) then return end
-  local red_slots = scroll["bmsc-red-signal-slots"]
-  local green_slots = scroll["bmsc-green-signal-slots"]
-
-  local rows_intact = (#by_color.red == 0 or (red_slots and red_slots.valid))
-    and (#by_color.green == 0 or (green_slots and green_slots.valid))
-  if rows_intact and scroll.tags.bmsc_signal_signature == signature then
-    for _, color in ipairs({"green", "red"}) do
-      local slots = color == "red" and red_slots or green_slots
-      for index, entry in ipairs(by_color[color]) do
-        -- 每种颜色各自保持稳定排序，因此常规刷新只更新数字。
-        local slot = slots.children[index]
-        local diagnostic = entry.diagnostic
-        slot.number = entry.count
-        apply_diagnostic_signal_style(slot, color, diagnostic)
-        slot.tooltip = Gui.production_diagnostic_tooltip(diagnostic)
-      end
+  local slots = scroll["bmsc-signal-slots"]
+  if slots and slots.valid and scroll.tags.bmsc_signal_signature == signature then
+    for index, entry in ipairs(entries) do
+      local slot = slots.children[index]
+      local diagnostic = entry.diagnostic
+      slot.number = entry.count
+      apply_diagnostic_signal_style(slot, entry.color, diagnostic)
+      slot.tooltip = Gui.production_diagnostic_tooltip(diagnostic)
     end
     return
   end
 
   scroll.clear()
   scroll.tags = {bmsc_signal_signature = signature}
-  if #entries == 0 then
-    scroll.add{type = "label", caption = {"bmsc.no-output"}}
-    return
-  end
+  -- 空信号区保持留白；运行表的空行和信号区采用同一“无文字占位”规则。
+  if #entries == 0 then return end
 
-  for _, color in ipairs({"green", "red"}) do
-    if #by_color[color] > 0 then
-      -- 红色和绿色使用两个独立表格；即使上一色不足八格，下一色也一定从新行开始。
-      local slots = scroll.add{type = "table", name = "bmsc-" .. color .. "-signal-slots", column_count = 8}
-      slots.style.horizontally_stretchable = true
-      if color == "red" and #by_color.green > 0 then slots.style.top_margin = 4 end
-      for _, entry in ipairs(by_color[color]) do
-        local diagnostic = entry.diagnostic
-        -- 保持原版电路槽位的图标与数字角标布局，仅附加原型交互信息。
-        local slot = slots.add{type = "sprite-button", sprite = entry.sprite, number = entry.count,
-          style = color .. "_circuit_network_content_slot", elem_tooltip = signal_elem_tooltip(entry.signal),
-          tooltip = Gui.production_diagnostic_tooltip(diagnostic),
-          tags = {
-            bmsc_signal_panel_icon = true,
-            bmsc_signal_side = section.name == "bmsc-input-signals" and "input" or "output",
-            bmsc_signal_color = color,
-            bmsc_signal_key = Util.signal_key(entry.signal),
-            bmsc_signal_type = entry.signal.type or "item",
-            bmsc_signal_name = entry.signal.name,
-            bmsc_signal_quality = Util.quality_name(entry.signal.quality)
-          }}
-        apply_diagnostic_signal_style(slot, color, diagnostic)
-        local quality = type(entry.signal.quality) == "string" and entry.signal.quality
-          or (entry.signal.quality and entry.signal.quality.name)
-        if (entry.signal.type or "item") == "item" and quality and quality ~= "normal" then
-          slot.quality = quality
-        end
-      end
+  slots = scroll.add{type = "table", name = "bmsc-signal-slots", column_count = 8}
+  slots.style.horizontally_stretchable = true
+  for _, entry in ipairs(entries) do
+    local diagnostic = entry.diagnostic
+    -- 合并后以绿色底色表示可操作的订单信号；纯红线信号保持原有红色底色。
+    local slot = slots.add{type = "sprite-button", sprite = entry.sprite, number = entry.count,
+      style = entry.color .. "_circuit_network_content_slot", elem_tooltip = signal_elem_tooltip(entry.signal),
+      tooltip = Gui.production_diagnostic_tooltip(diagnostic),
+      tags = {
+        bmsc_signal_panel_icon = true,
+        bmsc_signal_side = section.name == "bmsc-input-signals" and "input" or "output",
+        bmsc_signal_color = entry.color,
+        bmsc_signal_key = Util.signal_key(entry.signal),
+        bmsc_signal_type = entry.signal.type or "item",
+        bmsc_signal_name = entry.signal.name,
+        bmsc_signal_quality = Util.quality_name(entry.signal.quality)
+      }}
+    apply_diagnostic_signal_style(slot, entry.color, diagnostic)
+    local quality = type(entry.signal.quality) == "string" and entry.signal.quality
+      or (entry.signal.quality and entry.signal.quality.name)
+    if (entry.signal.type or "item") == "item" and quality and quality ~= "normal" then
+      slot.quality = quality
     end
   end
 end
@@ -648,6 +675,8 @@ end
 ---销毁留在子窗口后方的主窗口，但不改写 player.opened（它可能已经指向另一个实体）。
 function Gui.destroy_background(player)
   Gui.hide_network_popup(player)
+  local overlay = player.gui.screen[Gui.config_overlay_name]
+  if overlay and overlay.valid then overlay.destroy() end
   local frame = player.gui.screen[Gui.name]
   if frame and frame.valid then frame.destroy() end
 end
@@ -691,11 +720,111 @@ function Gui.add_signal_panel(parent, player)
   local section_content_height = math.max(48, math.floor((signal_panel_height - 118) / 2))
   signals.style.maximal_height = signal_panel_height
   signals.add{type = "label", caption = {"bmsc.signal-panel-title"}, style = "heading_2_label"}
+  -- 保持实体面板既有阅读顺序：先看输入，再向下查看输出。
   local input_signals = add_signal_section(
     signals, "bmsc-input-signals", {"bmsc.input-signals"}, section_content_height)
   input_signals.style.bottom_margin = 8
   add_signal_section(signals, "bmsc-output-signals", {"bmsc.output-signals"}, section_content_height)
   return signals
+end
+
+local function add_work_row(grid, name, caption)
+  local label = grid.add{type = "label", name = name .. "-kind", caption = caption}
+  label.style.minimal_width = 72
+  local item = grid.add{type = "flow", name = name .. "-item", direction = "horizontal"}
+  item.style.minimal_width = 170
+  item.style.vertical_align = "center"
+  local icon = item.add{type = "sprite-button", name = name .. "-icon", style = "slot_button", visible = false}
+  local item_name = item.add{type = "label", name = name .. "-name", caption = ""}
+  local function value(suffix, tooltip)
+    local field = grid.add{type = "label", name = name .. suffix, caption = "", tooltip = tooltip}
+    field.style.minimal_width, field.style.horizontal_align = 64, "right"
+    return field
+  end
+  value("-target", {"bmsc.work-target-tooltip"})
+  local separator = grid.add{type = "label", name = name .. "-separator-one", caption = "｜"}
+  value("-remaining", {"bmsc.work-remaining-tooltip"})
+  local separator_two = grid.add{type = "label", name = name .. "-separator-two", caption = "｜"}
+  value("-stock", {"bmsc.work-stock-tooltip"})
+  local state = grid.add{type = "label", name = name .. "-state", caption = ""}
+  state.style.minimal_width = 88
+  return {label = label, item = item, icon = icon, name = item_name,
+    target = grid[name .. "-target"], separator = separator, remaining = grid[name .. "-remaining"],
+    separator_two = separator_two, stock = grid[name .. "-stock"], state = state}
+end
+
+local function add_work_panel(parent)
+  local panel = parent.add{type = "frame", name = "bmsc-work-panel",
+    style = "inside_shallow_frame_with_padding", direction = "vertical"}
+  panel.style.horizontally_stretchable = true
+  local grid = panel.add{type = "table", name = "bmsc-work-grid", column_count = 8}
+  grid.style.horizontal_spacing = 4
+  add_work_row(grid, "bmsc-work-production", {"bmsc.work-production"})
+  add_work_row(grid, "bmsc-work-order", {"bmsc.work-order"})
+  add_work_row(grid, "bmsc-work-next", {"bmsc.work-next"})
+  return panel
+end
+
+local function set_work_row(panel, prefix, product, state_caption, color)
+  local grid = panel and panel["bmsc-work-grid"]
+  local row = grid and {
+    label = grid[prefix .. "-kind"], item = grid[prefix .. "-item"],
+    target = grid[prefix .. "-target"], separator = grid[prefix .. "-separator-one"],
+    remaining = grid[prefix .. "-remaining"], separator_two = grid[prefix .. "-separator-two"],
+    stock = grid[prefix .. "-stock"], state = grid[prefix .. "-state"]}
+  if not row then return end
+  row.icon, row.name = row.item[prefix .. "-icon"], row.item[prefix .. "-name"]
+  if not (row.label and row.icon and row.name and row.target and row.separator and row.remaining
+    and row.separator_two and row.stock and row.state) then return end
+  local visible = product and product.signal
+  if not visible then
+    row.label.caption, row.name.caption, row.icon.visible = "", "", false
+    for _, field in ipairs({row.target, row.separator, row.remaining, row.separator_two, row.stock, row.state}) do
+      field.caption = ""
+    end
+    return
+  end
+  row.label.caption = ({
+    ["bmsc-work-production"] = {"bmsc.work-production"},
+    ["bmsc-work-order"] = {"bmsc.work-order"},
+    ["bmsc-work-next"] = {"bmsc.work-next"}
+  })[prefix]
+  row.icon.visible, row.icon.sprite, row.icon.elem_tooltip = true, signal_sprite_path(product.signal), signal_elem_tooltip(product.signal)
+  row.name.caption = signal_localised_name(product.signal)
+  row.target.caption = tostring(math.ceil(product.target or 0))
+  row.separator.caption = "｜"
+  row.remaining.caption = tostring(math.ceil(product.remaining or 0))
+  row.separator_two.caption = "｜"
+  row.stock.caption = tostring(math.floor(product.stock or 0))
+  row.state.caption = state_caption or ""
+  row.state.style.font_color = color or {1, 1, 1}
+end
+
+local function material_state(stage)
+  local ingredients = stage and stage.ingredients or {}
+  local complete, ready = true, true
+  for _, ingredient in ipairs(ingredients) do
+    complete = complete and (ingredient.stock or 0) >= (ingredient.required or 0)
+    ready = ready and ingredient.demand_ready == true
+  end
+  if complete then return {"bmsc.work-material-full"}, {0.4, 1, 0.4} end
+  if ready then return {"bmsc.work-material-ready"}, {0.35, 0.7, 1} end
+  return {"bmsc.work-material-low"}, {1, 0.35, 0.35}
+end
+
+function Gui.refresh_work_panel(panel, work)
+  work = work or {}
+  local current = work.current
+  local stage = current and current.stage
+  local production = stage and stage.single_output ~= false and stage.product_output ~= false and stage or nil
+  local material, material_color = material_state(production)
+  set_work_row(panel, "bmsc-work-production", production and {
+    signal = production.signal, target = production.target, stock = production.stock,
+    remaining = math.max(0, (production.target or 0) - (production.stock or 0))} or nil, material, material_color)
+  set_work_row(panel, "bmsc-work-order", current and current.product,
+    current and {work.source == "network" and "bmsc.work-network" or "bmsc.work-local"} or nil)
+  set_work_row(panel, "bmsc-work-next", work.next and work.next.product,
+    work.next and {work.source == "network" and "bmsc.work-network" or "bmsc.work-local"} or nil)
 end
 
 ---刷新一套公共信号 GUI 的输入和输出槽位。
@@ -857,6 +986,31 @@ local function add_numeric_slider(parent, caption, name, value, allow_decimal, t
   return textfield
 end
 
+---添加带左右数值框的倍率控件。
+---左端可作为固定下界（生成倍率）或保留倍率（原料倍率）；滑块始终调整右端值，
+---避免为了两端控件引入自定义控件或额外持久化状态。
+local function add_rate_range(parent, caption, name, lower_name, lower_value, upper_value, lower_locked, tooltip)
+  parent.add{type = "label", caption = caption}
+  local controls = parent.add{type = "flow", name = name .. "-controls", direction = "horizontal"}
+  controls.style.vertical_align = "center"
+  controls.style.horizontal_spacing = 4
+  local lower = controls.add{type = "textfield", name = lower_name, style = "short_slider_value_textfield",
+    text = tostring(lower_value), numeric = true, allow_decimal = true, allow_negative = false,
+    enabled = not lower_locked, tooltip = tooltip}
+  lower.style.width = 56
+  local values = Gui.slider_profiles[name]
+  local slider = controls.add{type = "slider", name = name .. "-slider", style = "notched_slider",
+    minimum_value = 1, maximum_value = #values,
+    value = nearest_slider_index(upper_value, values), value_step = 1, discrete_values = true,
+    tooltip = tooltip, tags = {bmsc_numeric_input = name}}
+  slider.style.width = 112
+  local upper = controls.add{type = "textfield", name = name, style = "short_slider_value_textfield",
+    text = tostring(upper_value), numeric = true, allow_decimal = true, allow_negative = false,
+    tooltip = tooltip, tags = {bmsc_numeric_slider = name .. "-slider"}}
+  upper.style.width = 56
+  return upper
+end
+
 ---在超时输入框右侧追加同尺寸的只读计时框，三个模式共用同一布局。
 local function add_timeout_slider(parent, caption, name, value, allow_decimal, tooltip, visible, label_name)
   local input = add_numeric_slider(
@@ -886,7 +1040,8 @@ function Gui.validate_material_rate_inputs(source_element)
   local demand_name = recursion and "bmsc-recursion-material" or "bmsc-material"
   local retention_name = recursion and "bmsc-recursion-material-retention" or "bmsc-material-retention"
   local demand_flow = fields[demand_name .. "-controls"]
-  local retention_flow = fields[retention_name .. "-controls"]
+  -- 超市订单把保留/需求倍率收在同一双端控件中；生产订单仍保持两条独立行。
+  local retention_flow = fields[retention_name .. "-controls"] or demand_flow
   local demand_input = demand_flow and demand_flow[demand_name]
   local retention_input = retention_flow and retention_flow[retention_name]
   if not (demand_input and retention_input) then return false, nil, nil end
@@ -895,10 +1050,11 @@ function Gui.validate_material_rate_inputs(source_element)
   local retention = tonumber(retention_input.text)
   local valid = demand ~= nil and retention ~= nil and Config.material_rates_valid(demand, retention)
   local style = valid and "short_slider_value_textfield" or "invalid_value_short_number_textfield"
+  local width = recursion and 56 or 64
   demand_input.style = style
   retention_input.style = style
-  demand_input.style.width = 64                       -- 切换预设样式会清除自定义宽度，需要重新设置。
-  retention_input.style.width = 64
+  demand_input.style.width = width                    -- 切换预设样式会清除自定义宽度，需要重新设置。
+  retention_input.style.width = width
   return valid, demand, retention
 end
 
@@ -933,10 +1089,21 @@ end
 function Gui.containing_window(element)
   local current = element
   while current and current.valid do
-    if current.name == Gui.name then return current end
+    if current.name == Gui.name or current.name == Gui.config_overlay_name then return current end
     current = current.parent
   end
   return nil
+end
+
+---返回承载配置控件的窗口：宽屏是主窗口，窄屏是独立覆盖层。
+---@param window LuaGuiElement|nil 主窗口或覆盖层。
+---@return LuaGuiElement|nil
+local function config_window(window)
+  if window and window.name == Gui.name then
+    local overlay = window.parent and window.parent[Gui.config_overlay_name]
+    if overlay and overlay.valid then return overlay end
+  end
+  return window
 end
 
 ---刷新原版风格状态栏中的“输入/输出：已连接或未连接”。
@@ -946,30 +1113,23 @@ end
 ---@param current_output_networks table|nil control.lua 本轮实际写入输出代理的信号快照。
 ---@param input_diagnostics table|nil 生产订单绿色输入信号的未输出原因。
 ---@return nil
-function Gui.refresh_connection_status(player, entity, current_output_networks, input_diagnostics)
+function Gui.refresh_connection_status(player, entity, current_output_networks, input_diagnostics, work)
   local frame = player.gui.screen[Gui.name]
   if not (frame and frame.valid and entity and entity.valid) then return end
   local content = frame["bmsc-content"]
-  local connections = content and content["bmsc-connections"]
+  local runtime = content and find_descendant(content, "bmsc-runtime-page")
+  local connections = runtime and runtime["bmsc-connections"]
   if not connections then return end
   local input_networks = get_side_networks(entity, "input")
   local output_networks = get_side_networks(entity, "output")
   refresh_side_status(connections["bmsc-input-status"], input_networks)
   refresh_side_status(connections["bmsc-output-status"], output_networks)
-  -- 各模式分别绑定公共面板；只刷新当前可见实例，避免为隐藏模式做重复 GUI 更新。
-  local signal_output_networks
-  for _, details_name in ipairs({
-    "bmsc-production-details", "bmsc-recursion-details", "bmsc-recipe-query-details",
-    "bmsc-inventory-query-details", "bmsc-swap-details"
-  }) do
-    local details = content[details_name]
-    if details and details.visible then
-      -- 定时计算时优先使用“本轮实际写入代理”的快照，保证 GUI 与线路输出同源。
-      -- 打开窗口后的首次刷新还没有传入快照，此时才从代理线路读取已有信号。
-      signal_output_networks = signal_output_networks or current_output_networks
-        or get_side_networks(entity, "output", true)
-      Gui.refresh_signal_panel(details["bmsc-signals"], input_networks, signal_output_networks, input_diagnostics)
-    end
+  Gui.refresh_work_panel(runtime["bmsc-work-panel"], work)
+  if runtime.visible then
+    -- 定时计算时优先使用“本轮实际写入代理”的快照，保证 GUI 与线路输出同源。
+    -- 打开窗口后的首次刷新还没有传入快照，此时才从代理线路读取已有信号。
+    local signal_output_networks = current_output_networks or get_side_networks(entity, "output", true)
+    Gui.refresh_signal_panel(runtime["bmsc-signals"], input_networks, signal_output_networks, input_diagnostics)
   end
 end
 
@@ -981,32 +1141,92 @@ function Gui.show_mode_details(source_element, mode)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
   if not content then return end
-  local production_details = content["bmsc-production-details"]
-  local network_settings = content["bmsc-network-settings"]
+  local production_details = find_descendant(content, "bmsc-production-details")
+  local network_settings = find_descendant(content, "bmsc-network-settings")
   if network_settings then network_settings.visible = mode == Gui.supermarket_order end
-  local recursion_details = content["bmsc-recursion-details"]
-  local recipe_query_details = content["bmsc-recipe-query-details"]
-  local inventory_query_details = content["bmsc-inventory-query-details"]
-  local swap_details = content["bmsc-swap-details"]
+  local recursion_details = find_descendant(content, "bmsc-recursion-details")
+  local recipe_query_details = find_descendant(content, "bmsc-recipe-query-details")
+  local inventory_query_details = find_descendant(content, "bmsc-inventory-query-details")
+  local swap_details = find_descendant(content, "bmsc-swap-details")
   if production_details then production_details.visible = mode == Gui.production_order end
   if recursion_details then recursion_details.visible = mode == Gui.supermarket_order end
   if recipe_query_details then recipe_query_details.visible = mode == Gui.recipe_query end
   if inventory_query_details then inventory_query_details.visible = mode == Gui.inventory_query end
   if swap_details then swap_details.visible = mode == Gui.swap_order end
+  local runtime_window = window
+  if window and window.name == Gui.config_overlay_name then
+    runtime_window = window.parent and window.parent[Gui.name]
+  end
+  local runtime = runtime_window and find_descendant(runtime_window["bmsc-content"], "bmsc-runtime-page")
+  if runtime and runtime["bmsc-runtime-mode"] then
+    runtime["bmsc-runtime-mode"].caption = {"bmsc.runtime-mode", mode_caption(mode)}
+    runtime["bmsc-runtime-mode"].tooltip = mode_tooltip(mode)
+  end
+  local mode_select = find_descendant(content, "bmsc-mode")
+  if mode_select then mode_select.tooltip = mode_tooltip(mode) end
+end
 
+---按配置栏状态切换主窗口的紧凑/展开宽度，并保持窗口中心位置不跳动。
+local function set_config_window_width(window, config_visible)
+  local tags = window and window.tags or {}
+  local compact_width = tags.bmsc_compact_width
+  local expanded_width = tags.bmsc_expanded_width
+  if not (compact_width and expanded_width) then return end
+  local previous_width = config_visible and compact_width or expanded_width
+  local target_width = config_visible and expanded_width or compact_width
+  if target_width == previous_width then return end
+  local location = window.location
+  window.style.width = target_width
+  if location then
+    window.location = {x = location.x - math.floor((target_width - previous_width) / 2), y = location.y}
+  end
+end
+
+---主窗口被拖动时同步窄屏配置覆盖层，避免两个同生命周期窗口错位。
+---@param window LuaGuiElement 可能移动的主窗口。
+---@return nil
+function Gui.sync_config_overlay_location(window)
+  if not (window and window.valid and window.name == Gui.name and window.location) then return end
+  local overlay = window.parent and window.parent[Gui.config_overlay_name]
+  if overlay and overlay.valid and overlay.visible then
+    overlay.location = {x = window.location.x, y = window.location.y + 56}
+  end
+end
+
+---展开或收起参数栏，同时调整主窗口宽度；纯界面状态由 control.lua 按玩家保存。
+---@param source_element LuaGuiElement 参数栏按钮。
+---@return boolean 收起后是否需要立即刷新运行栏。
+---@return boolean|nil config_open 当前配置栏是否展开；无效页面返回 nil。
+function Gui.show_page(source_element, page)
+  local window = Gui.containing_window(source_element)
+  local content = window and window["bmsc-content"]
+  local runtime = content and find_descendant(content, "bmsc-runtime-page")
+  local config_column = content and content["bmsc-config-column"]
+  if page ~= "config" then return false, nil end
+  local overlay = window and window.parent[Gui.config_overlay_name]
+  if overlay then
+    overlay.visible = not overlay.visible
+    set_config_window_width(window, overlay.visible)
+    if overlay.visible and window.location then
+      overlay.location = {x = window.location.x, y = window.location.y + 56}
+    end
+    local switcher = window["bmsc-page-switcher"]
+    if switcher then switcher["bmsc-page-config"].toggled = overlay.visible end
+    return not overlay.visible, overlay.visible
+  end
+  if not (runtime and config_column) then return false, nil end
+  config_column.visible = not config_column.visible
+  set_config_window_width(window, config_column.visible)
+  runtime.visible = true
+  local switcher = window["bmsc-page-switcher"]
+  if switcher then
+    switcher["bmsc-page-config"].toggled = config_column.visible
+  end
+  return not config_column.visible, config_column.visible
 end
 
 local comparator_items = {"<", ">", "=", "≤", "≥", "≠"}
 local comparator_values = {"<", ">", "=", "<=", ">=", "~="}
-
-local function find_descendant(parent, name)
-  if not parent then return nil end
-  if parent.name == name then return parent end
-  for _, child in ipairs(parent.children) do
-    local found = find_descendant(child, name)
-    if found then return found end
-  end
-end
 
 local function set_condition_operand_style(input, fulfilled)
   input.style = fulfilled and "decider_combinator_fulfilled_signal_select_button"
@@ -1124,20 +1344,20 @@ end
 ---刷新各模式的只读计时框；调用方只传秒数，GUI 不读取任何运行记录。
 function Gui.refresh_timeout_elapsed(
   source_element, production_elapsed, material_wait_elapsed, recursion_elapsed, swap_elapsed)
-  local window = Gui.containing_window(source_element)
+  local window = config_window(Gui.containing_window(source_element))
   local content = window and window["bmsc-content"]
   if not content then return end
-  local production = content["bmsc-production-details"]
+  local production = find_descendant(content, "bmsc-production-details")
   local production_settings = production and production["bmsc-production-settings"]
   refresh_elapsed(production_settings and production_settings["bmsc-production-fields"],
     "bmsc-production-timeout", production_elapsed)
-  local recursion = content["bmsc-recursion-details"]
-  local recursion_settings = recursion and recursion["bmsc-recursion-settings"]
-  refresh_elapsed(recursion_settings and recursion_settings["bmsc-recursion-fields"],
+  local recursion = find_descendant(content, "bmsc-recursion-details")
+  local recursion_timeout = recursion and recursion["bmsc-recursion-timeout-settings"]
+  refresh_elapsed(recursion_timeout and recursion_timeout["bmsc-recursion-timeout-fields"],
     "bmsc-recursion-material-wait-time", material_wait_elapsed)
-  refresh_elapsed(recursion_settings and recursion_settings["bmsc-recursion-fields"],
+  refresh_elapsed(recursion_timeout and recursion_timeout["bmsc-recursion-timeout-fields"],
     "bmsc-recursion-timeout", recursion_elapsed)
-  local swap = content["bmsc-swap-details"]
+  local swap = find_descendant(content, "bmsc-swap-details")
   local swap_settings = swap and swap["bmsc-swap-settings"]
   refresh_elapsed(swap_settings and swap_settings["bmsc-swap-fields"],
     "bmsc-swap-timeout", swap_elapsed)
@@ -1145,7 +1365,7 @@ end
 
 ---刷新切换订单的蓝色条件满足态，不重建玩家正在操作的条件列表。
 function Gui.refresh_condition_states(source_element, set_name, fulfilled_conditions)
-  local window = Gui.containing_window(source_element)
+  local window = config_window(Gui.containing_window(source_element))
   local list = find_descendant(window, "bmsc-" .. set_name .. "-conditions")
   if not (list and list.visible) then return end
   for _, row in ipairs(list.children) do
@@ -1166,28 +1386,15 @@ end
 function Gui.set_recursion_single_options_visible(source_element, visible)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
-  local details = content and content["bmsc-recursion-details"]
+  local details = content and find_descendant(content, "bmsc-recursion-details")
   local settings = details and details["bmsc-recursion-settings"]
   local fields = settings and settings["bmsc-recursion-fields"]
-  if not fields then return end
-  for _, name in ipairs({
-    "bmsc-sequential-production-label", "bmsc-sequential-production",
-    "bmsc-recursion-material-wait-time-label", "bmsc-recursion-material-wait-time-controls",
-    "bmsc-recursion-timeout-label", "bmsc-recursion-timeout-controls",
-    "bmsc-recursion-timeout-monitor-item-changes-label",
-    "bmsc-recursion-timeout-monitor-item-changes"
-  }) do
-    local element = fields[name]
-    if element then element.visible = visible end
-  end
-  for _, name in ipairs({
-    "bmsc-recursion-timeout-conditions-label", "bmsc-recursion-timeout-conditions"
-  }) do
-    local element = details[name]
-    if element then element.visible = visible end
-  end
-  local sequential = fields["bmsc-sequential-production"]
-  Gui.set_sequence_restart_visible(source_element, visible and sequential and sequential.selected_index == 1)
+  local timeout = details and details["bmsc-recursion-timeout-settings"]
+  if not (fields and timeout) then return end
+  local sequential = find_descendant(fields, "bmsc-sequential-production")
+  if sequential then sequential.visible = visible end
+  timeout.visible = visible
+  Gui.set_sequence_restart_visible(source_element, visible and sequential and sequential.state == true)
 end
 
 ---只在启用顺序制作时显示“从头开始”按钮。
@@ -1197,14 +1404,10 @@ end
 function Gui.set_sequence_restart_visible(source_element, visible)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
-  local details = content and content["bmsc-recursion-details"]
+  local details = content and find_descendant(content, "bmsc-recursion-details")
   local settings = details and details["bmsc-recursion-settings"]
-  local fields = settings and settings["bmsc-recursion-fields"]
-  if not fields then return end
-  for _, name in ipairs({"bmsc-restart-sequence-spacer", "bmsc-restart-sequence"}) do
-    local element = fields[name]
-    if element then element.visible = visible end
-  end
+  local restart = settings and settings["bmsc-restart-sequence"]
+  if restart then restart.visible = visible end
 end
 
 ---只在生产订单的“所有（信号分离）”输出模式下显示缓存格数。
@@ -1214,7 +1417,7 @@ end
 function Gui.set_cache_grid_visible(source_element, visible)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
-  local details = content and content["bmsc-production-details"]
+  local details = content and find_descendant(content, "bmsc-production-details")
   local settings = details and details["bmsc-production-settings"]
   local fields = settings and settings["bmsc-production-fields"]
   if not fields then return end
@@ -1226,7 +1429,7 @@ end
 function Gui.set_recipe_query_cache_grid_visible(source_element, visible)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
-  local details = content and content["bmsc-recipe-query-details"]
+  local details = content and find_descendant(content, "bmsc-recipe-query-details")
   local settings = details and details["bmsc-recipe-query-settings"]
   local fields = settings and settings["bmsc-recipe-query-fields"]
   if not fields then return end
@@ -1243,9 +1446,9 @@ function Gui.sync_machine_buttons(source_element, machine_name)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
   if not content then return end
-  local production = content["bmsc-production-details"]
-  local recursion = content["bmsc-recursion-details"]
-  local recipe_query = content["bmsc-recipe-query-details"]
+  local production = find_descendant(content, "bmsc-production-details")
+  local recursion = find_descendant(content, "bmsc-recursion-details")
+  local recipe_query = find_descendant(content, "bmsc-recipe-query-details")
   local production_settings = production and production["bmsc-production-settings"]
   local recursion_settings = recursion and recursion["bmsc-recursion-settings"]
   local recipe_query_settings = recipe_query and recipe_query["bmsc-recipe-query-settings"]
@@ -1269,18 +1472,29 @@ end
 ---@param config table 已由业务层校验过的实体配置。
 ---@param current_output_networks table|nil control.lua 最近一次写入代理的输出快照。
 ---@param input_diagnostics table|nil 生产订单绿色输入信号的未输出原因。
+---@param work table|nil 控制层提供的当前工作快照。
 ---@param linked_inventory_available boolean|nil 是否显示关联箱自动库存校验选项。
+---@param config_open boolean|nil 玩家上次打开窗口时配置栏是否展开。
 ---@return LuaGuiElement frame 新创建的主窗口。
-function Gui.open(player, entity, config, current_output_networks, input_diagnostics, linked_inventory_available)
+function Gui.open(player, entity, config, current_output_networks, input_diagnostics, work,
+  linked_inventory_available, config_open)
   Gui.hide_network_popup(player)
   Gui.close_order_target(player, false)
   local old = player.gui.screen[Gui.name]
   if old then old.destroy() end
+  local old_overlay = player.gui.screen[Gui.config_overlay_name]
+  if old_overlay and old_overlay.valid then old_overlay.destroy() end
 
   local display_scale = player.display_scale > 0 and player.display_scale or 1
+  local logical_width = math.floor(player.display_resolution.width / display_scale)
+  local maximum_window_width = math.min(1280, math.max(320, logical_width - 80))
+  local compact_window_width = math.min(720, maximum_window_width)
   local maximum_window_height = math.floor(player.display_resolution.height / display_scale * 2 / 3)
+  local show_side_by_side = maximum_window_width >= 1040
+  config_open = config_open == true
   local frame = player.gui.screen.add{type = "frame", name = Gui.name, direction = "vertical"}
-  frame.style.width = 600                              -- 当前 480 的 1.25 倍，增加参数和信号展示空间。
+  frame.tags = {bmsc_compact_width = compact_window_width, bmsc_expanded_width = maximum_window_width}
+  frame.style.width = config_open and maximum_window_width or compact_window_width
   frame.style.maximal_height = maximum_window_height  -- 整个窗口最多占缩放后屏幕高度的三分之二。
   frame.force_auto_center()
 
@@ -1296,19 +1510,59 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     hovered_sprite = "utility/close_black", clicked_sprite = "utility/close_black",
     style = "frame_action_button", tooltip = {"gui.close"}}
 
-  -- 标题栏固定显示；其余内容超过窗口上限时统一在这里滚动。
-  local content = frame.add{type = "scroll-pane", name = "bmsc-content",
-    style = "shallow_scroll_pane", direction = "vertical",
-    horizontal_scroll_policy = "never", vertical_scroll_policy = "auto"}
+  -- 参数栏默认收起；展开后与运行信息并列，调参时无需离开当前订单和信号。
+  local pages = frame.add{type = "flow", name = "bmsc-page-switcher", direction = "horizontal"}
+  pages.style.horizontal_spacing = 4
+  pages.style.left_padding = 8
+  pages.style.bottom_padding = 4
+  pages.add{type = "button", name = "bmsc-page-config", caption = {"bmsc.config-page"},
+    tags = {bmsc_page = "config"}, toggled = config_open}
+
+  -- 宽屏用横向两栏；窄屏把配置栏提升为覆盖层，避免为了并排而压缩任一侧的控件。
+  local content = frame.add{type = "flow", name = "bmsc-content", direction = "horizontal"}
   content.style.horizontally_stretchable = true
   content.style.vertically_squashable = true
-  -- 所有直属子 GUI 统一与窗口边框留出空隙；右侧需额外避让纵向滚动条。
-  content.style.left_padding = 2
-  content.style.right_padding = 4
-  content.style.maximal_height = math.max(120, maximum_window_height - 40)
-  NetworkGui.settings(content, entity, config)
+  content.style.horizontal_spacing = 8
+  local column_height = math.max(120, maximum_window_height - 40)
+  local config_column
+  if show_side_by_side then
+    config_column = content.add{type = "scroll-pane", name = "bmsc-config-column",
+      style = "shallow_scroll_pane", direction = "vertical", visible = config_open,
+      horizontal_scroll_policy = "never", vertical_scroll_policy = "auto"}
+    config_column.style.minimal_width = 420
+    config_column.style.maximal_width = 420
+    config_column.style.maximal_height = column_height
+    config_column.style.vertically_squashable = true
+  end
+  local runtime_column = content.add{type = "scroll-pane", name = "bmsc-runtime-column",
+    style = "shallow_scroll_pane", direction = "vertical",
+    horizontal_scroll_policy = "auto", vertical_scroll_policy = "auto"}
+  runtime_column.style.maximal_height = column_height
+  runtime_column.style.horizontally_stretchable = true
+  runtime_column.style.vertically_squashable = true
+  local runtime_page = runtime_column.add{type = "flow", name = "bmsc-runtime-page", direction = "vertical"}
+  runtime_page.style.horizontally_stretchable = true
+  runtime_page.style.minimal_width = 580
 
-  local connections = content.add{type = "table", name = "bmsc-connections", column_count = 5}
+  if not show_side_by_side then
+    local overlay = player.gui.screen.add{type = "frame", name = Gui.config_overlay_name,
+      style = "inside_shallow_frame_with_padding", direction = "vertical", visible = config_open}
+    overlay.style.width = math.min(436, maximum_window_width)
+    overlay.style.maximal_height = column_height
+    if frame.location then overlay.location = {x = frame.location.x, y = frame.location.y + 56} end
+    local overlay_content = overlay.add{type = "flow", name = "bmsc-content", direction = "vertical"}
+    overlay_content.style.horizontally_stretchable = true
+    config_column = overlay_content.add{type = "scroll-pane", name = "bmsc-config-column",
+      style = "shallow_scroll_pane", direction = "vertical",
+      horizontal_scroll_policy = "never", vertical_scroll_policy = "auto"}
+    config_column.style.width = 420
+    config_column.style.maximal_height = column_height
+    config_column.style.vertically_squashable = true
+  end
+  local config_page = config_column.add{type = "flow", name = "bmsc-config-page", direction = "vertical"}
+  config_page.style.horizontally_stretchable = true
+
+  local connections = runtime_page.add{type = "table", name = "bmsc-connections", column_count = 5}
   connections.style.horizontally_stretchable = true
   connections.style.horizontal_spacing = 8
   connections.style.left_padding = 12
@@ -1322,8 +1576,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   connections.add{type = "label", caption = {"bmsc.output"}, style = "heading_2_label"}
   connections.add{type = "flow", name = "bmsc-output-status", direction = "horizontal"}
 
-  content.add{type = "line"}
-  local running = content.add{type = "flow", direction = "horizontal"}
+  runtime_page.add{type = "line"}
+  local running = runtime_page.add{type = "flow", direction = "horizontal"}
   running.style.vertical_align = "center"
   running.style.horizontal_spacing = 8
   running.style.left_padding = 12
@@ -1331,37 +1585,27 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   running.style.bottom_padding = 4
   -- 直接复用原版工作状态灯精灵；它比文字“●”更小，并自带原版的发光效果。
   running.add{type = "sprite", sprite = "utility/status_working"}
-  running.add{type = "label", caption = {"bmsc.normal-operation"}}
+  running.add{type = "label", name = "bmsc-runtime-mode",
+    caption = {"bmsc.runtime-mode", mode_caption(config.mode)}, tooltip = mode_tooltip(config.mode)}
+  add_work_panel(runtime_page)
+  Gui.add_signal_panel(runtime_page, player)
 
-  -- entity-preview 让游戏引擎渲染真实实体，方向、动画和品质都无需模组自行绘制。
-  local preview_frame = content.add{type = "frame", style = "inside_deep_frame"}
-  preview_frame.style.horizontally_stretchable = true
-  preview_frame.style.height = 160                     -- 参数：同步压缩预览区，保持窗口整体比例协调。
-  local preview = preview_frame.add{type = "entity-preview"}
-  preview.style.horizontally_stretchable = true
-  preview.style.vertically_stretchable = true
-  preview.entity = entity
-
-  local mode_area = content.add{type = "flow", direction = "vertical"}
-  mode_area.style.padding = 8                          -- 参数：缩小区域留白，让操作模式部分更紧凑。
+  local mode_area = config_page.add{type = "flow", direction = "vertical"}
+  mode_area.style.padding = 8
   local mode_fields = mode_area.add{type = "table", column_count = 2}
   mode_fields.style.horizontally_stretchable = true
-  -- 原版选择运算器使用醒目的“操作模式”标题；直接复用原版粗体标题样式。
   mode_fields.add{type = "label", caption = {"bmsc.mode"}, style = "heading_2_label"}
   mode_fields.add{type = "drop-down", name = "bmsc-mode",
     items = {{"bmsc.production-order"}, {"bmsc.supermarket-order"}, {"bmsc.recipe-query"},
       {"bmsc.inventory-query"}, {"bmsc.swap-order"}},
     selected_index = ({[Gui.production_order] = 1, [Gui.supermarket_order] = 2,
       [Gui.recipe_query] = 3, [Gui.inventory_query] = 4, [Gui.swap_order] = 5})[config.mode] or 1,
+    tooltip = mode_tooltip(config.mode)}
 
-    tooltip = {"bmsc.mode-tooltip"}}
+  -- 模式固定在最上方；网络、订单和超时分别由自己的 GUI 组件承载。
+  NetworkGui.settings(config_page, entity, config)
 
-  -- 功能说明紧跟操作模式，位置与原版对当前模式的解释文字一致。
-  local mode_description = mode_area.add{type = "label", caption = {"bmsc.wiring-help"}}
-  mode_description.style.single_line = false
-  mode_description.style.top_margin = 8
-
-  local details = content.add{type = "flow", name = "bmsc-production-details", direction = "vertical"}
+  local details = config_page.add{type = "flow", name = "bmsc-production-details", direction = "vertical"}
   details.style.horizontally_stretchable = true
   details.visible = config.mode == Gui.production_order
   details.add{type = "line"}
@@ -1369,7 +1613,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     style = "inside_shallow_frame_with_padding", direction = "vertical"}
   settings.style.horizontally_stretchable = true
   settings.add{type = "label", caption = {"bmsc.production-order-settings"}, style = "heading_2_label"}
-  local fields = settings.add{type = "table", name = "bmsc-production-fields", column_count = 2}
+  local fields = settings.add{type = "flow", name = "bmsc-production-fields", direction = "vertical"}
+  fields.style.horizontally_stretchable = true
   -- tooltip 是 Factorio GUI 元素的原生属性；鼠标停留在右侧输入控件时游戏自动显示说明。
   local production_machine = add_labeled(fields, {"bmsc.production-machine"}, {type = "choose-elem-button",
     name = "bmsc-production-machine", elem_type = "entity", entity = config.production_machine,
@@ -1405,19 +1650,16 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   -- 订单记忆属于运行状态而非配置值，提供独立按钮让玩家随时放弃当前缓存订单。
   settings.add{type = "button", name = "bmsc-clear-order-memory",
     caption = {"bmsc.clear-order-memory"}, tooltip = {"bmsc.clear-order-memory-tooltip"}}
-  -- 生产订单模式绑定公共信号面板。
-  Gui.add_signal_panel(details, player)
-
-  local recursion_details = content.add{type = "flow", name = "bmsc-recursion-details", direction = "vertical"}
+  local recursion_details = config_page.add{type = "flow", name = "bmsc-recursion-details", direction = "vertical"}
   recursion_details.style.horizontally_stretchable = true
   recursion_details.visible = config.mode == Gui.supermarket_order
-  recursion_details.add{type = "line"}
   local recursion_settings = recursion_details.add{
     type = "frame", name = "bmsc-recursion-settings",
     style = "inside_shallow_frame_with_padding", direction = "vertical"}
   recursion_settings.style.horizontally_stretchable = true
-  recursion_settings.add{type = "label", caption = {"bmsc.supermarket-order-settings"}, style = "heading_2_label"}
-  local recursion_fields = recursion_settings.add{type = "table", name = "bmsc-recursion-fields", column_count = 2}
+  recursion_settings.add{type = "label", caption = {"bmsc.order-params"}, style = "heading_2_label"}
+  local recursion_fields = recursion_settings.add{type = "flow", name = "bmsc-recursion-fields", direction = "vertical"}
+  recursion_fields.style.horizontally_stretchable = true
   recursion_fields.add{type = "label", caption = {"bmsc.production-machine"}}
   local recursion_machine_controls = recursion_fields.add{type = "flow", direction = "horizontal"}
   recursion_machine_controls.style.vertical_align = "center"
@@ -1436,55 +1678,56 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   for index, value in ipairs(validation_values) do
     if value == config.inventory_validation then selected_validation = index; break end
   end
-  recursion_machine_controls.add{type = "drop-down", name = "bmsc-inventory-validation",
+  local inventory_validation = recursion_machine_controls.add{type = "drop-down", name = "bmsc-inventory-validation",
     items = validation_items, selected_index = selected_validation,
     tooltip = {"bmsc.inventory-validation-tooltip"}}
-  add_numeric_slider(recursion_fields, {"bmsc.additional-rate"}, "bmsc-recursion-additional",
-    config.recursion_additional_production_rate, true, {"bmsc.recursion-additional-rate-tooltip"})
-  add_numeric_slider(recursion_fields, {"bmsc.material-rate"}, "bmsc-recursion-material",
-    config.recursion_material_demand_rate, true, {"bmsc.recursion-material-rate-tooltip"})
-  add_numeric_slider(recursion_fields, {"bmsc.material-retention-rate"},
-    "bmsc-recursion-material-retention", config.recursion_material_retention_rate or 1, true,
-    {"bmsc.recursion-material-retention-rate-tooltip"})
+  inventory_validation.style.width = 190
+  add_rate_range(recursion_fields, {"bmsc.generation-rate"}, "bmsc-recursion-additional",
+    "bmsc-recursion-additional-min", 0, config.recursion_additional_production_rate, true,
+    {"bmsc.recursion-additional-rate-tooltip"})
+  add_rate_range(recursion_fields, {"bmsc.material-range"}, "bmsc-recursion-material",
+    "bmsc-recursion-material-retention", config.recursion_material_retention_rate or 1,
+    config.recursion_material_demand_rate, false, {"bmsc.recursion-material-range-tooltip"})
   add_numeric_slider(recursion_fields, {"bmsc.recursion-depth"}, "bmsc-recursion-depth",
     config.recurise_depth, false, {"bmsc.recursion-depth-tooltip"})
-  add_labeled(recursion_fields, {"bmsc.output-mode"}, {type = "drop-down", name = "bmsc-recursion-output",
+  recursion_fields.add{type = "label", caption = {"bmsc.output-mode"}}
+  local output_controls = recursion_fields.add{
+    type = "flow", name = "bmsc-recursion-output-controls", direction = "horizontal"}
+  output_controls.style.vertical_align = "center"
+  output_controls.style.horizontal_spacing = 8
+  output_controls.add{type = "drop-down", name = "bmsc-recursion-output",
     items = {{"bmsc.single"}, {"bmsc.all"}}, selected_index = config.recursion_output_mode == "all" and 2 or 1,
-    tooltip = {"bmsc.recursion-output-mode-tooltip"}})
-  -- 顺序制作只对 single 有意义：启用后仅展开第一个库存未满足的订单。
+    tooltip = {"bmsc.recursion-output-mode-tooltip"}}
+  -- 顺序制作是单个输出的附加策略，复选框与输出模式同行且不清空既有选择。
   local timeout_visible = config.recursion_output_mode ~= "all"
-  recursion_fields.add{type = "label", name = "bmsc-sequential-production-label",
-    caption = {"bmsc.sequential-production"}, visible = timeout_visible}
-  recursion_fields.add{type = "drop-down", name = "bmsc-sequential-production",
-    items = {{"bmsc.yes"}, {"bmsc.no"}}, selected_index = config.sequential_production ~= false and 1 or 2,
+  output_controls.add{type = "checkbox", name = "bmsc-sequential-production",
+    caption = {"bmsc.sequential-production"}, state = config.sequential_production ~= false,
     tooltip = {"bmsc.sequential-production-tooltip"}, visible = timeout_visible}
   local restart_visible = timeout_visible and config.sequential_production ~= false
-  recursion_fields.add{type = "empty-widget", name = "bmsc-restart-sequence-spacer",
-    visible = restart_visible}
   recursion_fields.add{type = "button", name = "bmsc-restart-sequence",
     caption = {"bmsc.restart-sequence"}, tooltip = {"bmsc.restart-sequence-tooltip"},
     visible = restart_visible}
-  add_timeout_slider(recursion_fields, {"bmsc.material-wait-time"}, "bmsc-recursion-material-wait-time",
-    config.recursion_material_wait_time or 0, true, {"bmsc.material-wait-time-tooltip"}, timeout_visible,
-    "bmsc-recursion-material-wait-time-label")
-  -- 原料等待位于普通超时上方，两组计时参数随 single/all 模式一起显隐。
-  add_timeout_slider(recursion_fields, {"bmsc.recursion-timeout"}, "bmsc-recursion-timeout",
-    config.recursion_timeout or 0, true, {"bmsc.recursion-timeout-tooltip"}, timeout_visible,
-    "bmsc-recursion-timeout-label")
-  recursion_fields.add{type = "label", name = "bmsc-recursion-timeout-monitor-item-changes-label",
-    caption = {"bmsc.monitor-item-quantity-changes"}, visible = timeout_visible}
-  recursion_fields.add{
+
+  local timeout_settings = recursion_details.add{type = "frame", name = "bmsc-recursion-timeout-settings",
+    style = "inside_shallow_frame_with_padding", direction = "vertical", visible = timeout_visible}
+  timeout_settings.style.horizontally_stretchable = true
+  timeout_settings.add{type = "label", caption = {"bmsc.timeout-settings"}, style = "heading_2_label"}
+  local timeout_fields = timeout_settings.add{
+    type = "flow", name = "bmsc-recursion-timeout-fields", direction = "vertical"}
+  timeout_fields.style.horizontally_stretchable = true
+  add_timeout_slider(timeout_fields, {"bmsc.material-wait-time"}, "bmsc-recursion-material-wait-time",
+    config.recursion_material_wait_time or 0, true, {"bmsc.material-wait-time-tooltip"})
+  add_timeout_slider(timeout_fields, {"bmsc.recursion-timeout"}, "bmsc-recursion-timeout",
+    config.recursion_timeout or 0, true, {"bmsc.recursion-timeout-tooltip"})
+  timeout_fields.add{type = "label", caption = {"bmsc.monitor-item-quantity-changes"}}
+  timeout_fields.add{
     type = "drop-down", name = "bmsc-recursion-timeout-monitor-item-changes",
     items = {{"bmsc.yes"}, {"bmsc.no"}},
     selected_index = config.recursion_timeout_monitor_item_changes ~= false and 1 or 2,
-    tooltip = {"bmsc.monitor-item-quantity-changes-tooltip"}, visible = timeout_visible}
-  -- 重置条件与信号面板同为 recursion_details 的直接子元素，保证两块 GUI 紧邻显示。
-  add_conditions_editor(recursion_details, "recursion-timeout", {"bmsc.timeout-reset-conditions"},
-    config.recursion_timeout_conditions, timeout_visible)
-  -- 订单递归模式独立绑定同一个公共信号面板函数。
-  Gui.add_signal_panel(recursion_details, player)
-
-  local recipe_query_details = content.add{type = "flow", name = "bmsc-recipe-query-details", direction = "vertical"}
+    tooltip = {"bmsc.monitor-item-quantity-changes-tooltip"}}
+  add_conditions_editor(timeout_settings, "recursion-timeout", {"bmsc.timeout-reset-conditions"},
+    config.recursion_timeout_conditions)
+  local recipe_query_details = config_page.add{type = "flow", name = "bmsc-recipe-query-details", direction = "vertical"}
   recipe_query_details.style.horizontally_stretchable = true
   recipe_query_details.visible = config.mode == Gui.recipe_query
   recipe_query_details.add{type = "line"}
@@ -1494,7 +1737,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   recipe_query_settings.style.horizontally_stretchable = true
   recipe_query_settings.add{type = "label", caption = {"bmsc.recipe-query-settings"}, style = "heading_2_label"}
   local recipe_query_fields = recipe_query_settings.add{
-    type = "table", name = "bmsc-recipe-query-fields", column_count = 2}
+    type = "flow", name = "bmsc-recipe-query-fields", direction = "vertical"}
+  recipe_query_fields.style.horizontally_stretchable = true
   local recipe_query_machine = add_labeled(recipe_query_fields, {"bmsc.recipe-query-machine"}, {
     type = "choose-elem-button", name = "bmsc-recipe-query-machine", elem_type = "entity",
     entity = config.production_machine, tooltip = {"bmsc.recipe-query-machine-tooltip"}})
@@ -1507,10 +1751,7 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     "bmsc-recipe-query-cache-grid-number", config.recipe_query_cache_grid_number or 0, false,
     {"bmsc.recipe-query-cache-grid-number-tooltip"}, config.multiple_recipe_support,
     "bmsc-recipe-query-cache-grid-number-label")
-  -- 配方查询模式也展示输入产品及查询得到的直接原料信号。
-  Gui.add_signal_panel(recipe_query_details, player)
-
-  local inventory_query_details = content.add{
+  local inventory_query_details = config_page.add{
     type = "flow", name = "bmsc-inventory-query-details", direction = "vertical"}
   inventory_query_details.style.horizontally_stretchable = true
   inventory_query_details.visible = config.mode == Gui.inventory_query
@@ -1522,7 +1763,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   inventory_query_settings.add{
     type = "label", caption = {"bmsc.inventory-query-settings"}, style = "heading_2_label"}
   local inventory_query_fields = inventory_query_settings.add{
-    type = "table", name = "bmsc-inventory-query-fields", column_count = 2}
+    type = "flow", name = "bmsc-inventory-query-fields", direction = "vertical"}
+  inventory_query_fields.style.horizontally_stretchable = true
   add_labeled(inventory_query_fields, {"bmsc.query-type"}, {
     type = "drop-down", name = "bmsc-query-type",
     items = {{"bmsc.query-only-fluid"}, {"bmsc.query-only-item"}, {"bmsc.query-unrestricted"}},
@@ -1536,10 +1778,7 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     type = "drop-down", name = "bmsc-query-all",
     items = {{"bmsc.no"}, {"bmsc.yes"}}, selected_index = config.query_all and 2 or 1,
     tooltip = {"bmsc.query-all-tooltip"}})
-  -- 查询模式复用公共信号面板，展示作为查询条件的输入和共享区库存输出。
-  Gui.add_signal_panel(inventory_query_details, player)
-
-  local swap_details = content.add{type = "flow", name = "bmsc-swap-details", direction = "vertical"}
+  local swap_details = config_page.add{type = "flow", name = "bmsc-swap-details", direction = "vertical"}
   swap_details.style.horizontally_stretchable = true
   swap_details.visible = config.mode == Gui.swap_order
   swap_details.add{type = "line"}
@@ -1547,7 +1786,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     style = "inside_shallow_frame_with_padding", direction = "vertical"}
   swap_settings.style.horizontally_stretchable = true
   swap_settings.add{type = "label", caption = {"bmsc.swap-order-settings"}, style = "heading_2_label"}
-  local swap_fields = swap_settings.add{type = "table", name = "bmsc-swap-fields", column_count = 2}
+  local swap_fields = swap_settings.add{type = "flow", name = "bmsc-swap-fields", direction = "vertical"}
+  swap_fields.style.horizontally_stretchable = true
   add_labeled(swap_fields, {"bmsc.swap-output-mode"}, {type = "drop-down", name = "bmsc-swap-output-mode",
     items = {{"bmsc.swap-only-fluid"}, {"bmsc.swap-only-item"}, {"bmsc.swap-all"},
       {"bmsc.swap-all-with-signals"}},
@@ -1559,10 +1799,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   swap_settings.add{type = "button", name = "bmsc-clear-swap", caption = {"bmsc.clear-swap"},
     tooltip = {"bmsc.clear-swap-tooltip"}}
   add_conditions_editor(swap_settings, "swap", {"bmsc.timeout-reset-conditions"}, config.swap_conditions)
-  Gui.add_signal_panel(swap_details, player)
-
   -- 已保存的说明直接显示在配置界面内；内容支持 Factorio 富文本图标。
-  local saved_description = content.add{type = "flow", name = "bmsc-saved-description", direction = "vertical"}
+  local saved_description = config_page.add{type = "flow", name = "bmsc-saved-description", direction = "vertical"}
   saved_description.style.padding = 8
   saved_description.visible = entity.combinator_description ~= ""
   saved_description.add{type = "label", caption = {"bmsc.description"}, style = "heading_2_label"}
@@ -1570,12 +1808,12 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     type = "label", name = "bmsc-saved-description-text", caption = entity.combinator_description}
   saved_description_text.style.single_line = false
 
-  local footer = content.add{type = "flow", direction = "horizontal"}
+  local footer = config_page.add{type = "flow", direction = "horizontal"}
   footer.style.padding = 8
   footer.add{type = "button", name = "bmsc-description-toggle", caption = {"bmsc.add-description"}}
 
   -- 说明编辑器默认隐藏；点击“添加说明”后才展开，减少正常配置时的界面占用。
-  local description = content.add{type = "flow", name = "bmsc-description-editor", direction = "vertical"}
+  local description = config_page.add{type = "flow", name = "bmsc-description-editor", direction = "vertical"}
   description.visible = false
   description.style.padding = 8
   -- icon_selector=true 是 Factorio 2.1 的原生图标选择按钮，插入结果会作为富文本保存。
@@ -1587,7 +1825,7 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   actions.add{type = "button", name = "bmsc-description-cancel", caption = {"gui.cancel"}}
 
   player.opened = frame
-  Gui.refresh_connection_status(player, entity, current_output_networks, input_diagnostics)
+  Gui.refresh_connection_status(player, entity, current_output_networks, input_diagnostics, work)
   return frame
 end
 
@@ -1598,7 +1836,7 @@ end
 function Gui.show_description_editor(source_element, current_text)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
-  local editor = content and content["bmsc-description-editor"]
+  local editor = content and find_descendant(content, "bmsc-description-editor")
   if not editor then return end
   editor["bmsc-description-text"].text = current_text or ""
   editor.visible = true
@@ -1611,7 +1849,7 @@ end
 function Gui.get_description(source_element)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
-  local editor = content and content["bmsc-description-editor"]
+  local editor = content and find_descendant(content, "bmsc-description-editor")
   return editor and editor["bmsc-description-text"].text or nil
 end
 
@@ -1622,7 +1860,7 @@ end
 function Gui.refresh_saved_description(source_element, value)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
-  local display = content and content["bmsc-saved-description"]
+  local display = content and find_descendant(content, "bmsc-saved-description")
   if not display then return end
   display["bmsc-saved-description-text"].caption = value or ""
   display.visible = value ~= nil and value ~= ""
@@ -1634,7 +1872,7 @@ end
 function Gui.hide_description_editor(source_element)
   local window = Gui.containing_window(source_element)
   local content = window and window["bmsc-content"]
-  local editor = content and content["bmsc-description-editor"]
+  local editor = content and find_descendant(content, "bmsc-description-editor")
   if editor then editor.visible = false end
 end
 
@@ -1645,6 +1883,8 @@ end
 function Gui.close(player)
   Gui.hide_network_popup(player)
   Gui.close_order_target(player, false)
+  local overlay = player.gui.screen[Gui.config_overlay_name]
+  if overlay and overlay.valid then overlay.destroy() end
   local frame = player.gui.screen[Gui.name]
   player.opened = nil
   if frame and frame.valid then frame.destroy() end

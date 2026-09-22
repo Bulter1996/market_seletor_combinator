@@ -360,8 +360,10 @@ end
 
 function Network.release(key, force_index)
   for _, task in ipairs(Network.tasks(force_index)) do
-    if task.key == key and task.status == "waiting_transport" then
-      task.owner, task.pool, task.execution, task.finished_tick = nil, nil, nil, nil
+    if task.key == key then
+      -- 重新分配只撤销网络承诺；不能假定旧生产方尚未实际开始制造。
+      task.owner, task.pool, task.execution, task.finished_tick, task.current_recipe = nil, nil, nil, nil, nil
+      task.reserved_before, task.production_target, task.stock_reserved = nil, nil, nil
       task.status = "pending"
       return true
     end

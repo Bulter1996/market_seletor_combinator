@@ -19,6 +19,10 @@ data:extend({{
   type = "shortcut", name = "bmsc-production-network", action = "lua", style = "blue",
   icon = ENTITY_ICON, icon_size = 64, small_icon = ENTITY_ICON, small_icon_size = 64
 }, {
+  -- 订单网络监控是独立常驻窗口；默认 Y，可在控制设置中按玩家习惯改绑。
+  type = "custom-input", name = "bmsc-toggle-production-network", key_sequence = "Y",
+  consuming = "none", action = "lua"
+}, {
   -- 保留裸滚轮给树视图滚动；Option/Alt + 滚轮才缩放，避免全局抢占原版滚动行为。
   type = "custom-input", name = "bmsc-tree-zoom-in", key_sequence = "ALT + mouse-wheel-up",
   consuming = "game-only", action = "lua"

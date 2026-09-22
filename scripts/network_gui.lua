@@ -51,18 +51,27 @@ local function tree_window_size(player, view)
   return math.max(360, math.floor(display_width * 2 / 3)), math.max(240, math.floor(display_height / 2))
 end
 
-local function window(player, name, caption)
+local function window(player, name, caption, pinned)
   local old = player.gui.screen[name]
+  local location = old and old.location
   if old then old.destroy() end
-  local frame = player.gui.screen.add{type = "frame", name = name, direction = "vertical", caption = caption}
-  frame.force_auto_center()
+  local frame = player.gui.screen.add{type = "frame", name = name, direction = "vertical"}
+  if location then frame.location = location else frame.force_auto_center() end
   frame.style.maximal_height = math.max(240, math.floor(player.display_resolution.height / player.display_scale * 0.8))
-  local bar = frame.add{type = "flow", direction = "horizontal"}
+  local bar = frame.add{type = "flow", name = "bmsc-network-titlebar", direction = "horizontal"}
+  bar.drag_target = frame
+  bar.add{type = "label", caption = caption, style = "frame_title"}.drag_target = frame
+  local dragger = bar.add{type = "empty-widget", style = "draggable_space_header"}
+  dragger.style.horizontally_stretchable, dragger.style.height, dragger.drag_target = true, 24, frame
   bar.add{type = "button", caption = {"bmsc-net.refresh"}, tags = {bmsc_net_action = "refresh", window = name}}
-  bar.add{type = "button", caption = {"gui.close"}, tags = {bmsc_net_action = "close", window = name}}
+  local pin = bar.add{type = "sprite-button", name = "bmsc-network-pin", sprite = "utility/enter",
+    style = "frame_action_button", tooltip = {pinned and "bmsc-net.tree-unpin" or "bmsc-net.tree-pin"},
+    tags = {bmsc_net_action = "network-pin", window = name}}
+  pin.toggled = pinned == true
+  bar.add{type = "sprite-button", sprite = "utility/close", style = "frame_action_button",
+    tooltip = {"gui.close"}, tags = {bmsc_net_action = "close", window = name}}
   local content = frame.add{type = "scroll-pane", direction = "vertical", horizontal_scroll_policy = "auto"}
   content.style.maximal_height = math.max(180, frame.style.maximal_height - 100)
-  player.opened = frame
   return frame, content
 end
 
@@ -132,10 +141,74 @@ local function tree_window(player, view, record, signal, count)
   return frame, tree
 end
 
-local function location(records, unit)
-  local r = records[unit]
-  if r and r.entity.valid then return "#" .. unit .. " @ " .. r.entity.surface.name end
-  return unit and "#" .. unit or "—"
+local function signal_sprite(signal)
+  local kind = signal.type == "recipe" and "recipe" or signal.type == "fluid" and "fluid" or "item"
+  return kind .. "/" .. signal.name
+end
+
+local function combinator_display(records, unit)
+  local record = unit and records[unit]
+  if not (record and record.entity.valid) then return "—" end
+  local machine_name = record.config and record.config.production_machine
+  local machine = machine_name and prototypes.entity[machine_name]
+  local caption = {"", machine and machine.localised_name or {"bmsc-net.machine-unavailable"}, "[", unit, "]"}
+  local entity = record.entity
+  local tooltip = {"bmsc-net.combinator-help", machine and machine.localised_name or {"bmsc-net.machine-unavailable"},
+    unit, entity.surface.name, math.floor(entity.position.x), math.floor(entity.position.y)}
+  return caption, tooltip
+end
+
+local function network_rows(tasks, folded)
+  local by_key, children, roots = {}, {}, {}
+  for _, task in ipairs(tasks) do by_key[task.key] = task end
+  for _, task in ipairs(tasks) do
+    if task.parent and by_key[task.parent] and task.parent ~= task.key then
+      children[task.parent] = children[task.parent] or {}
+      children[task.parent][#children[task.parent] + 1] = task
+    else
+      roots[#roots + 1] = task
+    end
+  end
+  local rows, visited = {}, {}
+  local function visit(task, branches, is_last, depth)
+    if visited[task.key] then return end
+    visited[task.key] = true
+    rows[#rows + 1] = {task = task, branches = branches, is_last = is_last, depth = depth,
+      has_children = children[task.key] ~= nil}
+    if folded[task.key] then return end
+    local descendants = children[task.key] or {}
+    local next_branches = {}
+    for index, branch in ipairs(branches) do next_branches[index] = branch end
+    if depth > 0 then next_branches[#next_branches + 1] = not is_last end
+    for index, child in ipairs(descendants) do visit(child, next_branches, index == #descendants, depth + 1) end
+  end
+  for index, task in ipairs(roots) do visit(task, {}, index == #roots, 0) end
+  -- 旧存档若留下损坏的父链，仍显示任务，避免整个环形分支从监控窗口消失。
+  for _, task in ipairs(tasks) do if not visited[task.key] then visit(task, {}, true, 0) end end
+  return rows
+end
+
+local function add_order_cell(grid, row, folded)
+  local order = grid.add{type = "flow", direction = "horizontal"}
+  order.style.horizontal_spacing, order.style.vertical_align = 0, "center"
+  for _, has_next in ipairs(row.branches) do
+    local branch = order.add{type = "label", caption = has_next and "│" or " "}
+    branch.style.width, branch.style.horizontal_align = 18, "center"
+  end
+  if row.depth > 0 then
+    local joint = order.add{type = "label", caption = row.is_last and "└" or "├"}
+    joint.style.width, joint.style.horizontal_align = 18, "center"
+  end
+  if row.has_children then
+    local fold = order.add{type = "button", caption = folded[row.task.key] and "+" or "−",
+      style = "frame_action_button", tags = {bmsc_net_action = "fold", task = row.task.key}}
+    fold.style.width, fold.style.height = 28, 28
+  else
+    local spacer = order.add{type = "empty-widget"}
+    spacer.style.width, spacer.style.height = 28, 28
+  end
+  order.add{type = "sprite-button", sprite = signal_sprite(row.task.signal),
+    elem_tooltip = row.task.signal, style = "slot_button"}
 end
 
 function UI.refresh_network(player, records)
@@ -145,6 +218,11 @@ function UI.refresh_network(player, records)
   for _, task in ipairs(Network.tasks(player.force.index)) do
     parts[#parts + 1] = task.id .. ":" .. task.quantity .. ":" .. tostring(task.owner)
       .. ":" .. task.status .. ":" .. tostring(task.current_recipe) .. ":" .. tostring(task.blocked)
+      .. ":" .. tostring(task.parent)
+      .. ":" .. tostring(records[task.source] and records[task.source].config
+        and records[task.source].config.production_machine)
+      .. ":" .. tostring(task.owner and records[task.owner] and records[task.owner].config
+        and records[task.owner].config.production_machine)
   end
   local signature = table.concat(parts, "|")
   if view.network_signature ~= signature then
@@ -157,47 +235,34 @@ function UI.open_network(player, records)
   local view = views()[player.index] or {}
   views()[player.index] = view
   view.folded = view.folded or {}
-  local _, content = window(player, UI.name, {"bmsc-net.title"})
+  local frame, content = window(player, UI.name, {"bmsc-net.title"}, view.network_pinned)
+  if not view.network_pinned then player.opened = frame end
   local tasks = Network.tasks(player.force.index)
   local counts, qty = {}, 0
-  local by_key = {}
   for _, task in ipairs(tasks) do
     counts[task.status] = (counts[task.status] or 0) + 1
     qty = qty + task.quantity
-    by_key[task.key] = task
   end
   content.add{type = "label", caption = {"bmsc-net.summary", #tasks, qty,
     counts.pending or 0, (counts.assigned or 0) + (counts.producing or 0),
     counts.waiting_materials or 0, counts.waiting_transport or 0}}
-  local grid = content.add{type = "table", column_count = 8}
-  for _, key in ipairs({"task", "product", "quantity", "source", "owner", "recipe", "status", "actions"}) do
+  local grid = content.add{type = "table", column_count = 6}
+  for _, key in ipairs({"task", "quantity", "source", "owner", "status", "actions"}) do
     grid.add{type = "label", caption = {"bmsc-net." .. key}, style = "heading_2_label"}
   end
-  for _, task in ipairs(tasks) do
-    local parent, hidden, depth = task.parent, false, 0
-    while parent and by_key[parent] and depth < 16 do
-      if view.folded[parent] then hidden = true end
-      parent, depth = by_key[parent].parent, depth + 1
+  for _, row in ipairs(network_rows(tasks, view.folded)) do
+    local task = row.task
+    add_order_cell(grid, row, view.folded)
+    grid.add{type = "label", caption = tostring(task.quantity) .. " / " .. tostring(task.owner and task.quantity or 0)}
+    for _, unit in ipairs({task.source, task.owner or 0}) do
+      local target = unit ~= 0 and records[unit] or nil
+      local caption, tooltip = combinator_display(records, target and unit or nil)
+      grid.add{type = "button", caption = caption, tooltip = tooltip,
+        enabled = target and target.entity.valid or false, tags = {bmsc_net_action = "locate", unit = unit}}
     end
-    if not hidden then
-      grid.add{type = "button", caption = string.rep("  ", depth) .. (view.folded[task.key] and "+ " or "− ") .. task.id,
-        tags = {bmsc_net_action = "fold", task = task.key}}
-      grid.add{type = "sprite-button", sprite = (task.signal.type or "item") .. "/" .. task.signal.name,
-        elem_tooltip = task.signal, number = task.quantity, style = "slot_button"}
-      grid.add{type = "label", caption = tostring(task.quantity) .. " / " .. tostring(task.owner and task.quantity or 0)}
-      for _, unit in ipairs({task.source, task.owner or 0}) do
-        grid.add{type = "button", caption = location(records, unit ~= 0 and unit or nil),
-          enabled = records[unit] ~= nil, tags = {bmsc_net_action = "locate", unit = unit}}
-      end
-      local recipe = task.current_recipe and task.current_recipe:match("^recipe:(.+)$")
-      if recipe and prototypes.recipe[recipe] then
-        grid.add{type = "sprite-button", sprite = "recipe/" .. recipe, style = "slot_button",
-          elem_tooltip = {type = "recipe", name = recipe}}
-      else grid.add{type = "label", caption = "—"} end
-      grid.add{type = "label", caption = {"bmsc-net." .. (task.blocked or task.status)}}
-      grid.add{type = "button", caption = {"bmsc-net.release"}, enabled = task.status == "waiting_transport",
-        tooltip = {"bmsc-net.release-help"}, tags = {bmsc_net_action = "release", task = task.key}}
-    end
+    grid.add{type = "label", caption = {"bmsc-net." .. (task.blocked or task.status)}}
+    grid.add{type = "button", caption = {"bmsc-net.release"}, tooltip = {"bmsc-net.release-help"},
+      tags = {bmsc_net_action = "release", task = task.key}}
   end
 end
 
@@ -554,6 +619,12 @@ function UI.on_closed(event, records)
     end
     return true
   end
+  if event.element.name == UI.name then
+    local view = views()[player.index]
+    if view and view.network_pinned then return true end
+    event.element.destroy()
+    return true
+  end
   if event.element.name == UI.tree_name then
     local policy = player.gui.screen[UI.policy_name]
     -- 打开独立配置浮层会让 tree 失去 opened 焦点并触发此事件；这不是关闭树。
@@ -630,16 +701,34 @@ function UI.on_click(event, records)
     end
     local frame = player.gui.screen[tags.window]
     if frame then frame.destroy() end
-    player.opened = player.gui.screen["bmsc-window"]
+    if tags.window ~= UI.name then player.opened = player.gui.screen["bmsc-window"] end
   elseif action == "locate" then
     local r = records[tags.unit]
     if r and r.entity.valid and r.entity.force == player.force then
-      player.set_controller{type = defines.controllers.remote, position = r.entity.position, surface = r.entity.surface}
-      player.zoom = LOCATE_ZOOM
+      if event.button == defines.mouse_button_type.right then
+        player.set_controller{type = defines.controllers.remote, position = r.entity.position, surface = r.entity.surface}
+        player.zoom = LOCATE_ZOOM
+      else
+        player.opened = r.entity
+      end
     end
   elseif action == "release" then
     Network.release(tags.task, player.force.index)
     UI.open_network(player, records)
+  elseif action == "network-pin" and tags.window == UI.name then
+    local frame = player.gui.screen[UI.name]
+    if frame and frame.valid then
+      view.network_pinned = not view.network_pinned
+      local pin = frame["bmsc-network-titlebar"]["bmsc-network-pin"]
+      pin.toggled = view.network_pinned
+      pin.tooltip = {view.network_pinned and "bmsc-net.tree-unpin" or "bmsc-net.tree-pin"}
+      if view.network_pinned then
+        if player.opened == frame then player.opened = nil end
+        frame.bring_to_front()
+      else
+        player.opened = frame
+      end
+    end
   elseif action == "fold" then
     view.folded[tags.task] = not view.folded[tags.task]
     UI.open_network(player, records)

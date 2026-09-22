@@ -39,6 +39,7 @@ local function element()
     return child
   end
   e.force_auto_center = function() end
+  e.bring_to_front = function() e.brought_to_front = true end
   e.destroy = function() e.valid = false end
   e.clear = function()
     for _, child in ipairs(e.children) do if child.name then e[child.name] = nil end end
@@ -166,9 +167,50 @@ UI.open_tree(player, record, {type = "item", name = "plate"}, 1)
 numbered = {}
 for _, slot in ipairs(sprites(player.gui.screen[UI.tree_name])) do if slot.number ~= nil then numbered[#numbered + 1] = slot end end
 assert(#numbered == 2, "a limited recursion tree must retain its boundary output but omit deeper descendants")
-assert(UI.on_click({player_index = 1, element = {tags = {bmsc_net_action = "locate", unit = 1}}}, {[1] = record}))
-assert(player.remote_controller.position == record.entity.position and player.zoom == 0.5,
-  "locating a combinator must use a readable remote zoom instead of the closest view")
+storage.combinators = {[1] = record}
+storage.bmsc_production_network = {tasks = {network_1 = {
+  id = 1, key = "network_1", source = 1, owner = 1, signal = {type = "item", name = "plate"},
+  quantity = 10, status = "assigned"
+}, network_2 = {
+  id = 2, key = "network_2", parent = "network_1", source = 1, signal = {type = "item", name = "ore"},
+  quantity = 5, status = "pending"
+}}}
+UI.open_network(player, {[1] = record})
+local monitor = player.gui.screen[UI.name]
+local pin = monitor["bmsc-network-titlebar"]["bmsc-network-pin"]
+assert(player.opened == monitor and not pin.toggled and pin.tooltip[1] == "bmsc-net.tree-pin",
+  "an unpinned network monitor must use the standard opened lifecycle and show an inactive pin")
+assert(UI.on_click({player_index = 1, element = pin}, {[1] = record})
+  and storage.bmsc_network_views[1].network_pinned and pin.toggled and monitor.brought_to_front
+  and player.opened == nil, "pinning the network monitor must visibly detach it from the opened lifecycle")
+assert(UI.on_closed({player_index = 1, element = monitor}, {[1] = record}) and monitor.valid,
+  "a pinned network monitor must survive interactions with other game GUIs")
+assert(UI.on_click({player_index = 1, element = pin}, {[1] = record})
+  and not storage.bmsc_network_views[1].network_pinned and not pin.toggled and player.opened == monitor,
+  "unpinning the network monitor must restore the standard opened lifecycle")
+assert(UI.on_closed({player_index = 1, element = monitor}, {[1] = record}) and not monitor.valid,
+  "Esc or opening another GUI must close an unpinned network monitor")
+UI.open_network(player, {[1] = record})
+monitor = player.gui.screen[UI.name]
+local network_grid = monitor.children[2].children[2]
+local root_order, child_order = network_grid.children[7], network_grid.children[13]
+assert(root_order.children[1].caption == "−" and root_order.children[2].sprite == "item/plate"
+  and child_order.children[1].caption == "└" and child_order.children[3].sprite == "item/ore",
+  "network orders must render as an icon-only parent-child tree")
+local requester = network_grid.children[9]
+assert(requester.caption[2] == "Assembler" and requester.caption[4] == 1
+  and requester.tooltip[1] == "bmsc-net.combinator-help",
+  "requester and producer buttons must show the configured machine name and combinator number")
+assert(UI.on_click({player_index = 1, button = defines.mouse_button_type.left,
+  element = {tags = {bmsc_net_action = "locate", unit = 1}}}, {[1] = record}) and player.opened == record.entity,
+  "left-clicking a requester or producer must open its combinator")
+assert(UI.on_closed({player_index = 1, element = monitor}, {[1] = record}) and not monitor.valid,
+  "opening a combinator must close an unpinned network monitor")
+UI.open_network(player, {[1] = record})
+assert(UI.on_click({player_index = 1, button = defines.mouse_button_type.right,
+  element = {tags = {bmsc_net_action = "locate", unit = 1}}}, {[1] = record}))
+assert(player.remote_controller.position == record.entity.position and player.zoom == 1,
+  "right-clicking a requester or producer must locate it at a readable remote zoom")
 record.config.recurise_depth = 0
 record.config.inventory_validation = nil
 UI.open_policy(player, record, {type = "item", name = "plate"}, {x = 400, y = 160})

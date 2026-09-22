@@ -184,7 +184,12 @@ storage.combinators[old_owner].entity.valid = false
 tick()
 assert(first.owner == old_owner and first.status == "waiting_transport", "demolishing producer must not duplicate in-transit delivery")
 assert(not Network.release(first.key, 2), "other force cannot release task")
+first.status, first.execution, first.current_recipe = "producing", {}, "recipe:plate"
+first.reserved_before, first.production_target, first.stock_reserved = 3, 10, 10
 assert(Network.release(first.key, 1))
+assert(first.status == "pending" and not first.owner and not first.execution and not first.current_recipe
+  and not first.reserved_before and not first.production_target and not first.stock_reserved,
+  "reassigning must work for any active task and discard its old supplier execution state")
 
 -- 已分配但尚未完成的生产者失效后，唯一任务可重新分配。
 storage.bmsc_production_network = nil; storage.combinators = {}

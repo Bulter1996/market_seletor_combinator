@@ -1447,6 +1447,16 @@ script.on_event(defines.events.on_lua_shortcut, function(event)
   end
 end)
 
+-- `/c game.reload_mods()` 只会重载 control 阶段；若 data 阶段的新快捷键尚未载入，
+-- 注册不存在的事件会中止热重载。完整重启后原型存在，Y 即正常生效。
+if prototypes.custom_input["bmsc-toggle-production-network"] then
+  script.on_event("bmsc-toggle-production-network", function(event)
+    local player = game.get_player(event.player_index)
+    local frame = player.gui.screen[NetworkGui.name]
+    if frame then frame.destroy() else NetworkGui.open_network(player, state().combinators) end
+  end)
+end
+
 if TICK_INTERVAL == 30 then
   script.on_nth_tick(30, function()
     update_all()

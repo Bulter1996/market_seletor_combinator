@@ -26,3 +26,10 @@ switch_worktree.sh
 
 # 本地图片处理临时脚本，不属于模组源码
 /tmp.py
+
+# codegraph生成的数据库分析文件
+.codegraph/
+export-codegraph-gephi.sh
+codegraph-gephi-export/
+
+

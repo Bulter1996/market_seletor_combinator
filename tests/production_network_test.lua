@@ -27,7 +27,9 @@ local function sig(name) return {type = "item", name = name, quality = "normal"}
 local function key(name) return "item:" .. name .. ":normal" end
 local function entries(values)
   local result = {}
-  for name, count in pairs(values) do result[#result + 1] = {signal = sig(name), count = count} end
+  for name, count in pairs(values) do
+    result[#result + 1] = type(name) == "number" and count or {signal = sig(name), count = count}
+  end
   return result
 end
 local function record(unit, machine, red, green, pool)
@@ -49,6 +51,11 @@ local function tick()
     if r then r.output = Mode.calculate(r) end
   end
 end
+local migrated_priority = Config.normalize{network_priority = 7}
+assert(migrated_priority.network_publish_priority == 7 and migrated_priority.network_accept_priority == 7,
+  "legacy network priority must migrate to both independent priorities")
+assert(Config.default().network_publish_priority == 5 and Config.default().network_accept_priority == 5,
+  "new network priorities default to five")
 local a = record(1, "assembler", {}, {gear = 10})
 local b = record(2, "furnace", {ore = 100}, {})
 tick(); tick()
@@ -57,7 +64,23 @@ assert(task and task.signal.name == "plate" and task.owner == 2, "machine-capabl
 assert(b.output["recipe:plate"], "assigned demand executes real recipe")
 assert(#Network.tasks(1) == 1, "one request per source/material")
 
+-- 网络根订单可以直接使用配方信号；承接资格仍须按承接方机器解析出的产品判断。
+storage.bmsc_production_network = nil; storage.combinators = {}
+local recipe_signal = {type = "recipe", name = "plate"}
+a = record(1, "assembler", {}, {{signal = recipe_signal, count = 10}})
+b = record(2, "furnace", {ore = 100}, {})
+a.network_requests = {recipe = {source = 1, root = "recipe:plate", signal = recipe_signal, quantity = 10}}
+tick()
+task = Network.tasks(1)[1]
+assert(task and task.owner == 2 and b.output["recipe:plate"],
+  "a recipe-signal network task must use the accepting machine's recipe")
+
 -- 网络节点运行期间，本地订单恢复不抢占；完成当前节点后返回本地。
+storage.bmsc_production_network = nil; storage.combinators = {}
+a = record(1, "assembler", {}, {gear = 10})
+b = record(2, "furnace", {ore = 100}, {})
+tick(); tick()
+task = Network.tasks(1)[1]
 b.green = {widget = 5}; b.red.fuel = 50
 tick()
 assert(b.output["recipe:plate"], "local recovery must not preempt active network node")

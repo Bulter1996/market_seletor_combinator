@@ -36,9 +36,11 @@ local function can_accept(source, provider, task)
     or provider.entity.force.index ~= source.entity.force.index then return false end
   if source.entity.surface.index ~= provider.entity.surface.index
     and not (source.config.network_export and provider.config.network_import) then return false end
-  local fallback = Target.resolve(provider.entity.force, provider.config.production_machine, task.signal, provider.config).recipe
-  local recipe = Policy.choose(provider, task.signal, provider.network_red or {}, fallback)
-  return Policy.legal(provider, recipe, task.signal)
+  -- 配方信号必须先按承接方机器解析成实际产物；直接把 recipe 信号交给
+  -- recipe_product_amount 会得到 0，进而把可承接的任务误判为“无配方”。
+  local target = Target.resolve(provider.entity.force, provider.config.production_machine, task.signal, provider.config)
+  local recipe = Policy.choose(provider, target.signal, provider.network_red or {}, target.recipe)
+  return Policy.legal(provider, recipe, target.signal)
 end
 
 local function add(t, key, qty) t[key] = (t[key] or 0) + qty end
@@ -133,8 +135,8 @@ function Network.prepare(records)
   local tasks = {}
   for _, task in pairs(s.tasks) do tasks[#tasks + 1] = task end
   table.sort(tasks, function(a, b)
-    local pa = records[a.source] and records[a.source].config.network_priority or 0
-    local pb = records[b.source] and records[b.source].config.network_priority or 0
+    local pa = records[a.source] and records[a.source].config.network_publish_priority or 5
+    local pb = records[b.source] and records[b.source].config.network_publish_priority or 5
     if pa ~= pb then return pa > pb end
     return a.id < b.id
   end)
@@ -142,7 +144,7 @@ function Network.prepare(records)
   local transport_stock = {}
   for _, task in ipairs(tasks) do
     local source, owner = records[task.source], records[task.owner]
-    task.priority = valid(source) and source.config.network_priority or 0
+    task.priority = valid(source) and (source.config.network_publish_priority or 5) or 5
     if task.status ~= "waiting_transport" and task.owner and (not valid(source) or not can_accept(source, owner, task)) then
       task.owner, task.pool, task.execution = nil, nil, nil
       task.status = "pending"
@@ -171,8 +173,8 @@ function Network.prepare(records)
       for _, unit in ipairs(units) do
         local r = records[unit]
         if can_accept(source, r, task) and (not best
-          or r.config.network_priority > best.config.network_priority
-          or r.config.network_priority == best.config.network_priority
+          or (r.config.network_accept_priority or 5) > (best.config.network_accept_priority or 5)
+          or (r.config.network_accept_priority or 5) == (best.config.network_accept_priority or 5)
             and #r.network_assignments < #best.network_assignments) then best = r end
       end
       if best then
@@ -329,7 +331,7 @@ function Network.calculate(record, calculate)
   end)
   if not selected then
     if executable(local_output) and (old_local_key and local_output[old_local_key]
-      or not candidates[1] or candidates[1].task.priority <= record.config.network_priority) then selected = local_output
+      or not candidates[1] or candidates[1].task.priority <= (record.config.network_accept_priority or 5)) then selected = local_output
     elseif candidates[1] then selected, selected_task = candidates[1].outputs, candidates[1].task end
   end
   record.network_requests = requests

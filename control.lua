@@ -130,10 +130,13 @@ local function current_work_summary(record)
   -- “当前订单”只承载单一工作项；全量输出同时处理多个订单时，避免 pairs 的偶然顺序制造误导。
   if active_count ~= 1 then current = nil end
   local network_orders = {}
+  local network_diagnostics = {}
   for _, task in ipairs(record.network_assignments or {}) do
     if task.signal and task.quantity and task.quantity > 0 then
       network_orders[#network_orders + 1] = {signal = Util.make_signal(
         task.signal.type, task.signal.name, task.signal.quality), count = task.quantity}
+      local diagnostic = task.execution and task.execution.supermarket_order_diagnostics
+      if diagnostic then network_diagnostics[Util.signal_key(task.signal)] = diagnostic[Util.signal_key(task.signal)] end
     end
   end
   local linked_inventory = {}
@@ -154,7 +157,7 @@ local function current_work_summary(record)
     end
   end
   return {current = current, next = next_key and diagnostics[next_key] or nil, source = source,
-    network_orders = network_orders, linked_inventory = linked_inventory}
+    network_orders = network_orders, network_diagnostics = network_diagnostics, linked_inventory = linked_inventory}
 end
 
 ---销毁某条记录的全部隐藏输出代理。
@@ -746,10 +749,10 @@ local function copy_products(products)
   return result
 end
 
-local function open_order_target(player, record, order_signal, order_count)
+local function open_order_target(player, record, order_signal, order_count, network_task)
   if record.config.mode == MODE_SUPERMARKET_ORDER then
-    MODES[MODE_SUPERMARKET_ORDER].calculate(record)
-    NetworkGui.open_tree(player, record, order_signal, order_count)
+    if not network_task then MODES[MODE_SUPERMARKET_ORDER].calculate(record) end
+    NetworkGui.open_tree(player, record, order_signal, order_count, network_task)
     return
   end
   local recipe_query = record.config.mode == MODE_RECIPE_QUERY
@@ -1011,6 +1014,7 @@ script.on_event(defines.events.on_gui_value_changed, function(event)
   if accepted then invalidate_numeric_runtime_state(record, textfield.name) end
 end)
 script.on_event(defines.events.on_gui_selection_state_changed, function(event)
+  if NetworkGui.on_selection(event, state().combinators) then return end
   local event_tags = event.element.tags or {}
   if event_tags.bmsc_swap_comparator and event_tags.bmsc_condition_set then
     local record = current_record(event.player_index)
@@ -1234,7 +1238,21 @@ script.on_event(defines.events.on_gui_click, function(event)
           and record.config.mode == MODE_RECIPE_QUERY) then
       local order_signal = signal_from_tags(tags)
       if order_signal and Util.is_recipe_input(order_signal) then
-        open_order_target(player, record, order_signal, event.element.number or 0)
+        local network_task
+        if tags.bmsc_signal_source == "network-order" then
+          for _, task in ipairs(record.network_assignments or {}) do
+            if task.key == record.network_active and Util.signal_key(task.signal) == tags.bmsc_signal_key then
+              network_task = task.key
+              break
+            end
+          end
+          if not network_task then
+            for _, task in ipairs(record.network_assignments or {}) do
+              if Util.signal_key(task.signal) == tags.bmsc_signal_key then network_task = task.key; break end
+            end
+          end
+        end
+        open_order_target(player, record, order_signal, event.element.number or 0, network_task)
       end
     elseif event.button == defines.mouse_button_type.right and tags.bmsc_signal_side == "input"
       and tags.bmsc_signal_source == "local-order"

@@ -864,7 +864,7 @@ function Gui.refresh_signal_panel(signals, input_networks, output_networks, inpu
   work = work or {}
   refresh_signal_section(signals["bmsc-network-order-signals"], {
     {color = "green", signals = work.network_orders or {}}
-  }, nil, "network-order")
+  }, work.network_diagnostics, "network-order")
   refresh_signal_section(signals["bmsc-local-green-signals"], green, input_diagnostics, "local-order")
   refresh_signal_section(signals["bmsc-local-red-signals"], red, nil, "local-stock")
   refresh_signal_section(signals["bmsc-linked-inventory-signals"], {

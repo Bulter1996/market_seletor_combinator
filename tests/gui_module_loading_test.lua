@@ -147,6 +147,15 @@ assert(numbered[#numbered - 1].number == 1 and numbered[#numbered].number == 4,
 assert(numbered[#numbered].style_name == "red_circuit_network_content_slot",
   "an empty red inventory input is a valid zero stock and must be shown as insufficient")
 assert(has_connector(player.gui.screen[UI.tree_name]), "tree must draw connectors between recipe products and ingredients")
+-- 网络订单的计划保存在任务执行上下文，树窗口不能回退读取本地订单计划。
+record.network_assignments = {{key = "network-1", execution = {entity = record.entity, config = record.config,
+  network_observed_inventory = {}, supermarket_order_plan = {roots = {{source_key = "item:ore:normal",
+    signal = {type = "item", name = "ore"}, product_amount = 1, recipe_name = "chance", children = {}}}}}}}
+UI.open_tree(player, record, {type = "item", name = "ore"}, 2, "network-1")
+assert(storage.bmsc_network_views[1].network_task == "network-1"
+  and player.gui.screen[UI.tree_name]["bmsc-tree-content"].children[1].type == "table",
+  "network order must render its execution plan instead of the local plan")
+record.network_assignments = nil
 record.config.recurise_depth = 1
 record.entity.position, record.entity.surface = {x = 10, y = 20}, {index = 1, name = "nauvis"}
 record.supermarket_order_plan = {roots = {{source_key = "item:plate:normal", level = 1,
@@ -367,6 +376,17 @@ assert(UI.on_click({player_index = 1, element = {tags = {bmsc_net_action = "tree
 assert(storage.bmsc_network_views[1].collapsed["0"], "collapse-all must collapse the root branch")
 assert(UI.on_click({player_index = 1, element = {tags = {bmsc_net_action = "tree-expand-all"}}}, {[1] = record}))
 assert(not next(storage.bmsc_network_views[1].collapsed), "expand-all must clear all collapsed branches")
+assert(UI.on_selection({player_index = 1, element = {selected_index = 3,
+  tags = {bmsc_net_config = "network_publish", unit = 1}}}, {[1] = record}))
+assert(record.config.network_publish and record.config.network_export,
+  "cross-planet publishing must set the existing network flags together")
+assert(UI.on_selection({player_index = 1, element = {selected_index = 2,
+  tags = {bmsc_net_config = "network_accept", unit = 1}}}, {[1] = record}))
+assert(record.config.network_accept and not record.config.network_import,
+  "same-planet acceptance must not enable cross-planet imports")
+assert(UI.on_text({player_index = 1, element = {text = "8", tags = {
+  bmsc_net_field = "network_publish_priority", unit = 1}}}, {[1] = record}))
+assert(record.config.network_publish_priority == 8, "publish priority must save independently")
 assert(UI.on_text({player_index = 1, element = {text = "3", tags = {
   bmsc_net_field = "demand", unit = 1, key = "plate", recipe = "plate"}}}, {[1] = record}))
 assert(invalidated == 1 and record.config.recipe_policies.plate[1].demand == 3,

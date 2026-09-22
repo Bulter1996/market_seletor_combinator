@@ -288,6 +288,16 @@ local function tree_root(record, signal)
   end
 end
 
+-- 网络订单的树保存在任务执行上下文；本地订单才使用组合器自己的运行计划。
+local function tree_plan_record(record, view)
+  if view.network_task then
+    for _, task in ipairs(record.network_assignments or {}) do
+      if task.key == view.network_task and task.execution then return task.execution end
+    end
+  end
+  return record
+end
+
 ---“收起全部”只改每个节点自身的状态；之后展开父节点时，子节点仍保持各自的收起状态。
 local function collapse_tree(node, path, collapsed)
   if not (node.children and node.children[1]) then return end
@@ -369,18 +379,20 @@ local function tree_tooltip(record, node, required, inventory)
   return tooltip
 end
 
-function UI.open_tree(player, record, signal, count)
+function UI.open_tree(player, record, signal, count, network_task)
   local view = views()[player.index] or {}
-  if view.unit ~= record.entity.unit_number or not view.signal or Util.signal_key(view.signal) ~= Util.signal_key(signal) then
+  if view.unit ~= record.entity.unit_number or view.network_task ~= network_task
+    or not view.signal or Util.signal_key(view.signal) ~= Util.signal_key(signal) then
     view = {tree_location = view.tree_location}
   end
   views()[player.index] = view
-  view.unit, view.signal, view.count = record.entity.unit_number, signal, count
+  view.unit, view.signal, view.count, view.network_task = record.entity.unit_number, signal, count, network_task
   view.collapsed = view.collapsed or {}
-  local frame, content = tree_window(player, view, record, signal, count)
+  local plan_record = tree_plan_record(record, view)
+  local frame, content = tree_window(player, view, plan_record, signal, count)
   frame.tags = {bmsc_signal_type = signal.type, bmsc_signal_name = signal.name,
     bmsc_signal_quality = signal.quality, bmsc_order_count = count}
-  local root = tree_root(record, signal)
+  local root = tree_root(plan_record, signal)
   if not root then
     content.add{type = "label", caption = {"bmsc-net.no-tree"}}
     return
@@ -403,11 +415,11 @@ function UI.open_tree(player, record, signal, count)
       if node then
         local key = Util.signal_key(node.signal)
         local required = totals[key] or 0
-        local inventory = inventory_for_tree(record, key, required)
+        local inventory = inventory_for_tree(plan_record, key, required)
         local style = inventory and (inventory.sufficient and "green_circuit_network_content_slot"
           or "red_circuit_network_content_slot") or "slot_button"
         add_large_slot(cell, {type = "sprite-button", sprite = node.signal.type .. "/" .. node.signal.name,
-          number = math.ceil(required), style = style, tooltip = tree_tooltip(record, node, required, inventory),
+          number = math.ceil(required), style = style, tooltip = tree_tooltip(plan_record, node, required, inventory),
           tags = {bmsc_net_action = "select", key = key, type = node.signal.type, name = node.signal.name,
             quality = node.signal.quality, path = paths[node], has_children = node.children and node.children[1] ~= nil}}, icon_size)
       else
@@ -429,7 +441,7 @@ function UI.on_zoom(event, records, delta)
   local record = view and records[view.unit]
   if not (record and record.entity.valid and record.entity.force == player.force) then return false end
   view.tree_scale = math.max(1 / LARGE_ICON, math.min(2, (view.tree_scale or 1) + delta))
-  UI.open_tree(player, record, view.signal, view.count)
+  UI.open_tree(player, record, view.signal, view.count, view.network_task)
   return true
 end
 
@@ -578,7 +590,7 @@ function refresh_tree(player, records, invalidate)
   if not (r and r.entity.valid and r.entity.force == player.force) then return end
   if invalidate then SupermarketOrder.invalidate_plan(r) end
   SupermarketOrder.calculate(r)
-  UI.open_tree(player, r, view.signal, view.count)
+  UI.open_tree(player, r, view.signal, view.count, view.network_task)
 end
 
 local function set_policy_enabled(record, tags, enabled)
@@ -637,26 +649,26 @@ function UI.on_click(event, records)
     if not r or not r.entity.valid or r.entity.force ~= player.force then return true end
     if action == "tree-size" then
       view.window_scale = tags.tree_window_scale == 2 and 2 or 1
-      local root = tree_root(r, view.signal)
+      local root = tree_root(tree_plan_record(r, view), view.signal)
       if root then fit_tree_scale(player, view, root) end
-      UI.open_tree(player, r, view.signal, view.count)
+      UI.open_tree(player, r, view.signal, view.count, view.network_task)
       return true
     end
     if action == "tree-pin" then
       view.pinned = not view.pinned
-      UI.open_tree(player, r, view.signal, view.count)
+      UI.open_tree(player, r, view.signal, view.count, view.network_task)
       return true
     end
     if action == "tree-expand-all" then
       view.collapsed = {}
-      UI.open_tree(player, r, view.signal, view.count)
+      UI.open_tree(player, r, view.signal, view.count, view.network_task)
       return true
     end
     if action == "tree-collapse-all" then
       view.collapsed = {}
-      local root = tree_root(r, view.signal)
+      local root = tree_root(tree_plan_record(r, view), view.signal)
       if root then collapse_tree(root, "0", view.collapsed) end
-      UI.open_tree(player, r, view.signal, view.count)
+      UI.open_tree(player, r, view.signal, view.count, view.network_task)
       return true
     end
     if action == "select" then
@@ -669,7 +681,7 @@ function UI.on_click(event, records)
           else
             view.collapsed[tags.path] = true
           end
-          UI.open_tree(player, r, view.signal, view.count)
+          UI.open_tree(player, r, view.signal, view.count, view.network_task)
         end
         return true
       end
@@ -749,13 +761,32 @@ function UI.on_checked(event, records)
   return true
 end
 
+function UI.on_selection(event, records)
+  local tags = event.element.tags or {}
+  local field = tags.bmsc_net_config
+  if field ~= "network_publish" and field ~= "network_accept" then return false end
+  local r, player = records[tags.unit], game.get_player(event.player_index)
+  if not r or not r.entity.valid or r.entity.force ~= player.force then return true end
+  local enabled, cross_planet = event.element.selected_index == 2, event.element.selected_index == 3
+  r.config[field] = enabled or cross_planet
+  r.config[field == "network_publish" and "network_export" or "network_import"] = cross_planet
+  if field == "network_publish" and r.config.network_publish and r.config.inventory_validation == "none" then
+    r.config.network_publish, r.config.network_export, event.element.selected_index = false, false, 1
+    player.print({"bmsc-net.requires-inventory"})
+  end
+  return true
+end
+
 function UI.on_text(event, records)
   local tags = event.element.tags or {}
   if not tags.bmsc_net_field then return false end
   local r, player = records[tags.unit], game.get_player(event.player_index)
   local value = tonumber(event.element.text)
   if not r or not r.entity.valid or r.entity.force ~= player.force or not value or value ~= value or math.abs(value) == math.huge then return true end
-  if tags.bmsc_net_field == "network_priority" then r.config.network_priority = value; return true end
+  if tags.bmsc_net_field == "network_publish_priority" or tags.bmsc_net_field == "network_accept_priority" then
+    r.config[tags.bmsc_net_field] = value
+    return true
+  end
   local entries = r.config.recipe_policies[tags.key] or {}
   local entry
   for _, current in ipairs(entries) do
@@ -789,14 +820,22 @@ function UI.settings(parent, entity, config)
   group.style.horizontally_stretchable = true
   group.visible = config.mode == "supermarket_order"
   group.add{type = "label", caption = {"bmsc-net.title"}, style = "heading_2_label"}
-  for _, field in ipairs({"network_publish", "network_accept", "network_export", "network_import"}) do
-    group.add{type = "checkbox", caption = {"bmsc-net." .. field}, state = config[field] == true,
+  local fields = group.add{type = "table", column_count = 2}
+  fields.style.horizontally_stretchable = true
+  local function add_scope(field, cross_field)
+    fields.add{type = "label", caption = {"bmsc-net." .. field}}
+    fields.add{type = "drop-down", items = {{"bmsc-net.network-disabled"}, {"bmsc-net.network-local"},
+      {"bmsc-net.network-cross"}}, selected_index = config[field] and (config[cross_field] and 3 or 2) or 1,
       tags = {bmsc_net_config = field, unit = entity.unit_number}}
   end
-  local row = group.add{type = "flow", direction = "horizontal"}
-  row.add{type = "label", caption = {"bmsc-net.priority"}}
-  row.add{type = "textfield", text = tostring(config.network_priority or 0), numeric = true, allow_negative = true,
-    tags = {bmsc_net_field = "network_priority", unit = entity.unit_number}}
+  add_scope("network_publish", "network_export")
+  add_scope("network_accept", "network_import")
+  for _, field in ipairs({"network_publish_priority", "network_accept_priority"}) do
+    fields.add{type = "label", caption = {"bmsc-net." .. field}, tooltip = {"bmsc-net.network-priority-help"}}
+    local input = fields.add{type = "textfield", text = tostring(config[field] or 5), numeric = true,
+      allow_negative = true, tooltip = {"bmsc-net.network-priority-help"}, tags = {bmsc_net_field = field, unit = entity.unit_number}}
+    input.style.width = 72
+  end
 end
 
 return UI

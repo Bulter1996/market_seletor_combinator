@@ -337,7 +337,6 @@ local function tree_root(record, signal)
   for _, node in ipairs(roots) do
     if node.source_key == Util.signal_key(signal) then
       local limit = math.max(0, math.floor(tonumber(record.config.recurise_depth) or 0))
-      if limit == 0 then return node end
       local function trim(current)
         local visible = {}
         for key, value in pairs(current) do visible[key] = value end

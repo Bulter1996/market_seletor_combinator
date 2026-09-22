@@ -36,7 +36,8 @@ local function record(unit, machine, red, green, pool)
   local r = {red = red, green = green, config = Config.normalize{
     production_machine = machine, inventory_validation = "inventory", network_publish = true,
     network_accept = true, recursion_additional_production_rate = 0,
-    recursion_material_demand_rate = 1, recursion_material_retention_rate = 0}}
+    recursion_material_demand_rate = 1, recursion_material_retention_rate = 0,
+    recurise_depth = 10}}
   r.entity = {valid = true, unit_number = unit, force = force, surface = surface,
     get_signals = function(id) return entries(id == 1 and r.red or r.green) end,
     get_circuit_network = function() return {network_id = pool or unit} end}
@@ -84,7 +85,7 @@ task = Network.tasks(1)[1]
 b.green = {widget = 5}; b.red.fuel = 50
 tick()
 assert(b.output["recipe:plate"], "local recovery must not preempt active network node")
-b.red.plate = 10
+b.red.plate = 60
 tick()
 assert(task.status == "waiting_transport", "producer red inventory completes production")
 assert(b.output["recipe:widget"], "local order wins next scheduling boundary")
@@ -94,12 +95,12 @@ assert(task.status == "waiting_transport" and task.owner == 2, "in-transit stock
 a.green.gear = 20
 tick(); tick()
 local pending_delta = Network.tasks(1)
-assert(#pending_delta == 2 and task.quantity == 10 and task.status == "waiting_transport",
+assert(#pending_delta == 2 and task.quantity == 20 and task.status == "waiting_transport",
   "larger source order must not inflate finished transport promise")
-assert(pending_delta[2].quantity == 10 and pending_delta[2].status ~= "waiting_transport")
+assert(pending_delta[2].quantity == 20 and pending_delta[2].status ~= "waiting_transport")
 assert(pending_delta[2].reserved_before == 0, "departed goods do not inflate the new production target")
 a.green.gear = 10
-a.red.plate = 10
+a.red.plate = 20
 tick(); tick()
 assert(#Network.tasks(1) == 0, "requester physical stock releases commitment")
 
@@ -111,7 +112,7 @@ b = record(2, "furnace", {plate = 10, ore = 100}, {plate = 10})
 tick(); tick()
 task = Network.tasks(1)[1]
 assert(task.status ~= "waiting_transport", "local ten plates cannot also supply remote ten")
-b.red.plate = 20
+b.red.plate = 60
 tick()
 assert(task.status == "waiting_transport")
 
@@ -138,7 +139,7 @@ assert(Policy.choose(b, sig("plate"), {[key("ore")] = 100, [key("scrap")] = 1}).
 local copy = Config.normalize(b.config)
 copy.recipe_policies[key("plate")][1].priority = 99
 assert(b.config.recipe_policies[key("plate")][1].priority == 10, "blueprint config is deep-copied")
--- 已有基础数量也必须完成承接方的额外生产目标。
+-- 已有基础数量也必须完成承接方的生产倍率目标。
 storage.bmsc_production_network = nil; storage.combinators = {}
 a = record(1, "assembler", {}, {machine = 10})
 b = record(2, "furnace", {ore = 100}, {})
@@ -148,7 +149,7 @@ assert(task.signal.name == "frame" and b.output["recipe:plate"], "network task s
 b.green.widget = 5; b.red.fuel = 100
 tick()
 assert(b.output["recipe:plate"], "local order does not interrupt intermediate material")
-b.red.plate = 11
+b.red.plate = 41
 tick()
 assert(b.output["recipe:widget"], "local order wins after intermediate finishes, before whole task finishes")
 assert(task.owner == 2 and task.status ~= "waiting_transport", "parent task remains assigned")
@@ -157,24 +158,25 @@ assert(task.owner == 2 and task.status ~= "waiting_transport", "parent task rema
 storage.bmsc_production_network = nil; storage.combinators = {}
 a = record(1, "assembler", {}, {gear = 10})
 b = record(2, "furnace", {plate = 10, ore = 100}, {})
-b.config.recursion_additional_production_rate = 1
+b.config.recursion_additional_production_rate = 2
 tick(); tick()
 task = Network.tasks(1)[1]
-assert(task.status == "producing" and b.output["recipe:plate"].count == 10, "extra production must not stall at base target")
-b.red.plate = 20; tick()
+assert(task.status == "producing" and b.output["recipe:plate"].count == 30,
+  "production rate must not stall at base target")
+b.red.plate = 40; tick()
 assert(task.status == "waiting_transport")
 
--- 两个生产者读取同一个红线网络，十个实物最多交付一个十个的任务。
+-- 两个生产者读取同一个红线网络，一份生产目标库存最多交付一个任务。
 storage.bmsc_production_network = nil; storage.combinators = {}
 a = record(1, "assembler", {}, {gear = 10})
-b = record(2, "furnace", {plate = 10, ore = 100}, {}, 100)
+b = record(2, "furnace", {plate = 40, ore = 100}, {}, 100)
 local c = record(3, "assembler", {}, {gear = 10})
 local d = record(4, "furnace", b.red, {}, 100)
 tick(); tick()
 local waiting = 0
 for _, t in ipairs(Network.tasks(1)) do if t.status == "waiting_transport" then waiting = waiting + 1 end end
 assert(waiting == 1, "shared red pool must commit existing stock exactly once")
-b.red.plate = 20; tick()
+b.red.plate = 80; tick()
 waiting = 0
 for _, t in ipairs(Network.tasks(1)) do if t.status == "waiting_transport" then waiting = waiting + 1 end end
 assert(waiting == 2)

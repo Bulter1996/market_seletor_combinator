@@ -53,7 +53,7 @@ local entity = {force = force, get_signals = function(connector_id)
 end}
 local record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single",
-  sequential_production = true, recurise_depth = 0, recursion_timeout = 0
+  sequential_production = true, recurise_depth = 10, recursion_timeout = 0
 }}
 
 local Mode = require("scripts.modes.supermarket_order")
@@ -72,12 +72,6 @@ local cycled = Mode.calculate(record)
 assert(record.supermarket_sequence_index == 1)
 assert(cycled["item:iron:normal"].count == 10)
 
-Mode.restart_sequence(record)
-local restarted = Mode.calculate(record)
-assert(record.supermarket_sequence_index == 1)
-assert(restarted["item:iron:normal"].count == 10)
-assert(record.supermarket_order_diagnostics["item:b:normal"].kind == "waiting_for_order")
-
 -- 右键后移当前订单会直接选择下一项，即使配置了原料等待时间也不会保留旧输出。
 orders = {
   {signal = {type = "item", name = "a", quality = "normal"}, count = 20},
@@ -89,7 +83,7 @@ inventory = {
 }
 local deferred_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single",
-  sequential_production = true, recurise_depth = 0, recursion_timeout = 0,
+  sequential_production = true, recurise_depth = 10, recursion_timeout = 0,
   recursion_material_wait_time = 10
 }}
 assert(Mode.calculate(deferred_record)["item:a:normal"].count == 10)
@@ -119,7 +113,7 @@ inventory = {
 }
 local nonsequential_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single",
-  sequential_production = false, recurise_depth = 0, recursion_timeout = 0,
+  sequential_production = false, recurise_depth = 10, recursion_timeout = 0,
   recursion_material_wait_time = 10, recursion_material_demand_rate = 0,
   recursion_material_retention_rate = 0
 }}
@@ -155,7 +149,7 @@ inventory = {
 game.tick = 0
 local single_timeout_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 1, recursion_timeout_monitor_item_changes = false,
+  recurise_depth = 10, recursion_timeout = 1, recursion_timeout_monitor_item_changes = false,
   recursion_additional_production_rate = 0, recursion_material_demand_rate = 10,
   recursion_material_retention_rate = 1
 }}
@@ -176,7 +170,7 @@ inventory = {{signal = {type = "item", name = "wire", quality = "normal"}, count
 orders = {{signal = {type = "item", name = "circuit", quality = "normal"}, count = 10}}
 local all_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 0
+  recurise_depth = 10, recursion_timeout = 0
 }}
 local all_outputs = Mode.calculate(all_record)
 assert(all_record.detail_outputs == nil)
@@ -206,7 +200,7 @@ orders = {
 inventory = {}
 local multi_all_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 0
+  recurise_depth = 10, recursion_timeout = 0
 }}
 local multi_all_outputs = Mode.calculate(multi_all_record)
 assert(multi_all_outputs["item:a:normal"].count == 15)
@@ -229,7 +223,7 @@ inventory = {
 }
 local detail_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 0, recursion_additional_production_rate = 2,
+  recurise_depth = 10, recursion_timeout = 0, recursion_additional_production_rate = 2,
   recursion_material_demand_rate = 10, recursion_material_retention_rate = 5
 }}
 assert(Mode.calculate(detail_record)["item:circuit:normal"].count == 30)
@@ -266,7 +260,7 @@ inventory = {
 }
 local hysteresis_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 0, recursion_additional_production_rate = 2,
+  recurise_depth = 10, recursion_timeout = 0, recursion_additional_production_rate = 2,
   recursion_material_demand_rate = 10, recursion_material_retention_rate = 5
 }}
 local below_start = Mode.calculate(hysteresis_record)
@@ -341,7 +335,7 @@ inventory = {
 game.tick = 0
 local material_wait_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 0, recursion_material_wait_time = 2,
+  recurise_depth = 10, recursion_timeout = 0, recursion_material_wait_time = 2,
   recursion_additional_production_rate = 2, recursion_material_demand_rate = 10,
   recursion_material_retention_rate = 5
 }}
@@ -373,8 +367,8 @@ game.tick = 331
 assert(next(Mode.calculate(material_wait_record)) == nil)
 assert(material_wait_record.recursion_material_wait_tick == nil)
 
--- 严格校验会汇总所有机器无法制造的终端缺口，暂时跳过该订单；
--- 补齐后订单会重新进入候选。single 当前输出同时写入详细模式代理。
+-- 原料不足不能跳过有缺口的订单：顺序模式立即进入当前订单的最深原料，
+-- 非顺序模式则汇总全部订单并从最深层开始输出。
 orders = {
   {signal = {type = "item", name = "circuit", quality = "normal"}, count = 10},
   {signal = {type = "item", name = "stone-brick", quality = "normal"}, count = 10},
@@ -384,34 +378,30 @@ inventory = {{signal = {type = "item", name = "a", quality = "normal"}, count = 
 game.tick = 0
 local strict_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = true,
-  recursion_strict_validation = true, recurise_depth = 0, recursion_timeout = 0,
+  recursion_strict_validation = true, recurise_depth = 10, recursion_timeout = 0,
   recursion_additional_production_rate = 0, recursion_material_demand_rate = 10,
   recursion_material_retention_rate = 1
 }}
 local skipped = Mode.calculate(strict_record)
-assert(skipped["item:z:normal"].count == 10)
+assert(skipped["item:copper-plate:normal"].count == 30)
+assert(skipped["item:z:normal"] == nil)
 assert(skipped["item:stone-brick:normal"] == nil)
-assert(strict_record.detail_outputs["item:z:normal"].count == 10)
-assert(strict_record.supermarket_order_diagnostics["item:stone-brick:normal"].kind == "no_recipe")
+assert(strict_record.detail_outputs["item:copper-plate:normal"].count == 30)
 local strict_diagnostic = strict_record.supermarket_order_diagnostics["item:circuit:normal"]
-assert(strict_diagnostic.kind == "strict_materials")
-local strict_shortages = {}
-for _, shortage in ipairs(strict_diagnostic.shortages) do
-  strict_shortages[shortage.signal.name] = shortage.count
-end
-assert(strict_shortages["copper-plate"] == 11)
-assert(strict_shortages.plate == 11)
+assert(strict_diagnostic.kind == "supermarket_expanding")
 
 local strict_all_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
-  recursion_strict_validation = true, recurise_depth = 0, recursion_additional_production_rate = 0
+  recursion_strict_validation = true, recurise_depth = 10, recursion_additional_production_rate = 0
 }}
 local strict_all = Mode.calculate(strict_all_record)
-assert(strict_all["item:circuit:normal"] == nil)
+assert(strict_all["item:circuit:normal"].count == 10)
+assert(strict_all["item:wire:normal"].count == 30)
+assert(strict_all["item:copper-plate:normal"].count == 30)
+assert(strict_all["item:plate:normal"].count == 10)
 assert(strict_all["item:stone-brick:normal"] == nil)
 assert(strict_all["item:z:normal"].count == 10)
 assert(strict_all_record.detail_outputs == nil)
-assert(strict_all_record.supermarket_order_diagnostics["item:circuit:normal"].kind == "strict_materials")
 assert(strict_all_record.supermarket_order_diagnostics["item:stone-brick:normal"].kind == "no_recipe")
 
 local strict_copper = {signal = {type = "item", name = "copper-plate", quality = "normal"}, count = 10}
@@ -419,14 +409,7 @@ local strict_plate = {signal = {type = "item", name = "plate", quality = "normal
 inventory[#inventory + 1] = strict_copper
 inventory[#inventory + 1] = strict_plate
 game.tick = 15
-assert(Mode.calculate(strict_record)["item:z:normal"].count == 10)
-strict_diagnostic = strict_record.supermarket_order_diagnostics["item:circuit:normal"]
-strict_shortages = {}
-for _, shortage in ipairs(strict_diagnostic.shortages) do
-  strict_shortages[shortage.signal.name] = shortage.count
-end
-assert(strict_shortages["copper-plate"] == 1)
-assert(strict_shortages.plate == 1)
+assert(Mode.calculate(strict_record)["item:copper-plate:normal"].count == 20)
 
 strict_copper.count = 11
 strict_plate.count = 11
@@ -444,32 +427,32 @@ inventory = {
 }
 local strict_partial_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recursion_strict_validation = true, recurise_depth = 0, recursion_timeout = 0,
+  recursion_strict_validation = true, recurise_depth = 10, recursion_timeout = 0,
   recursion_additional_production_rate = 0, recursion_material_demand_rate = 10,
   recursion_material_retention_rate = 1
 }}
 local strict_partial = Mode.calculate(strict_partial_record)
-assert(strict_partial["item:wire:normal"].count == 301)
-assert(strict_partial["item:plate:normal"] == nil)
+assert(strict_partial["item:wire:normal"] == nil)
+assert(strict_partial["item:plate:normal"].count == 89)
 assert(strict_partial["item:copper-plate:normal"] == nil)
 strict_partial_record.config.recursion_output_mode = "all"
 local strict_partial_all = Mode.calculate(strict_partial_record)
 assert(strict_partial_all["item:circuit:normal"].count == 100)
 assert(strict_partial_all["item:wire:normal"].count == 300)
-assert(strict_partial_all["item:plate:normal"] == nil)
-assert(strict_partial_all["item:copper-plate:normal"] == nil)
+assert(strict_partial_all["item:plate:normal"].count == 89)
+assert(strict_partial_all["item:copper-plate:normal"].count == 289)
 
 -- all 的精确目标不能污染 single 的严格大于停止边界；切换后 300 仍需输出到 301。
 local output_mode_cache_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
-  recursion_strict_validation = true, recurise_depth = 0, recursion_timeout = 0,
+  recursion_strict_validation = true, recurise_depth = 10, recursion_timeout = 0,
   recursion_additional_production_rate = 0, recursion_material_demand_rate = 10,
   recursion_material_retention_rate = 1
 }}
 assert(Mode.calculate(output_mode_cache_record)["item:wire:normal"].count == 300)
 output_mode_cache_record.config.recursion_output_mode = "single"
 Mode.reset(output_mode_cache_record)
-assert(Mode.calculate(output_mode_cache_record)["item:wire:normal"].count == 301)
+assert(Mode.calculate(output_mode_cache_record)["item:plate:normal"].count == 89)
 
 -- 小订单的整单扩展目标可能低于父级材料启动线：电路板 3 需要铜丝 9，而单份启动线
 -- 是 3 × 10 = 30，因此只按单份用量兜底，铜丝保持到严格大于 3 × (1 + 10) = 33。
@@ -480,7 +463,7 @@ inventory = {
 }
 local strict_small_order_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recursion_strict_validation = true, recurise_depth = 0, recursion_timeout = 0,
+  recursion_strict_validation = true, recurise_depth = 10, recursion_timeout = 0,
   recursion_additional_production_rate = 0, recursion_material_demand_rate = 10,
   recursion_material_retention_rate = 1
 }}
@@ -510,7 +493,7 @@ inventory = {
 local strict_large_ingredient_record = {entity = entity, config = {
   mode = "supermarket_order",
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recursion_strict_validation = true, recurise_depth = 0, recursion_timeout = 0,
+  recursion_strict_validation = true, recurise_depth = 10, recursion_timeout = 0,
   recursion_material_wait_time = 2,
   recursion_additional_production_rate = 1, recursion_material_demand_rate = 10,
   recursion_material_retention_rate = 1
@@ -526,11 +509,11 @@ game.tick = 30
 local strict_wait_held = Mode.calculate(strict_large_ingredient_record)
 assert(strict_wait_held["item:remote-tower:normal"].count == 114)
 assert(strict_large_ingredient_record.supermarket_order_diagnostics["item:factory-2:normal"].kind
-  == "strict_materials")
+  == "supermarket_expanding")
 game.tick = 149
 assert(Mode.calculate(strict_large_ingredient_record)["item:remote-tower:normal"].count == 114)
 game.tick = 150
-assert(next(Mode.calculate(strict_large_ingredient_record)) == nil)
+assert(Mode.calculate(strict_large_ingredient_record)["item:iron:normal"].count == 500)
 assert(strict_large_ingredient_record.recursion_material_wait_tick == nil)
 
 -- 严格校验遵守生产机器的地表限制；例如只允许高磁场的机器不能在低磁场地表接单。
@@ -549,7 +532,7 @@ inventory = {
 }
 local surface_limited_record = {entity = entity, config = {
   production_machine = "surface-limited-assembler", recursion_output_mode = "single",
-  sequential_production = false, recursion_strict_validation = true, recurise_depth = 0,
+  sequential_production = false, recursion_strict_validation = true, recurise_depth = 10,
   recursion_timeout = 0, recursion_additional_production_rate = 0,
   recursion_material_demand_rate = 1, recursion_material_retention_rate = 0
 }}
@@ -563,7 +546,7 @@ orders = {{signal = {type = "item", name = "stone-brick", quality = "normal"}, c
 inventory = {}
 local strict_toggle_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
-  recursion_strict_validation = false, recurise_depth = 0, recursion_additional_production_rate = 0
+  recursion_strict_validation = false, recurise_depth = 10, recursion_additional_production_rate = 0
 }}
 assert(Mode.calculate(strict_toggle_record)["item:stone-brick:normal"].count == 10)
 strict_toggle_record.config.recursion_strict_validation = true
@@ -581,7 +564,7 @@ game.tick = 0
 local unchecked_record = {entity = entity, config = {
   production_machine = "assembler", inventory_validation = "none",
   recursion_output_mode = "single", sequential_production = true,
-  recurise_depth = 0, recursion_timeout = 1, recursion_timeout_monitor_item_changes = false,
+  recurise_depth = 10, recursion_timeout = 1, recursion_timeout_monitor_item_changes = false,
   recursion_additional_production_rate = 0
 }}
 local unchecked = Mode.calculate(unchecked_record)
@@ -606,7 +589,7 @@ game.tick = 0
 local linked_record = {entity = entity, config = {
   production_machine = "assembler", inventory_validation = "linked",
   recursion_output_mode = "single", sequential_production = true,
-  recurise_depth = 0, recursion_timeout = 0, recursion_additional_production_rate = 0,
+  recurise_depth = 10, recursion_timeout = 0, recursion_additional_production_rate = 0,
   recursion_material_demand_rate = 10, recursion_material_retention_rate = 1,
   recursion_material_wait_time = 1
 }}
@@ -626,8 +609,8 @@ for generation = 2, 4 do
   assert(Mode.calculate(linked_record)["item:a:normal"].count == 10)
 end
 game.tick = 541
-assert(next(Mode.calculate(linked_record)) == nil)
-assert(linked_record.supermarket_order_diagnostics["item:a:normal"].kind == "strict_materials")
+assert(Mode.calculate(linked_record)["item:a:normal"].count == 10)
+assert(linked_record.supermarket_order_diagnostics["item:a:normal"].kind == "active_output")
 InventoryQuery.is_available = original_available
 InventoryQuery.get_shared_inventory = original_shared
 

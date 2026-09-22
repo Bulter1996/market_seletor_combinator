@@ -77,7 +77,7 @@ function Network.prepare(records)
             local key = Util.signal_key(signal)
             -- 同库存池重复读到同一本地库存目标，按最大目标保护，不能逐组合器相加。
             pool.protected[key] = math.max(pool.protected[key] or 0,
-              math.ceil(demand.count * (1 + (r.config.recursion_additional_production_rate or 0))))
+              math.ceil(demand.count * (r.config.recursion_additional_production_rate or 2)))
           end
         end
       end
@@ -200,7 +200,7 @@ function Network.prepare(records)
         local base = (pool.protected[key] or 0) + (allocated[task.pool][key] or 0)
         add(allocated[task.pool], key, task.quantity)
         task.reserved_before = base
-        task.production_target = math.ceil(task.quantity * (1 + (r.config.recursion_additional_production_rate or 0)))
+        task.production_target = math.ceil(task.quantity * (r.config.recursion_additional_production_rate or 2))
         if (pool.stock[key] or 0) >= base + task.production_target then
           task.status, task.execution, task.finished_tick = "waiting_transport", nil, game.tick
           task.stock_reserved = task.quantity
@@ -233,7 +233,7 @@ local function publish(record, execution, parent, destination)
     for key, qty in pairs(inventory) do available[key] = qty end
     local function visit(node, required, path)
       -- 本机递归的边界输出不等同于网络缺料请求；不能绕过玩家设定的展开深度。
-      if depth_limit > 0 and (node.level or 1) > depth_limit then return end
+      if (node.level or 1) > depth_limit then return end
       local key = Util.signal_key(node.signal)
       local stock = math.max(0, available[key] or 0)
       available[key] = math.max(0, stock - required)
@@ -270,7 +270,7 @@ local function publish(record, execution, parent, destination)
     end
     local expanded = execution.supermarket_active_orders and execution.supermarket_active_orders[root.source_key]
     local goal = parent and parent.production_target or expanded
-      and root.amount * (1 + (record.config.recursion_additional_production_rate or 0)) or root.amount
+      and root.amount * (record.config.recursion_additional_production_rate or 2) or root.amount
     local status = Target.inventory_status(root.validation_products or {root.signal}, inventory, goal)
     visit(root, (inventory[Util.signal_key(root.signal)] or 0) + status.remaining, lineage)
   end

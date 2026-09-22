@@ -9,7 +9,6 @@ local InventoryQuery = require("scripts.modes.inventory_query")
 local Policy = require("scripts.recipe_policy")
 local Network = require("scripts.production_network")
 local PLAN_REVISION = 19
-local LINKED_SHORTAGE_CONFIRMATIONS = 3
 local Mode = {
   name = "supermarket_order",                        -- 模式注册名，必须与 config.lua 的值一致。
   -- 原生 select/max 即使关闭 output_networks，仍会计算输入并把结果显示在实体信息的
@@ -59,15 +58,6 @@ function Mode.reset(record)
   record.recursion_inventory_protection_tick = nil
   record.recursion_inventory_shortages = nil
   record.recursion_linked_last_outputs = nil
-end
-
----让顺序制作在下一轮从第一个订单重新检索。
----@param record table control.lua 保存的组合器记录。
----@return nil
-function Mode.restart_sequence(record)
-  Mode.reset(record)
-  record.supermarket_sequence_index = 1
-  record.supermarket_sequence_signature = nil
 end
 
 ---后移 single 当前订单；顺序模式推进游标，非顺序模式选择下一个有候选输出的订单。
@@ -209,6 +199,7 @@ local function calculate_local(record)
   -- control.lua 正常会先迁移配置；这里仍允许测试桩或热加载中的残缺记录进入，所有缺省
   -- 字段都按最保守语义处理，避免一次坏记录中断同一 on_nth_tick 内其他运算器。
   local config = type(record.config) == "table" and record.config or {}
+  local wanted_depth = math.max(0, math.floor(tonumber(config.recurise_depth) or 0))
   local validation_mode = config.inventory_validation
   if validation_mode ~= Config.inventory_validation.inventory
     and validation_mode ~= Config.inventory_validation.linked
@@ -222,6 +213,8 @@ local function calculate_local(record)
   if validation_mode == Config.inventory_validation.linked and not InventoryQuery.is_available() then
     validation_mode = Config.inventory_validation.inventory
   end
+  -- 深度 0 不展开配方，因此也不应读取或校验下层材料库存。
+  if wanted_depth == 0 then validation_mode = Config.inventory_validation.none end
   local validates_inventory = validation_mode == Config.inventory_validation.inventory
     or validation_mode == Config.inventory_validation.linked
   -- 计算过程中订单、严格校验或配方树变化可能清除当前选择；先保留上一轮真实输出，
@@ -252,7 +245,13 @@ local function calculate_local(record)
   local observed_inventory = inputs.red
   local raw_demands = inputs.entries.green
   local timeout = tonumber(config.recursion_timeout) or 0
-  local additional_rate = math.max(0, tonumber(config.recursion_additional_production_rate) or 0)
+  local production_rate = tonumber(config.recursion_additional_production_rate)
+  -- 直接调用模式模块的旧测试桩和热加载记录仍可能携带旧版“额外倍率”。
+  if (tonumber(config.schema_revision) or 0) < 18 then
+    production_rate = math.max(1, (production_rate or 0) + 1)
+  else
+    production_rate = math.max(2, production_rate or 2)
+  end
   local material_demand_rate = math.max(0, tonumber(config.recursion_material_demand_rate) or 1)
   local material_retention_rate = math.max(0, tonumber(config.recursion_material_retention_rate) or 0)
   local timeout_reset_active, condition_results = Conditions.evaluate(config.recursion_timeout_conditions,
@@ -310,7 +309,7 @@ local function calculate_local(record)
 
   ---构建一棵不含 LuaRecipePrototype 等运行时原型对象的配方树，确保能够安全写入 storage。
   ---根订单标记为第 1 层。深度 N 表示允许展开 level <= N 的可制造节点；第一次
-  ---超过限制的节点（level=N+1）成为边界输出。0 不设边界，一直展开到无配方或循环。
+  ---超过限制的节点（level=N+1）成为边界输出。0 把根订单作为边界，只输出订单物品。
   local maximum_plan_level = 1
   local terminal_nodes_by_level = {}
   local function remember_terminal_node(node)
@@ -467,13 +466,11 @@ local function calculate_local(record)
   table.sort(inventory_parts)
   local inventory_signature = table.concat(inventory_parts, "|")
 
-  -- 严格校验按每一层“单份配方用量 × 材料需求倍率”判断能否启动，
-  -- 不要求一次备齐整张订单。中间产品超过阈值后即停止继续向下校验。
+  -- 库存校验只阻止当前机器本身无法生产的根订单；原料不足必须继续展开为生产请求。
   local active_orders = type(record.supermarket_active_orders) == "table"
     and record.supermarket_active_orders or {}
   record.supermarket_active_orders = active_orders
   local strict_order_diagnostics = {}
-  local linked_shortage_protected = false
   local function strict_order_diagnostic(root)
     if not validates_inventory then return nil end
     -- 订单物品本身无法由所选机器制造时也必须跳过，不能把它当作终端原料输出。
@@ -484,63 +481,6 @@ local function calculate_local(record)
       or not surface_conditions_met(record.entity.surface, root_recipe and root_recipe.surface_conditions) then
       return {kind = "surface_conditions"}
     end
-    local shortages = {}
-    local function add_shortage(signal, count)
-      local key = Util.signal_key(signal)
-      local entry = shortages[key]
-      if not entry then
-        entry = {signal = Util.make_signal(signal.type, signal.name, signal.quality), count = 0}
-        shortages[key] = entry
-      end
-      -- 同一原料出现在多条分支时，只需满足其中最高的单层启动阈值。
-      entry.count = math.max(entry.count, count)
-    end
-    local function visit(node)
-      if not node.recipe_name then return end
-      for _, child in ipairs(node.children) do
-        local stock = math.max(0, observed_inventory[Util.signal_key(child.signal)] or 0)
-        local threshold = child.amount * (node.demand_rate or material_demand_rate)
-        if stock <= threshold then
-          local recipe = child.recipe_name and prototypes.recipe[child.recipe_name]
-          if recipe and surface_conditions_met(record.entity.surface, recipe.surface_conditions) then
-            visit(child)
-          elseif not child.cyclic then
-            -- 启动条件是严格大于；当库存恰好等于阈值时仍至少缺少 1。
-            add_shortage(child.signal, math.max(1, math.floor(threshold - stock) + 1))
-          end
-        end
-      end
-    end
-    visit(root)
-    local result = {}
-    for _, value in ipairs(Util.sorted_outputs(shortages)) do
-      result[#result + 1] = {signal = value.entry.signal, count = math.ceil(value.entry.count)}
-    end
-    local diagnostic = result[1] and {kind = "strict_materials", shortages = result} or nil
-    if validation_mode ~= Config.inventory_validation.linked then return diagnostic end
-    local states = type(record.recursion_inventory_shortages) == "table"
-      and record.recursion_inventory_shortages or {}
-    record.recursion_inventory_shortages = states
-    if not diagnostic then
-      local was_active = active_orders[root.source_key] and states[root.source_key] ~= nil
-      states[root.source_key] = nil
-      if was_active then finish_inventory_pause("recursion_inventory_protection_tick") end
-      return nil
-    end
-    -- 新订单必须先通过库存校验；只有已经启动的订单才享受三份独立快照的防抖保护。
-    if not active_orders[root.source_key] then return diagnostic end
-    local state = states[root.source_key] or {count = 0}
-    if state.generation ~= record.recursion_inventory_generation then
-      state.count = state.count + 1
-      state.generation = record.recursion_inventory_generation
-      states[root.source_key] = state
-    end
-    if state.count >= LINKED_SHORTAGE_CONFIRMATIONS then
-      finish_inventory_pause("recursion_inventory_protection_tick")
-      return diagnostic
-    end
-    record.recursion_inventory_protection_tick = record.recursion_inventory_protection_tick or game.tick
-    linked_shortage_protected = true
     return nil
   end
 
@@ -568,6 +508,9 @@ local function calculate_local(record)
       status = extended
     }
   end
+  local function blocks_order(diagnostic)
+    return diagnostic ~= nil
+  end
   if sequential then
     if record.supermarket_sequence_signature ~= order_signature then
       record.supermarket_sequence_signature = order_signature
@@ -580,7 +523,7 @@ local function calculate_local(record)
       -- 当前项运行时仍为队列中其他订单保留具体校验原因，避免输入悬浮框退化为“等待中”。
       for _, root in ipairs(plan.roots) do
         local target = (record.network_force_active or active_orders[root.source_key])
-          and root.amount * (1 + additional_rate) or root.amount
+          and root.amount * production_rate or root.amount
         if not root_status(root, target).satisfied then
           strict_order_diagnostics[root.source_key] = strict_order_diagnostic(root)
         end
@@ -590,15 +533,14 @@ local function calculate_local(record)
     local sequence_index = root_count > 0
       and (math.max(1, math.floor(tonumber(record.supermarket_sequence_index) or 1)) - 1) % root_count + 1
       or 1
-    local scan_start_index = sequence_index
     local selected
     for _ = 1, root_count do
       local root = plan.roots[sequence_index]
-      local extended_target = root.amount * (1 + additional_rate)
+      local extended_target = root.amount * production_rate
       local target = (record.network_force_active or active_orders[root.source_key]) and extended_target or root.amount
       if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostics[root.source_key]
-        if diagnostic then
+        if blocks_order(diagnostic) then
           active_orders[root.source_key] = nil
           strict_order_diagnostics[root.source_key] = diagnostic
         else
@@ -618,16 +560,15 @@ local function calculate_local(record)
       end
       sequence_index = sequence_index % root_count + 1
     end
-    record.supermarket_sequence_index = selected
-      and (validates_inventory and scan_start_index or sequence_index) or 1
+    record.supermarket_sequence_index = selected and sequence_index or 1
   else
     -- 非顺序模式允许多个订单同时处于迟滞区间：库存低于基础目标时启动，达到扩展目标后退出。
     for _, root in ipairs(plan.roots) do
-      local extended_target = root.amount * (1 + additional_rate)
+      local extended_target = root.amount * production_rate
       local target = (record.network_force_active or active_orders[root.source_key]) and extended_target or root.amount
       if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostic(root)
-        if diagnostic then
+        if blocks_order(diagnostic) then
           strict_order_diagnostics[root.source_key] = diagnostic
         else
           active_orders[root.source_key] = true
@@ -669,11 +610,10 @@ local function calculate_local(record)
     return node.output_signal or node.signal
   end
 
-  local wanted_depth = math.max(0, math.floor(tonumber(config.recurise_depth) or 0))
   -- maximum_level 是这张订单实际能到达的最深节点。例如树只到第 3 层时，深度 10
-  -- 与深度 3 的含义完全相同。深度 0 保留为“不限制”的专用快照。
+  -- 与深度 3 的含义完全相同。深度 0 使用“不递归”的根订单快照。
   local maximum_depth = math.max(1, plan.maximum_level or 1)
-  local effective_depth = wanted_depth == 0 and 0 or math.min(wanted_depth, maximum_depth)
+  local effective_depth = math.min(wanted_depth, maximum_depth)
 
   -- 提前识别“当前可制造节点的直接原料跌破保留阈值”这一常见切换原因。
   -- 其他撤销原因由最终输出处的统一等待门处理。
@@ -684,7 +624,7 @@ local function calculate_local(record)
   local function find_selected_material_shortage(node)
     if selected_materials_insufficient then return end
     if Util.signal_key(node_output_signal(node)) == selected_output_key then
-      local within_depth = effective_depth == 0 or node.level <= effective_depth
+      local within_depth = node.level <= effective_depth
       if within_depth and node.recipe_name and not node.cyclic then
         for _, child in ipairs(node.children) do
           local child_stock = math.max(0, observed_inventory[Util.signal_key(child.signal)] or 0)
@@ -716,7 +656,7 @@ local function calculate_local(record)
   end
 
   ---为指定深度生成完整输出快照；终端材料会自然保留在所有更深的快照中。
-  ---@param depth_limit uint 0 表示展开到全部终端节点。
+  ---@param depth_limit uint 0 表示不展开根订单配方。
   ---@return table depth_outputs 当前深度对应的完整输出集合。
   ---@return table terminal_by_level 已经无法继续递归的材料，按实际层级分组。
   ---@return table boundary_outputs 因当前深度限制而停止的可递归节点。
@@ -856,7 +796,7 @@ local function calculate_local(record)
         local stop_target = node.level > 1 and node.recipe_name
           and math.floor(stage_expanded_required) + 1 or stage_expanded_required
         if stock >= stop_target then return false end
-        local reaches_limit = depth_limit > 0 and node.level > depth_limit
+        local reaches_limit = node.level > depth_limit
         -- 终端/边界信号只是外部补料请求，本模式无法制造它；父配方一旦重新达到
         -- 材料启动阈值就应继续上移，不能把基础原料锁到整条生产链的扩展总量。
         if node.cyclic or not node.recipe_name or reaches_limit then return false end
@@ -866,7 +806,7 @@ local function calculate_local(record)
         end
         return true
       end
-      if node.cyclic or not node.recipe_name or (depth_limit > 0 and node.level > depth_limit) then
+      if node.cyclic or not node.recipe_name or node.level > depth_limit then
         return false
       end
       local base_crafts = math.ceil(base_required / node.product_amount)
@@ -883,9 +823,6 @@ local function calculate_local(record)
     local function resolve(node, base_required, expanded_required, suppress_stage_output, force_active)
       if expanded_required <= 0 then return end
       local stage_expanded_required = recursive_expanded_target(node, expanded_required)
-      -- 严格模式只把机器能够制造的产品写入输出。无法制造的终端原料已经在整张订单
-      -- 进入递归前按“单份用量 × 材料需求倍率”校验：不足则跳过订单，满足则只作为库存门槛。
-      if validates_inventory and not node.cyclic and not node.recipe_name then return end
       local output_signal = node_output_signal(node)
       local output_key = Util.signal_key(output_signal)
       local stock = math.max(0, inventory[Util.signal_key(node.signal)] or 0)
@@ -918,7 +855,7 @@ local function calculate_local(record)
 
       local selected = output_key == selected_key
       local should_run = selected or force_active or base_shortage > 0
-      local reaches_limit = depth_limit > 0 and node.level > depth_limit
+      local reaches_limit = node.level > depth_limit
       if node.cyclic or not node.recipe_name then
         if should_run and not suppress_stage_output then
           local terminal_outputs = terminal_by_level[node.level]
@@ -1029,7 +966,7 @@ local function calculate_local(record)
     .. "|output-mode=" .. tostring(config.recursion_output_mode)
     .. "|active-order=" .. tostring(active_order_key)
     .. "|selected=" .. tostring(record.selected_recursion_output)
-    .. "|additional=" .. tostring(additional_rate)
+    .. "|production-rate=" .. tostring(production_rate)
     .. "|demand=" .. tostring(material_demand_rate)
     .. "|retention=" .. tostring(material_retention_rate)
     .. "|material-wait=" .. tostring(material_wait_active)
@@ -1142,7 +1079,7 @@ local function calculate_local(record)
         diagnostic = {kind = "recipe_locked", recipe_name = target.locked_recipe}
       elseif not signal or (demand.signal.type == "recipe" and not specified_recipe) then
         diagnostic = {kind = "no_recipe"}
-      elseif strict_order_diagnostics[source_key] then
+      elseif blocks_order(strict_order_diagnostics[source_key]) then
         diagnostic = strict_order_diagnostics[source_key]
       elseif sequential and completed_order_keys[source_key] then
         diagnostic = {kind = "supermarket_completed"}
@@ -1179,7 +1116,7 @@ local function calculate_local(record)
         local detail = root_details[source_key]
         if root then
           -- 信号只能输出整数；目标出现小数时展示真正能够解除订单的最小整数库存。
-          local product_target = math.ceil(root_targets[source_key] or root.amount * (1 + additional_rate))
+          local product_target = math.ceil(root_targets[source_key] or root.amount * production_rate)
           local status = OrderTarget.inventory_status(
             root.validation_products or {root.signal}, observed_inventory, product_target)
           local product = status.products[1]
@@ -1220,20 +1157,6 @@ local function calculate_local(record)
         end
       end
     end
-  end
-
-  -- 已启动订单的前两份缺料快照只用于确认，不撤销当前信号，也不累计普通超时。
-  if linked_shortage_protected and (record.recursion_linked_last_outputs
-    or previous_output_key and previous_output and not outputs[previous_output_key]) then
-    local held_outputs = record.recursion_linked_last_outputs
-      or {[previous_output_key] = previous_output}
-    if previous_output_key and previous_output then
-      record.selected_recursion_output = previous_output_key
-      record.recursion_output_count = previous_output.count
-    end
-    if config.recursion_output_mode ~= "all" then record.detail_outputs = held_outputs end
-    update_diagnostics(held_outputs)
-    return held_outputs
   end
 
   if config.recursion_output_mode == "all" then

@@ -855,9 +855,7 @@ local condition_config_fields = {
 
 local timeout_monitor_fields = {
   ["bmsc-production-timeout-monitor-item-changes"] = {
-    config = "production_timeout_monitor_item_changes", condition_set = "production-timeout"},
-  ["bmsc-recursion-timeout-monitor-item-changes"] = {
-    config = "recursion_timeout_monitor_item_changes", condition_set = "recursion-timeout"}
+    config = "production_timeout_monitor_item_changes", condition_set = "production-timeout"}
 }
 
 local function conditions_for(record, set_name)
@@ -896,6 +894,7 @@ local function update_numeric_config(record, element_name, value)
     return true
   end
   if element_name == "bmsc-recursion-additional" then
+    if value <= 1 then return false end
     record.config.recursion_additional_production_rate = value
     return true
   end
@@ -1038,9 +1037,9 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   if event.element.name == "bmsc-mode" then
     local record = current_record(event.player_index)
     if not record then return end
-    record.config.mode = ({MODE_PRODUCTION_ORDER, MODE_SUPERMARKET_ORDER, MODE_RECIPE_QUERY,
-      MODE_INVENTORY_QUERY, MODE_SWAP_ORDER})
-      [event.element.selected_index] or MODE_PRODUCTION_ORDER
+    local selected_mode = Gui.mode_from_selected_index(event.element.selected_index)
+    if not selected_mode then return end
+    record.config.mode = selected_mode
     reset_all_modes(record)
     sync_mode_visual(record)
     Gui.close_order_target(game.get_player(event.player_index), true)
@@ -1289,13 +1288,6 @@ script.on_event(defines.events.on_gui_click, function(event)
     end
     return
   end
-  if event.element.name == "bmsc-restart-sequence" then
-    if record then
-      MODES[MODE_SUPERMARKET_ORDER].restart_sequence(record)
-      write_outputs(record, {})
-    end
-    return
-  end
   if tags.bmsc_add_condition and tags.bmsc_condition_set and record then
     local conditions = conditions_for(record, tags.bmsc_condition_set)
     conditions[#conditions + 1] = {
@@ -1346,7 +1338,13 @@ script.on_event(defines.events.on_gui_checked_state_changed, function(event)
     -- 顺序策略改变后，旧的单信号锁定可能属于已经被忽略的另一个订单。
     MODES[MODE_SUPERMARKET_ORDER].reset(record)
     MODES[MODE_SUPERMARKET_ORDER].invalidate_plan(record)
-    Gui.set_sequence_restart_visible(event.element, record.config.sequential_production)
+    return
+  end
+  if event.element.name == "bmsc-recursion-timeout-monitor-item-changes" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    record.config.recursion_timeout_monitor_item_changes = event.element.state == true
+    reset_condition_timer(record, "recursion-timeout")
     return
   end
   if event.element.name == "bmsc-swap-loop" then

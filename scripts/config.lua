@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 17
+Config.schema_revision = 18
 
 Config.mode = {
   production_order = "production_order",
@@ -109,8 +109,8 @@ function Config.default()
     production_timeout_conditions = default_conditions(), -- 参数：满足时重置生产订单超时。
     output_mode = "all",                         -- 参数：生产订单输出产品、原料或两者。
     cache_grid_number = 0,                      -- 参数：分离模式可占用的固体原料格数；0 表示不限制。
-    recurise_depth = 0,                          -- 参数：超市订单最大递归深度；0 表示不限制。
-    recursion_additional_production_rate = 1,    -- 参数：超市订单成品目标的额外生产倍率。
+    recurise_depth = 0,                          -- 参数：超市订单最大递归深度；0 表示不递归。
+    recursion_additional_production_rate = 2,    -- 参数：超市订单成品目标的生产倍率（字段名为旧版兼容保留）。
     recursion_material_demand_rate = 10,         -- 参数：超市订单切入上层配方的原料启动倍率。
     recursion_material_retention_rate = 1,       -- 参数：超市订单当前配方的原料保留倍率。
     recursion_output_mode = "single",            -- 参数：超市订单输出单项或全部结果。
@@ -118,7 +118,7 @@ function Config.default()
     sequential_production = true,                -- 参数：single 模式是否按订单顺序逐个完成。
     recursion_material_wait_time = 0,            -- 参数：single 当前输出被撤销或切换前的保持秒数。
     recursion_timeout = 0,                       -- 参数：single 无变化轮换秒数；0 表示禁用。
-    recursion_timeout_monitor_item_changes = true, -- 参数：当前输出数量变化时是否重置超市超时。
+    recursion_timeout_monitor_item_changes = false, -- 参数：当前输出数量变化时是否重置超市超时。
     recursion_timeout_conditions = default_conditions(),  -- 参数：满足时重置超市订单超时。
     swap_output_mode = "fluid",                 -- 参数：切换订单输出的信号类型。
     swap_timeout = 0,                            -- 参数：重置条件不满足多久后交换红绿输出；0 表示禁用。
@@ -240,7 +240,10 @@ function Config.normalize(source)
     config.recurise_depth = math.max(0, math.floor(source.recurise_depth))
   end
   if type(source.recursion_additional_production_rate) == "number" then
-    config.recursion_additional_production_rate = math.max(0, source.recursion_additional_production_rate)
+    local production_rate = source.recursion_additional_production_rate
+    -- revision 17 及更早版本保存的是“额外倍率”，加 1 后迁移为当前的直接生产倍率。
+    if (tonumber(source.schema_revision) or 0) < 18 then production_rate = production_rate + 1 end
+    config.recursion_additional_production_rate = math.max(2, production_rate)
   end
   if type(source.recursion_material_demand_rate) == "number" then
     config.recursion_material_demand_rate = math.max(0, source.recursion_material_demand_rate)

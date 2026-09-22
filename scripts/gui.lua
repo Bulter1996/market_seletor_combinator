@@ -25,7 +25,7 @@ local function mode_caption(mode)
     [Gui.recipe_query] = {"bmsc.recipe-query"},
     [Gui.inventory_query] = {"bmsc.inventory-query"},
     [Gui.swap_order] = {"bmsc.swap-order"}
-  })[mode] or {"bmsc.production-order"}
+  })[mode] or {"bmsc.supermarket-order"}
 end
 
 ---模式说明只在鼠标停留时出现；配置栏不再为帮助文字预留多行高度。
@@ -38,7 +38,24 @@ local function mode_tooltip(mode)
     [Gui.recipe_query] = {"bmsc.mode-tooltip-recipe-query"},
     [Gui.inventory_query] = {"bmsc.mode-tooltip-inventory-query"},
     [Gui.swap_order] = {"bmsc.mode-tooltip-swap-order"}
-  })[mode] or {"bmsc.mode-tooltip-production-order"}
+  })[mode] or {"bmsc.mode-tooltip-supermarket-order"}
+end
+
+-- 生产订单只为旧存档保留运行兼容，不再作为新配置入口；可选模式集中在这里，
+-- 避免 GUI 顺序和 control.lua 的事件映射各自维护一份索引。
+local SELECTABLE_MODES = {
+  Gui.supermarket_order, Gui.recipe_query, Gui.inventory_query, Gui.swap_order
+}
+
+function Gui.mode_from_selected_index(index)
+  return SELECTABLE_MODES[index]
+end
+
+local function mode_selected_index(mode)
+  for index, candidate in ipairs(SELECTABLE_MODES) do
+    if candidate == mode then return index end
+  end
+  return 0
 end
 -- 参数：每一种数值参数自己的吸附档位。
 -- Factorio 原生离散滑块只能等距吸附，因此滑块内部仍使用 1~6 的索引，再由这里映射实际值。
@@ -54,7 +71,7 @@ Gui.slider_profiles = {
   ["bmsc-swap-timeout"] = {0, 5, 10, 30, 60, 120}      -- 切换订单复用相同时间档。
 }
 -- 超市订单与生产订单共用三项迟滞参数，但使用独立控件名，避免 GUI 树中重名。
-Gui.slider_profiles["bmsc-recursion-additional"] = Gui.slider_profiles["bmsc-additional"]
+Gui.slider_profiles["bmsc-recursion-additional"] = {2, 3, 5, 10, 20, 50}
 Gui.slider_profiles["bmsc-recursion-material"] = Gui.slider_profiles["bmsc-material"]
 Gui.slider_profiles["bmsc-recursion-material-retention"] = Gui.slider_profiles["bmsc-material-retention"]
 Gui.slider_profiles["bmsc-recipe-query-cache-grid-number"] = Gui.slider_profiles["bmsc-cache-grid-number"]
@@ -365,9 +382,6 @@ function Gui.production_diagnostic_tooltip(diagnostic)
   elseif diagnostic.kind == "materials" then
     local shortages = shortage_localised_list(diagnostic.shortages)
     reason = shortages and {"bmsc.production-reason-materials", shortages} or nil
-  elseif diagnostic.kind == "strict_materials" then
-    local shortages = shortage_localised_list(diagnostic.shortages)
-    reason = shortages and {"bmsc.supermarket-reason-strict-materials", shortages} or nil
   elseif diagnostic.kind == "stock_sufficient" then
     local products = type(diagnostic.products) == "table" and diagnostic.products or nil
     local stocks = products and signal_count_localised_list(products, "stock")
@@ -783,7 +797,7 @@ local function work_row_caption(prefix)
   })[prefix]
 end
 
-local function set_work_row(panel, prefix, product, state_caption, color)
+local function set_work_row(panel, prefix, product, state_caption, color, state_tooltip)
   local grid = panel and panel["bmsc-work-grid"]
   local row = grid and {
     label = grid[prefix .. "-kind"], item = grid[prefix .. "-item"],
@@ -806,6 +820,7 @@ local function set_work_row(panel, prefix, product, state_caption, color)
       ["bmsc-work-order"] = {"bmsc.work-idle-order"},
       ["bmsc-work-next"] = {"bmsc.work-idle-next"}
     })[prefix]
+    row.state.tooltip = nil
     return
   end
   row.label.caption = work_row_caption(prefix)
@@ -818,6 +833,7 @@ local function set_work_row(panel, prefix, product, state_caption, color)
   row.separator_three.caption = "｜"
   row.state.caption = state_caption or ""
   row.state.style.font_color = color or {1, 1, 1}
+  row.state.tooltip = state_tooltip
 end
 
 local function material_state(stage)
@@ -838,9 +854,14 @@ function Gui.refresh_work_panel(panel, work)
   local stage = current and current.stage
   local production = stage and stage.single_output ~= false and stage.product_output ~= false and stage or nil
   local material, material_color = material_state(production)
+  local material_stock = 0
+  for _, ingredient in ipairs(production and production.ingredients or {}) do
+    material_stock = material_stock + math.max(0, ingredient.stock or 0)
+  end
   set_work_row(panel, "bmsc-work-production", production and {
     signal = production.signal, target = production.target, stock = production.stock,
-    remaining = math.max(0, (production.target or 0) - (production.stock or 0))} or nil, material, material_color)
+    remaining = math.max(0, (production.target or 0) - (production.stock or 0))} or nil, material, material_color,
+    production and {"bmsc.work-material-stock-tooltip", math.floor(material_stock)} or nil)
   set_work_row(panel, "bmsc-work-order", current and current.product,
     current and {work.source == "network" and "bmsc.work-network" or "bmsc.work-local"} or nil)
   set_work_row(panel, "bmsc-work-next", work.next and work.next.product,
@@ -1020,7 +1041,7 @@ local function add_numeric_slider(parent, caption, name, value, allow_decimal, t
 end
 
 ---添加带左右数值框的倍率控件。
----左端可作为固定下界（生成倍率）或保留倍率（原料倍率）；滑块始终调整右端值，
+---左端可作为固定下界（生产倍率）或保留倍率（原料倍率）；滑块始终调整右端值，
 ---避免为了两端控件引入自定义控件或额外持久化状态。
 local function add_rate_range(parent, caption, name, lower_name, lower_value, upper_value, lower_locked, tooltip)
   parent.add{type = "label", caption = caption}
@@ -1426,20 +1447,6 @@ function Gui.set_recursion_single_options_visible(source_element, visible)
   local sequential = find_descendant(fields, "bmsc-sequential-production")
   if sequential then sequential.visible = visible end
   timeout.visible = visible
-  Gui.set_sequence_restart_visible(source_element, visible and sequential and sequential.state == true)
-end
-
----只在启用顺序制作时显示“从头开始”按钮。
----@param source_element LuaGuiElement 超市订单参数区内的任意控件。
----@param visible boolean 是否显示。
----@return nil
-function Gui.set_sequence_restart_visible(source_element, visible)
-  local window = Gui.containing_window(source_element)
-  local content = window and window["bmsc-content"]
-  local details = content and find_descendant(content, "bmsc-recursion-details")
-  local settings = details and details["bmsc-recursion-settings"]
-  local restart = settings and settings["bmsc-restart-sequence"]
-  if restart then restart.visible = visible end
 end
 
 ---只在生产订单的“所有（信号分离）”输出模式下显示缓存格数。
@@ -1634,10 +1641,9 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   mode_fields.style.horizontally_stretchable = true
   mode_fields.add{type = "label", caption = {"bmsc.mode"}, style = "heading_2_label"}
   mode_fields.add{type = "drop-down", name = "bmsc-mode",
-    items = {{"bmsc.production-order"}, {"bmsc.supermarket-order"}, {"bmsc.recipe-query"},
+    items = {{"bmsc.supermarket-order"}, {"bmsc.recipe-query"},
       {"bmsc.inventory-query"}, {"bmsc.swap-order"}},
-    selected_index = ({[Gui.production_order] = 1, [Gui.supermarket_order] = 2,
-      [Gui.recipe_query] = 3, [Gui.inventory_query] = 4, [Gui.swap_order] = 5})[config.mode] or 1,
+    selected_index = mode_selected_index(config.mode),
     tooltip = mode_tooltip(config.mode)}
 
   -- 模式固定在最上方；网络、订单和超时分别由自己的 GUI 组件承载。
@@ -1720,8 +1726,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     items = validation_items, selected_index = selected_validation,
     tooltip = {"bmsc.inventory-validation-tooltip"}}
   inventory_validation.style.width = 190
-  add_rate_range(recursion_fields, {"bmsc.generation-rate"}, "bmsc-recursion-additional",
-    "bmsc-recursion-additional-min", 0, config.recursion_additional_production_rate, true,
+  add_rate_range(recursion_fields, {"bmsc.production-rate"}, "bmsc-recursion-additional",
+    "bmsc-recursion-additional-min", 1, config.recursion_additional_production_rate, true,
     {"bmsc.recursion-additional-rate-tooltip"})
   add_rate_range(recursion_fields, {"bmsc.material-range"}, "bmsc-recursion-material",
     "bmsc-recursion-material-retention", config.recursion_material_retention_rate or 1,
@@ -1741,11 +1747,6 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   output_controls.add{type = "checkbox", name = "bmsc-sequential-production",
     caption = {"bmsc.sequential-production"}, state = config.sequential_production ~= false,
     tooltip = {"bmsc.sequential-production-tooltip"}, visible = timeout_visible}
-  local restart_visible = timeout_visible and config.sequential_production ~= false
-  recursion_fields.add{type = "button", name = "bmsc-restart-sequence",
-    caption = {"bmsc.restart-sequence"}, tooltip = {"bmsc.restart-sequence-tooltip"},
-    visible = restart_visible}
-
   local timeout_settings = recursion_details.add{type = "frame", name = "bmsc-recursion-timeout-settings",
     style = "inside_shallow_frame_with_padding", direction = "vertical", visible = timeout_visible}
   timeout_settings.style.horizontally_stretchable = true
@@ -1755,14 +1756,12 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   timeout_fields.style.horizontally_stretchable = true
   add_timeout_slider(timeout_fields, {"bmsc.material-wait-time"}, "bmsc-recursion-material-wait-time",
     config.recursion_material_wait_time or 0, true, {"bmsc.material-wait-time-tooltip"})
-  add_timeout_slider(timeout_fields, {"bmsc.recursion-timeout"}, "bmsc-recursion-timeout",
-    config.recursion_timeout or 0, true, {"bmsc.recursion-timeout-tooltip"})
-  timeout_fields.add{type = "label", caption = {"bmsc.monitor-item-quantity-changes"}}
-  timeout_fields.add{
-    type = "drop-down", name = "bmsc-recursion-timeout-monitor-item-changes",
-    items = {{"bmsc.yes"}, {"bmsc.no"}},
-    selected_index = config.recursion_timeout_monitor_item_changes ~= false and 1 or 2,
-    tooltip = {"bmsc.monitor-item-quantity-changes-tooltip"}}
+  local recursion_timeout = add_timeout_slider(timeout_fields, {"bmsc.recursion-timeout"},
+    "bmsc-recursion-timeout", config.recursion_timeout or 0, true, {"bmsc.recursion-timeout-tooltip"})
+  recursion_timeout.parent.add{
+    type = "checkbox", name = "bmsc-recursion-timeout-monitor-item-changes",
+    caption = {"bmsc.monitor-quantity"}, state = config.recursion_timeout_monitor_item_changes == true,
+    tooltip = {"bmsc.recursion-monitor-quantity-tooltip"}}
   add_conditions_editor(timeout_settings, "recursion-timeout", {"bmsc.timeout-reset-conditions"},
     config.recursion_timeout_conditions)
   local recipe_query_details = config_page.add{type = "flow", name = "bmsc-recipe-query-details", direction = "vertical"}

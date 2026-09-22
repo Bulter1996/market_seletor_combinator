@@ -599,6 +599,7 @@ script.on_event(defines.events.on_gui_opened, function(event)
   end
 end)
 script.on_event(defines.events.on_gui_closed, function(event)
+  if NetworkGui.on_closed(event, state().combinators) then return end
   if event.element and event.element.valid and event.element.name == NetworkGui.name then
     event.element.destroy()
     return
@@ -627,6 +628,21 @@ script.on_event(defines.events.on_gui_closed, function(event)
   Gui.hide_network_popup(player)
   event.element.destroy()
 end)
+script.on_event(defines.events.on_gui_location_changed, function(event)
+  NetworkGui.on_location_changed(event)
+end)
+-- custom-input 属于数据阶段。热重载 control.lua 而未完整重启游戏时原型尚不存在，
+-- 此处跳过注册以避免 Unknown event；完整重启后会按 event_id 正常启用滚轮缩放。
+local function register_tree_zoom_input(name, delta)
+  local input = prototypes.custom_input and prototypes.custom_input[name]
+  if input then
+    script.on_event(input.event_id, function(event)
+      NetworkGui.on_zoom(event, state().combinators, delta)
+    end)
+  end
+end
+register_tree_zoom_input("bmsc-tree-zoom-in", 0.25)
+register_tree_zoom_input("bmsc-tree-zoom-out", -0.25)
 
 ---根据玩家索引取得其当前正在编辑的组合器记录。
 ---@param player_index uint 玩家索引。

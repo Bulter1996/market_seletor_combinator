@@ -18,6 +18,13 @@ local ENTITY_ICON = "__market-selector-combinator__/graphics/icons/market-select
 data:extend({{
   type = "shortcut", name = "bmsc-production-network", action = "lua", style = "blue",
   icon = ENTITY_ICON, icon_size = 64, small_icon = ENTITY_ICON, small_icon_size = 64
+}, {
+  -- 保留裸滚轮给树视图滚动；Option/Alt + 滚轮才缩放，避免全局抢占原版滚动行为。
+  type = "custom-input", name = "bmsc-tree-zoom-in", key_sequence = "ALT + mouse-wheel-up",
+  consuming = "game-only", action = "lua"
+}, {
+  type = "custom-input", name = "bmsc-tree-zoom-out", key_sequence = "ALT + mouse-wheel-down",
+  consuming = "game-only", action = "lua"
 }})
 
 -- 复制选择器组合器的原型作为基础，然后修改为我们需要的实体

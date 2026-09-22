@@ -222,6 +222,7 @@ local function publish(record, execution, parent, destination)
   if not inventory then return end
   local plan = execution.supermarket_order_plan
   if not plan then return end
+  local depth_limit = math.max(0, math.floor(tonumber(record.config.recurise_depth) or 0))
   for _, root in ipairs(plan.roots) do
     local lineage = {}
     for _, key in ipairs(parent and parent.lineage or {}) do lineage[#lineage + 1] = key end
@@ -229,6 +230,8 @@ local function publish(record, execution, parent, destination)
     local available = {}
     for key, qty in pairs(inventory) do available[key] = qty end
     local function visit(node, required, path)
+      -- 本机递归的边界输出不等同于网络缺料请求；不能绕过玩家设定的展开深度。
+      if depth_limit > 0 and (node.level or 1) > depth_limit then return end
       local key = Util.signal_key(node.signal)
       local stock = math.max(0, available[key] or 0)
       available[key] = math.max(0, stock - required)

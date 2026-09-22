@@ -52,12 +52,13 @@ local player = {index = 1, force = force, gui = {screen = element()},
   display_scale = 1, display_resolution = {width = 1920, height = 1080},
   mod_settings = { ["bmsc-policy-gui-opacity"] = {value = "60"} },
   print = function(message) messages[#messages + 1] = message end}
+player.set_controller = function(spec) player.remote_controller = spec end
 local record = {entity = {valid = true, force = force, unit_number = 1, combinator_description = "",
   get_wire_connector = function() return {connection_count = 0} end},
   config = Config.default()}
 record.config.recipe_policies = {plate = {{recipe = "plate", priority = 0, demand = 2, retention = 1}}}
 game = {get_player = function() return player end}
-defines = {mouse_button_type = {left = 1, right = 2}, wire_connector_id = {
+defines = {controllers = {remote = 1}, mouse_button_type = {left = 1, right = 2}, wire_connector_id = {
   combinator_input_red = 1, combinator_input_green = 2, combinator_output_red = 3, combinator_output_green = 4}}
 storage = {bmsc_network_views = {[1] = {unit = 1, signal = {type = "item", name = "plate"}, count = 1}}}
 prototypes = {
@@ -146,6 +147,20 @@ assert(numbered[#numbered - 1].number == 1 and numbered[#numbered].number == 4,
 assert(numbered[#numbered].style_name == "red_circuit_network_content_slot",
   "an empty red inventory input is a valid zero stock and must be shown as insufficient")
 assert(has_connector(player.gui.screen[UI.tree_name]), "tree must draw connectors between recipe products and ingredients")
+record.config.recurise_depth = 1
+record.entity.position, record.entity.surface = {x = 10, y = 20}, {index = 1, name = "nauvis"}
+record.supermarket_order_plan = {roots = {{source_key = "item:plate:normal", level = 1,
+  signal = {type = "item", name = "plate"}, product_amount = 1, recipe_name = "plate", children = {{
+    level = 2, signal = {type = "item", name = "ore"}, amount = 1, children = {{
+      level = 3, signal = {type = "item", name = "coal"}, amount = 1, children = {}}}}}}}}
+UI.open_tree(player, record, {type = "item", name = "plate"}, 1)
+numbered = {}
+for _, slot in ipairs(sprites(player.gui.screen[UI.tree_name])) do if slot.number ~= nil then numbered[#numbered + 1] = slot end end
+assert(#numbered == 2, "a limited recursion tree must retain its boundary output but omit deeper descendants")
+assert(UI.on_click({player_index = 1, element = {tags = {bmsc_net_action = "locate", unit = 1}}}, {[1] = record}))
+assert(player.remote_controller.position == record.entity.position and player.zoom == 0.5,
+  "locating a combinator must use a readable remote zoom instead of the closest view")
+record.config.recurise_depth = 0
 record.config.inventory_validation = nil
 UI.open_policy(player, record, {type = "item", name = "plate"}, {x = 400, y = 160})
 local policy = player.gui.screen[UI.policy_name]

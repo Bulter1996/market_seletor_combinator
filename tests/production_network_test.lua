@@ -189,4 +189,11 @@ for _, t in ipairs(Network.tasks(1)) do
   if t.blocked == "cycle" then found_cycle = true; assert(not t.owner) end
 end
 assert(found_child and found_cycle, "multi-hop needs preserve ancestor lineage")
+
+-- 网络发布必须与本机递归使用同一深度边界，不能把边界以下的终端材料另行发布。
+storage.bmsc_production_network = nil; storage.combinators = {}
+a = record(1, "assembler", {}, {gear = 10})
+a.config.recurise_depth = 1
+tick(); tick()
+assert(#Network.tasks(1) == 0, "network publishing must not traverse beyond the configured recursion depth")
 print("production network: ok")

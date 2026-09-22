@@ -8,6 +8,7 @@ local UI = {
   tree_name = "bmsc-order-target-window",
   policy_name = "bmsc-tree-policy-window"
 }
+local LOCATE_ZOOM = 1 -- 远程定位需保留周边参照，不能以最近视角贴满目标组合器。
 local LARGE_ICON = 56
 local POLICY_ICON = 42 -- 原版 32px 槽位的约 1.3 倍，和树节点图标区分但不喧宾夺主。
 local POLICY_FIELD_WIDTH = 56
@@ -269,7 +270,21 @@ end
 local function tree_root(record, signal)
   local roots = record.supermarket_order_plan and record.supermarket_order_plan.roots or {}
   for _, node in ipairs(roots) do
-    if node.source_key == Util.signal_key(signal) then return node end
+    if node.source_key == Util.signal_key(signal) then
+      local limit = math.max(0, math.floor(tonumber(record.config.recurise_depth) or 0))
+      if limit == 0 then return node end
+      local function trim(current)
+        local visible = {}
+        for key, value in pairs(current) do visible[key] = value end
+        visible.children = {}
+        -- 深度上限的下一层是当前输出边界，显示它但不再展开其原料。
+        if (current.level or 1) <= limit then
+          for _, child in ipairs(current.children or {}) do visible.children[#visible.children + 1] = trim(child) end
+        end
+        return visible
+      end
+      return trim(node)
+    end
   end
 end
 
@@ -608,6 +623,7 @@ function UI.on_click(event, records)
     local r = records[tags.unit]
     if r and r.entity.valid and r.entity.force == player.force then
       player.set_controller{type = defines.controllers.remote, position = r.entity.position, surface = r.entity.surface}
+      player.zoom = LOCATE_ZOOM
     end
   elseif action == "release" then
     Network.release(tags.task, player.force.index)

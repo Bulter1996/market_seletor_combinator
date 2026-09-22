@@ -765,6 +765,14 @@ local function add_work_panel(parent)
   return panel
 end
 
+local function work_row_caption(prefix)
+  return ({
+    ["bmsc-work-production"] = {"bmsc.work-production"},
+    ["bmsc-work-order"] = {"bmsc.work-order"},
+    ["bmsc-work-next"] = {"bmsc.work-next"}
+  })[prefix]
+end
+
 local function set_work_row(panel, prefix, product, state_caption, color)
   local grid = panel and panel["bmsc-work-grid"]
   local row = grid and {
@@ -778,17 +786,19 @@ local function set_work_row(panel, prefix, product, state_caption, color)
     and row.separator_two and row.stock and row.state) then return end
   local visible = product and product.signal
   if not visible then
-    row.label.caption, row.name.caption, row.icon.visible = "", "", false
+    -- 三行工作摘要始终保留，避免空闲时只留下无法解释的大空框。
+    row.label.caption, row.name.caption, row.icon.visible = work_row_caption(prefix), "—", false
     for _, field in ipairs({row.target, row.separator, row.remaining, row.separator_two, row.stock, row.state}) do
       field.caption = ""
     end
+    row.state.caption = ({
+      ["bmsc-work-production"] = {"bmsc.work-idle-production"},
+      ["bmsc-work-order"] = {"bmsc.work-idle-order"},
+      ["bmsc-work-next"] = {"bmsc.work-idle-next"}
+    })[prefix]
     return
   end
-  row.label.caption = ({
-    ["bmsc-work-production"] = {"bmsc.work-production"},
-    ["bmsc-work-order"] = {"bmsc.work-order"},
-    ["bmsc-work-next"] = {"bmsc.work-next"}
-  })[prefix]
+  row.label.caption = work_row_caption(prefix)
   row.icon.visible, row.icon.sprite, row.icon.elem_tooltip = true, signal_sprite_path(product.signal), signal_elem_tooltip(product.signal)
   row.name.caption = signal_localised_name(product.signal)
   row.target.caption = tostring(math.ceil(product.target or 0))

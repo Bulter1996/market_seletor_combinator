@@ -129,7 +129,32 @@ local function current_work_summary(record)
   end
   -- “当前订单”只承载单一工作项；全量输出同时处理多个订单时，避免 pairs 的偶然顺序制造误导。
   if active_count ~= 1 then current = nil end
-  return {current = current, next = next_key and diagnostics[next_key] or nil, source = source}
+  local network_orders = {}
+  for _, task in ipairs(record.network_assignments or {}) do
+    if task.signal and task.quantity and task.quantity > 0 then
+      network_orders[#network_orders + 1] = {signal = Util.make_signal(
+        task.signal.type, task.signal.name, task.signal.quality), count = task.quantity}
+    end
+  end
+  local linked_inventory = {}
+  local stage = current and current.stage
+  if record.config.inventory_validation == Config.inventory_validation.linked and stage and stage.ingredients then
+    local requested = {}
+    for _, ingredient in ipairs(stage.ingredients) do
+      if ingredient.signal then requested[Util.signal_key(ingredient.signal)] = ingredient.signal end
+    end
+    local shared = MODES[MODE_INVENTORY_QUERY].get_shared_inventory(record.entity.force, requested)
+    if shared then
+      for _, ingredient in ipairs(stage.ingredients) do
+        local signal = ingredient.signal
+        if signal then linked_inventory[#linked_inventory + 1] = {
+          signal = Util.make_signal(signal.type, signal.name, signal.quality),
+          count = math.max(0, shared[Util.signal_key(signal)] or 0)} end
+      end
+    end
+  end
+  return {current = current, next = next_key and diagnostics[next_key] or nil, source = source,
+    network_orders = network_orders, linked_inventory = linked_inventory}
 end
 
 ---销毁某条记录的全部隐藏输出代理。
@@ -1203,15 +1228,16 @@ script.on_event(defines.events.on_gui_click, function(event)
   if tags.bmsc_signal_panel_icon then
     if event.shift and event.button == defines.mouse_button_type.left
       and tags.bmsc_signal_side == "input" and record
-      and ((tags.bmsc_signal_color == "green" and (record.config.mode == MODE_PRODUCTION_ORDER
-        or record.config.mode == MODE_SUPERMARKET_ORDER))
-        or record.config.mode == MODE_RECIPE_QUERY) then
+      and (((tags.bmsc_signal_source == "local-order" or tags.bmsc_signal_source == "network-order")
+        and (record.config.mode == MODE_PRODUCTION_ORDER or record.config.mode == MODE_SUPERMARKET_ORDER))
+        or (tags.bmsc_signal_source == "local-order" or tags.bmsc_signal_source == "local-stock")
+          and record.config.mode == MODE_RECIPE_QUERY) then
       local order_signal = signal_from_tags(tags)
       if order_signal and Util.is_recipe_input(order_signal) then
         open_order_target(player, record, order_signal, event.element.number or 0)
       end
     elseif event.button == defines.mouse_button_type.right and tags.bmsc_signal_side == "input"
-      and tags.bmsc_signal_color == "green"
+      and tags.bmsc_signal_source == "local-order"
       and record and record.config.mode == MODE_SUPERMARKET_ORDER
       and MODES[MODE_SUPERMARKET_ORDER].defer_current_order(record, tags.bmsc_signal_key) then
       -- defer_current_order 已先清除旧输出选择，因此这次重算不会进入原料等待门。
@@ -1220,7 +1246,7 @@ script.on_event(defines.events.on_gui_click, function(event)
         player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
     elseif event.button == defines.mouse_button_type.left and not event.alt
       and not event.control and not event.shift and tags.bmsc_signal_side == "input"
-      and tags.bmsc_signal_color == "green"
+      and tags.bmsc_signal_source == "local-order"
       and record and record.config.mode == MODE_SUPERMARKET_ORDER
       and signal_double_clicked(event.player_index, record, tags.bmsc_signal_key)
       and MODES[MODE_SUPERMARKET_ORDER].prioritize_waiting_order(record, tags.bmsc_signal_key) then

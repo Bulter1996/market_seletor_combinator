@@ -502,7 +502,10 @@ end
 ---@param networks table 当前侧的红绿网络。
 ---@param diagnostics table|nil 以 Util.signal_key 为键的绿色输入诊断。
 ---@return nil
-local function refresh_signal_section(section, networks, diagnostics)
+local function refresh_signal_section(section, networks, diagnostics, source)
+  -- 热更新不会重建已打开的旧窗口；旧布局没有新增的来源子框时跳过本轮刷新，
+  -- 玩家关闭并重新打开组合器后会按新结构创建，不能因此让 on_nth_tick 中断。
+  if not section or section.valid == false then return end
   local entries = collect_signal_entries(networks, diagnostics)
   local signature_parts = {}
   for _, entry in ipairs(entries) do
@@ -511,6 +514,7 @@ local function refresh_signal_section(section, networks, diagnostics)
       .. tostring(entry.sort_priority) .. "|" .. entry.key
   end
   local signature = table.concat(signature_parts, "\n")
+  section.visible = #entries > 0
   local scroll = section["bmsc-signal-scroll"]
   if not (scroll and scroll.valid) then return end
   local slots = scroll["bmsc-signal-slots"]
@@ -540,7 +544,8 @@ local function refresh_signal_section(section, networks, diagnostics)
       tooltip = Gui.production_diagnostic_tooltip(diagnostic),
       tags = {
         bmsc_signal_panel_icon = true,
-        bmsc_signal_side = section.name == "bmsc-input-signals" and "input" or "output",
+        bmsc_signal_side = source == "output" and "output" or "input",
+        bmsc_signal_source = source,
         bmsc_signal_color = entry.color,
         bmsc_signal_key = Util.signal_key(entry.signal),
         bmsc_signal_type = entry.signal.type or "item",
@@ -687,7 +692,7 @@ end
 ---@param caption LocalisedString 子 GUI 标题。
 ---@param maximum_content_height uint 滚动内容的最大高度。
 ---@return LuaGuiElement section 创建出的子 GUI。
-local function add_signal_section(parent, name, caption, maximum_content_height)
+local function add_signal_section(parent, name, caption, maximum_content_height, minimum_content_height)
   local section = parent.add{type = "frame", name = name,
     style = "inside_shallow_frame_with_padding", direction = "vertical"}
   section.style.horizontally_stretchable = true
@@ -696,8 +701,8 @@ local function add_signal_section(parent, name, caption, maximum_content_height)
     direction = "vertical", horizontal_scroll_policy = "never", vertical_scroll_policy = "auto"}
   scroll.style.horizontally_stretchable = true
   scroll.style.vertically_squashable = true
-  -- 父面板达到高度上限时，每个输入/输出子区仍至少保留两行槽位。
-  scroll.style.minimal_height = 96  -- 至少保留两行信号，避免内容区视觉过窄。
+  -- 多来源输入并存时每组保留一行；仅有输入/输出两组的旧布局仍保留两行。
+  scroll.style.minimal_height = minimum_content_height or 96
   scroll.style.maximal_height = maximum_content_height
   return section
 end
@@ -713,51 +718,56 @@ function Gui.add_signal_panel(parent, player)
     style = "inside_shallow_frame_with_padding", direction = "vertical"}
   signals.style.horizontally_stretchable = true
 
-  -- GUI 尺寸使用缩放后的逻辑像素。信号公共区最高占半个屏幕；扣除标题、内边距和
-  -- 两个子面板标题后，剩余高度由输入、输出各自的滚动区均分。
+  -- GUI 尺寸使用缩放后的逻辑像素。输入来源按语义分组；空组会隐藏，因此常见布局
+  -- 不会为网络订单或关联库存预留空白。
   local display_scale = player.display_scale > 0 and player.display_scale or 1
   local signal_panel_height = math.floor(player.display_resolution.height / display_scale / 2)
-  local section_content_height = math.max(48, math.floor((signal_panel_height - 118) / 2))
+  local section_content_height = math.max(48, math.floor((signal_panel_height - 210) / 5))
   signals.style.maximal_height = signal_panel_height
   signals.add{type = "label", caption = {"bmsc.signal-panel-title"}, style = "heading_2_label"}
-  -- 保持实体面板既有阅读顺序：先看输入，再向下查看输出。
-  local input_signals = add_signal_section(
-    signals, "bmsc-input-signals", {"bmsc.input-signals"}, section_content_height)
-  input_signals.style.bottom_margin = 8
+  add_signal_section(signals, "bmsc-network-order-signals", {"bmsc.network-order-signals"}, section_content_height, 48)
+  add_signal_section(signals, "bmsc-local-green-signals", {"bmsc.local-green-signals"}, section_content_height, 48)
+  add_signal_section(signals, "bmsc-local-red-signals", {"bmsc.local-red-signals"}, section_content_height, 48)
+  local linked = add_signal_section(
+    signals, "bmsc-linked-inventory-signals", {"bmsc.linked-inventory-signals"}, section_content_height, 48)
+  linked.style.bottom_margin = 8
   add_signal_section(signals, "bmsc-output-signals", {"bmsc.output-signals"}, section_content_height)
   return signals
 end
 
 local function add_work_row(grid, name, caption)
-  local label = grid.add{type = "label", name = name .. "-kind", caption = caption}
-  label.style.minimal_width = 72
+  local label = grid.add{type = "label", name = name .. "-kind", caption = caption, style = "heading_2_label"}
+  label.style.minimal_width = 104
   local item = grid.add{type = "flow", name = name .. "-item", direction = "horizontal"}
-  item.style.minimal_width = 170
+  item.style.minimal_width = 48
   item.style.vertical_align = "center"
   local icon = item.add{type = "sprite-button", name = name .. "-icon", style = "slot_button", visible = false}
-  local item_name = item.add{type = "label", name = name .. "-name", caption = ""}
   local function value(suffix, tooltip)
     local field = grid.add{type = "label", name = name .. suffix, caption = "", tooltip = tooltip}
-    field.style.minimal_width, field.style.horizontal_align = 64, "right"
+    field.style.minimal_width, field.style.horizontal_align = 56, "center"
     return field
   end
   value("-target", {"bmsc.work-target-tooltip"})
   local separator = grid.add{type = "label", name = name .. "-separator-one", caption = "｜"}
+  separator.style.horizontal_align = "center"
   value("-remaining", {"bmsc.work-remaining-tooltip"})
   local separator_two = grid.add{type = "label", name = name .. "-separator-two", caption = "｜"}
+  separator_two.style.horizontal_align = "center"
   value("-stock", {"bmsc.work-stock-tooltip"})
+  local separator_three = grid.add{type = "label", name = name .. "-separator-three", caption = "｜"}
+  separator_three.style.horizontal_align = "center"
   local state = grid.add{type = "label", name = name .. "-state", caption = ""}
-  state.style.minimal_width = 88
-  return {label = label, item = item, icon = icon, name = item_name,
+  state.style.minimal_width = 104
+  return {label = label, item = item, icon = icon,
     target = grid[name .. "-target"], separator = separator, remaining = grid[name .. "-remaining"],
-    separator_two = separator_two, stock = grid[name .. "-stock"], state = state}
+    separator_two = separator_two, stock = grid[name .. "-stock"], separator_three = separator_three, state = state}
 end
 
 local function add_work_panel(parent)
   local panel = parent.add{type = "frame", name = "bmsc-work-panel",
     style = "inside_shallow_frame_with_padding", direction = "vertical"}
   panel.style.horizontally_stretchable = true
-  local grid = panel.add{type = "table", name = "bmsc-work-grid", column_count = 8}
+  local grid = panel.add{type = "table", name = "bmsc-work-grid", column_count = 9}
   grid.style.horizontal_spacing = 4
   add_work_row(grid, "bmsc-work-production", {"bmsc.work-production"})
   add_work_row(grid, "bmsc-work-order", {"bmsc.work-order"})
@@ -779,16 +789,16 @@ local function set_work_row(panel, prefix, product, state_caption, color)
     label = grid[prefix .. "-kind"], item = grid[prefix .. "-item"],
     target = grid[prefix .. "-target"], separator = grid[prefix .. "-separator-one"],
     remaining = grid[prefix .. "-remaining"], separator_two = grid[prefix .. "-separator-two"],
-    stock = grid[prefix .. "-stock"], state = grid[prefix .. "-state"]}
+    stock = grid[prefix .. "-stock"], separator_three = grid[prefix .. "-separator-three"], state = grid[prefix .. "-state"]}
   if not row then return end
-  row.icon, row.name = row.item[prefix .. "-icon"], row.item[prefix .. "-name"]
-  if not (row.label and row.icon and row.name and row.target and row.separator and row.remaining
-    and row.separator_two and row.stock and row.state) then return end
+  row.icon = row.item[prefix .. "-icon"]
+  if not (row.label and row.icon and row.target and row.separator and row.remaining
+    and row.separator_two and row.stock and row.separator_three and row.state) then return end
   local visible = product and product.signal
   if not visible then
     -- 三行工作摘要始终保留，避免空闲时只留下无法解释的大空框。
-    row.label.caption, row.name.caption, row.icon.visible = work_row_caption(prefix), "—", false
-    for _, field in ipairs({row.target, row.separator, row.remaining, row.separator_two, row.stock, row.state}) do
+    row.label.caption, row.icon.visible = work_row_caption(prefix), false
+    for _, field in ipairs({row.target, row.separator, row.remaining, row.separator_two, row.stock, row.separator_three, row.state}) do
       field.caption = ""
     end
     row.state.caption = ({
@@ -800,12 +810,12 @@ local function set_work_row(panel, prefix, product, state_caption, color)
   end
   row.label.caption = work_row_caption(prefix)
   row.icon.visible, row.icon.sprite, row.icon.elem_tooltip = true, signal_sprite_path(product.signal), signal_elem_tooltip(product.signal)
-  row.name.caption = signal_localised_name(product.signal)
   row.target.caption = tostring(math.ceil(product.target or 0))
   row.separator.caption = "｜"
   row.remaining.caption = tostring(math.ceil(product.remaining or 0))
   row.separator_two.caption = "｜"
   row.stock.caption = tostring(math.floor(product.stock or 0))
+  row.separator_three.caption = "｜"
   row.state.caption = state_caption or ""
   row.state.style.font_color = color or {1, 1, 1}
 end
@@ -844,10 +854,23 @@ end
 ---@param output_networks table 输出端红绿网络数据。
 ---@param input_diagnostics table|nil 生产订单绿色输入信号的未输出原因。
 ---@return nil
-function Gui.refresh_signal_panel(signals, input_networks, output_networks, input_diagnostics)
+function Gui.refresh_signal_panel(signals, input_networks, output_networks, input_diagnostics, work)
   if not (signals and signals.valid) then return end
-  refresh_signal_section(signals["bmsc-input-signals"], input_networks, input_diagnostics)
-  refresh_signal_section(signals["bmsc-output-signals"], output_networks)
+  local green, red = {}, {}
+  for _, network in ipairs(input_networks or {}) do
+    local target = network.color == "green" and green or red
+    target[#target + 1] = network
+  end
+  work = work or {}
+  refresh_signal_section(signals["bmsc-network-order-signals"], {
+    {color = "green", signals = work.network_orders or {}}
+  }, nil, "network-order")
+  refresh_signal_section(signals["bmsc-local-green-signals"], green, input_diagnostics, "local-order")
+  refresh_signal_section(signals["bmsc-local-red-signals"], red, nil, "local-stock")
+  refresh_signal_section(signals["bmsc-linked-inventory-signals"], {
+    {color = "green", signals = work.linked_inventory or {}}
+  }, nil, "linked-inventory")
+  refresh_signal_section(signals["bmsc-output-signals"], output_networks, nil, "output")
 end
 
 ---让一个 GUI 元素及其全部子元素不参与鼠标命中。
@@ -1139,7 +1162,7 @@ function Gui.refresh_connection_status(player, entity, current_output_networks, 
     -- 定时计算时优先使用“本轮实际写入代理”的快照，保证 GUI 与线路输出同源。
     -- 打开窗口后的首次刷新还没有传入快照，此时才从代理线路读取已有信号。
     local signal_output_networks = current_output_networks or get_side_networks(entity, "output", true)
-    Gui.refresh_signal_panel(runtime["bmsc-signals"], input_networks, signal_output_networks, input_diagnostics)
+    Gui.refresh_signal_panel(runtime["bmsc-signals"], input_networks, signal_output_networks, input_diagnostics, work)
   end
 end
 
@@ -1216,7 +1239,6 @@ function Gui.show_page(source_element, page)
   local overlay = window and window.parent[Gui.config_overlay_name]
   if overlay then
     overlay.visible = not overlay.visible
-    set_config_window_width(window, overlay.visible)
     if overlay.visible and window.location then
       overlay.location = {x = window.location.x, y = window.location.y + 56}
     end
@@ -1498,13 +1520,15 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   local display_scale = player.display_scale > 0 and player.display_scale or 1
   local logical_width = math.floor(player.display_resolution.width / display_scale)
   local maximum_window_width = math.min(1280, math.max(320, logical_width - 80))
-  local compact_window_width = math.min(720, maximum_window_width)
+  local compact_window_width = math.min(560, maximum_window_width)
+  -- 运行栏两侧和双栏中缝都使用 8 px；展开只增加配置栏与这些必要间距。
+  local expanded_window_width = math.min(maximum_window_width, compact_window_width + 444)
   local maximum_window_height = math.floor(player.display_resolution.height / display_scale * 2 / 3)
   local show_side_by_side = maximum_window_width >= 1040
   config_open = config_open == true
   local frame = player.gui.screen.add{type = "frame", name = Gui.name, direction = "vertical"}
-  frame.tags = {bmsc_compact_width = compact_window_width, bmsc_expanded_width = maximum_window_width}
-  frame.style.width = config_open and maximum_window_width or compact_window_width
+  frame.tags = {bmsc_compact_width = compact_window_width, bmsc_expanded_width = expanded_window_width}
+  frame.style.width = config_open and show_side_by_side and expanded_window_width or compact_window_width
   frame.style.maximal_height = maximum_window_height  -- 整个窗口最多占缩放后屏幕高度的三分之二。
   frame.force_auto_center()
 
@@ -1533,6 +1557,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   content.style.horizontally_stretchable = true
   content.style.vertically_squashable = true
   content.style.horizontal_spacing = 8
+  content.style.left_padding = 8
+  content.style.right_padding = 8
   local column_height = math.max(120, maximum_window_height - 40)
   local config_column
   if show_side_by_side then
@@ -1548,11 +1574,13 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
     style = "shallow_scroll_pane", direction = "vertical",
     horizontal_scroll_policy = "auto", vertical_scroll_policy = "auto"}
   runtime_column.style.maximal_height = column_height
+  runtime_column.style.minimal_width = compact_window_width - 32
+  runtime_column.style.maximal_width = compact_window_width - 32
   runtime_column.style.horizontally_stretchable = true
   runtime_column.style.vertically_squashable = true
   local runtime_page = runtime_column.add{type = "flow", name = "bmsc-runtime-page", direction = "vertical"}
   runtime_page.style.horizontally_stretchable = true
-  runtime_page.style.minimal_width = 580
+  runtime_page.style.minimal_width = 460
 
   if not show_side_by_side then
     local overlay = player.gui.screen.add{type = "frame", name = Gui.config_overlay_name,

@@ -242,7 +242,7 @@ assert(content.type == "flow" and content.direction == "horizontal",
   "main content must be a horizontal layout container, not one shared vertical scroll pane")
 assert(runtime_page.visible and not config_column.visible,
   "main window must open with the parameter column collapsed")
-assert(main.style.width == 720,
+assert(main.style.width == 552,
   "a collapsed configuration page must keep the runtime window compact")
 assert(runtime_page["bmsc-signals"], "runtime page must own the shared signal panel")
 local work_grid = runtime_page["bmsc-work-panel"]["bmsc-work-grid"]
@@ -250,6 +250,8 @@ assert(work_grid["bmsc-work-production-target"].caption == "100"
   and work_grid["bmsc-work-production-remaining"].caption == "75"
   and work_grid["bmsc-work-production-stock"].caption == "25",
   "current production must keep target, shortage, and stock in fixed numeric columns")
+assert(work_grid["bmsc-work-production-separator-three"].caption == "｜",
+  "stock and state must remain separate columns")
 assert(work_grid["bmsc-work-next-kind"].caption == ""
   and work_grid["bmsc-work-next-separator-one"].caption == ""
   and work_grid["bmsc-work-next-separator-two"].caption == "",
@@ -258,19 +260,29 @@ local signal_panel = Gui.add_signal_panel(element(), player)
 Gui.refresh_signal_panel(signal_panel, {
   {color = "red", signals = {{signal = {type = "item", name = "plate"}, count = 3}}},
   {color = "green", signals = {{signal = {type = "item", name = "plate"}, count = 7}}}
-}, {}, {})
-local input_slots = signal_panel["bmsc-input-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
-assert(#input_slots.children == 1 and input_slots.children[1].number == 10
-  and input_slots.children[1].tags.bmsc_signal_color == "green",
-  "the same red and green signal must render once with the combined count and retain green input actions")
+}, {}, {}, {
+  network_orders = {{signal = {type = "item", name = "gear"}, count = 10}},
+  linked_inventory = {{signal = {type = "item", name = "ore"}, count = 80}}
+})
+local green_slots = signal_panel["bmsc-local-green-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
+local red_slots = signal_panel["bmsc-local-red-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
+local network_slots = signal_panel["bmsc-network-order-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
+local linked_slots = signal_panel["bmsc-linked-inventory-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
+assert(#green_slots.children == 1 and green_slots.children[1].number == 7
+  and green_slots.children[1].tags.bmsc_signal_source == "local-order"
+  and #red_slots.children == 1 and red_slots.children[1].number == 3
+  and red_slots.children[1].tags.bmsc_signal_source == "local-stock"
+  and #network_slots.children == 1 and network_slots.children[1].tags.bmsc_signal_source == "network-order"
+  and #linked_slots.children == 1 and linked_slots.children[1].tags.bmsc_signal_source == "linked-inventory",
+  "each input source must have its own slots and interaction source")
 assert(not content["bmsc-production-details"], "configuration details must not remain direct content children")
 local closed, config_open = Gui.show_page(main["bmsc-page-switcher"]["bmsc-page-config"], "config")
 assert(not closed and config_open,
   "opening the configuration drawer must report its player-persisted visual state")
 assert(runtime_page.visible and config_column.visible,
   "configuration drawer must leave the runtime panel visible")
-assert(main.style.width == 1280,
-  "opening the configuration page must expand the window to its available width")
+assert(main.style.width == 996,
+  "opening configuration must add its fixed column without stretching the runtime column")
 assert(config_page["bmsc-production-details"],
   "configuration page must retain the existing production settings")
 assert(config_page["bmsc-network-settings"] and config_page["bmsc-network-settings"].type == "frame",
@@ -301,11 +313,11 @@ Gui.set_recursion_single_options_visible(order_fields["bmsc-recursion-output-con
 assert(timeout_settings.visible and order_fields["bmsc-recursion-output-controls"]["bmsc-sequential-production"].visible,
   "Single output must restore the timeout component and sequential checkbox")
 local reopened, config_closed = Gui.show_page(main["bmsc-page-switcher"]["bmsc-page-config"], "config")
-assert(reopened and not config_closed and main.style.width == 720,
+assert(reopened and not config_closed and main.style.width == 552,
   "closing the configuration drawer must refresh runtime and restore compact width")
 
 local remembered_main = Gui.open(player, record.entity, record.config, nil, nil, nil, nil, true)
-assert(remembered_main.style.width == 1280
+assert(remembered_main.style.width == 996
   and remembered_main["bmsc-content"]["bmsc-config-column"].visible,
   "a caller-provided player preference must reopen the configuration page expanded")
 
@@ -317,14 +329,14 @@ local overlay = player.gui.screen[Gui.config_overlay_name]
 assert(not narrow_content["bmsc-config-column"] and overlay and not overlay.visible,
   "narrow screens must keep configuration outside the runtime layout until requested")
 assert(not Gui.show_page(narrow_main["bmsc-page-switcher"]["bmsc-page-config"], "config")
-  and overlay.visible and overlay["bmsc-content"]["bmsc-config-column"] and narrow_main.style.width == 920,
-  "opening configuration on a narrow screen must show the standalone overlay")
+  and overlay.visible and overlay["bmsc-content"]["bmsc-config-column"] and narrow_main.style.width == 552,
+  "opening configuration on a narrow screen must show the standalone overlay without widening runtime")
 narrow_main.location = {x = 100, y = 20}
 Gui.sync_config_overlay_location(narrow_main)
 assert(overlay.location.x == 100 and overlay.location.y == 76,
   "the narrow-screen configuration overlay must follow a dragged main window")
 assert(Gui.show_page(narrow_main["bmsc-page-switcher"]["bmsc-page-config"], "config")
-  and not overlay.visible and narrow_main.style.width == 720,
+  and not overlay.visible and narrow_main.style.width == 552,
   "closing the narrow-screen overlay must request a runtime refresh")
 player.display_resolution = {width = 1920, height = 1080}
 Gui.rebuild_conditions = rebuild_conditions

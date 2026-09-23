@@ -79,7 +79,7 @@ assert(record.supermarket_order_diagnostics["item:a:normal"].kind == "waiting_fo
 inventory = {{signal = {type = "item", name = "b", quality = "normal"}, count = 10}}
 local cycled = Mode.calculate(record)
 assert(record.supermarket_sequence_index == 1)
-assert(cycled["item:iron:normal"].count == 10)
+assert(cycled["item:iron:normal"] == nil)
 
 -- 右键后移当前订单会直接选择下一项，即使配置了原料等待时间也不会保留旧输出。
 orders = {
@@ -147,7 +147,7 @@ inventory = {}
 orders[2].count = 11
 local changed = Mode.calculate(record)
 assert(record.supermarket_sequence_index == 1)
-assert(changed["item:iron:normal"].count == 10)
+assert(changed["item:iron:normal"] == nil)
 
 -- 超时轮换时若只有当前一个候选，必须解除锁定并立即按材料需求倍率重新判断。
 orders = {{signal = {type = "item", name = "b", quality = "normal"}, count = 10}}
@@ -185,21 +185,20 @@ local all_outputs = Mode.calculate(all_record)
 assert(all_record.detail_outputs == nil)
 assert(all_outputs["item:circuit:normal"].count == 10)
 assert(all_outputs["item:wire:normal"].count == 20)
-assert(all_outputs["item:plate:normal"].count == 10)
-assert(all_outputs["item:copper-plate:normal"].count == 30)
+assert(all_outputs["item:plate:normal"] == nil and all_outputs["item:copper-plate:normal"] == nil)
 local all_diagnostic = all_record.supermarket_order_diagnostics["item:circuit:normal"]
 assert(all_diagnostic.order.signal.name == "circuit" and all_diagnostic.order.count == 10)
 assert(all_diagnostic.product.signal.name == "circuit")
 assert(all_diagnostic.product.target == 10 and all_diagnostic.product.stock == 0
   and all_diagnostic.product.remaining == 10)
-assert(#all_diagnostic.outputs == 4)
-assert(all_diagnostic.outputs[1].signal.name == "copper-plate"
-  and all_diagnostic.outputs[1].count == 30 and all_diagnostic.outputs[1].depth == 3)
-assert(all_diagnostic.outputs[4].signal.name == "circuit"
-  and all_diagnostic.outputs[4].count == 10 and all_diagnostic.outputs[4].depth == 1)
+assert(#all_diagnostic.outputs == 2)
+assert(all_diagnostic.outputs[1].signal.name == "wire"
+  and all_diagnostic.outputs[1].count == 20 and all_diagnostic.outputs[1].depth == 2)
+assert(all_diagnostic.outputs[2].signal.name == "circuit"
+  and all_diagnostic.outputs[2].count == 10 and all_diagnostic.outputs[2].depth == 1)
 local ordered = require("scripts.common_util").sorted_outputs(all_outputs)
-assert(ordered[1].key == "item:copper-plate:normal")
-assert(ordered[4].key == "item:circuit:normal")
+assert(ordered[1].key == "item:wire:normal")
+assert(ordered[2].key == "item:circuit:normal")
 
 -- 多个订单的全量输出虽然会在线路端合并，悬浮信息仍必须保留各自的生产链归属。
 orders = {
@@ -213,15 +212,13 @@ local multi_all_record = {entity = entity, config = {
 }}
 local multi_all_outputs = Mode.calculate(multi_all_record)
 assert(multi_all_outputs["item:a:normal"].count == 15)
-assert(multi_all_outputs["item:iron:normal"].count == 15)
+assert(multi_all_outputs["item:iron:normal"] == nil)
 local b_outputs = multi_all_record.supermarket_order_diagnostics["item:b:normal"].outputs
 local z_outputs = multi_all_record.supermarket_order_diagnostics["item:z:normal"].outputs
-assert(b_outputs[1].signal.name == "iron" and b_outputs[1].count == 10 and b_outputs[1].depth == 3)
-assert(b_outputs[2].signal.name == "a" and b_outputs[2].count == 10 and b_outputs[2].depth == 2)
-assert(b_outputs[3].signal.name == "b" and b_outputs[3].count == 10 and b_outputs[3].depth == 1)
-assert(z_outputs[1].signal.name == "iron" and z_outputs[1].count == 5 and z_outputs[1].depth == 3)
-assert(z_outputs[2].signal.name == "a" and z_outputs[2].count == 5 and z_outputs[2].depth == 2)
-assert(z_outputs[3].signal.name == "z" and z_outputs[3].count == 5 and z_outputs[3].depth == 1)
+assert(b_outputs[1].signal.name == "a" and b_outputs[1].count == 10 and b_outputs[1].depth == 2)
+assert(b_outputs[2].signal.name == "b" and b_outputs[2].count == 10 and b_outputs[2].depth == 1)
+assert(z_outputs[1].signal.name == "a" and z_outputs[1].count == 5 and z_outputs[1].depth == 2)
+assert(z_outputs[2].signal.name == "z" and z_outputs[2].count == 5 and z_outputs[2].depth == 1)
 
 -- 当前层缺少的可制造中间原料会再展开一层，展示应生产数量及其下一层真实缺口。
 orders = {{signal = {type = "item", name = "circuit", quality = "normal"}, count = 10}}
@@ -256,8 +253,7 @@ all_record.config.recursion_additional_production_rate = 1
 local expanded_outputs = Mode.calculate(all_record)
 assert(expanded_outputs["item:circuit:normal"].count == 20)
 assert(expanded_outputs["item:wire:normal"].count == 50)
-assert(expanded_outputs["item:plate:normal"].count == 20)
-assert(expanded_outputs["item:copper-plate:normal"].count == 60)
+assert(expanded_outputs["item:plate:normal"] == nil and expanded_outputs["item:copper-plate:normal"] == nil)
 
 -- 每一层递归产品都使用扩展目标和材料迟滞。电路板 10、额外倍率 2、材料倍率 10
 -- 时，铜丝整单目标 90 已超过单份启动线 30，因此目标仍为 90；铜板超过 10 才启动。
@@ -273,7 +269,7 @@ local hysteresis_record = {entity = entity, config = {
   recursion_material_demand_rate = 10, recursion_material_retention_rate = 5
 }}
 local below_start = Mode.calculate(hysteresis_record)
-assert(below_start["item:copper-plate:normal"].count == 80)
+assert(below_start["item:copper-plate:normal"] == nil)
 
 inventory[3].count = 11
 local started = Mode.calculate(hysteresis_record)
@@ -311,7 +307,7 @@ assert(Mode.calculate(hysteresis_record)["item:circuit:normal"].count == 30)
 inventory[1].count = 10
 inventory[3].count = 4
 local released = Mode.calculate(hysteresis_record)
-assert(released["item:copper-plate:normal"].count == 86)
+assert(released["item:copper-plate:normal"] == nil)
 
 -- 电路板达到 30 后退出，跌回 15 时仍不重新启动。
 inventory = {
@@ -442,15 +438,13 @@ local strict_partial_record = {entity = entity, config = {
   recursion_material_retention_rate = 1
 }}
 local strict_partial = Mode.calculate(strict_partial_record)
-assert(strict_partial["item:wire:normal"] == nil)
-assert(strict_partial["item:plate:normal"].count == 89)
+assert(strict_partial["item:wire:normal"].count == 301 and strict_partial["item:plate:normal"] == nil)
 assert(strict_partial["item:copper-plate:normal"] == nil)
 strict_partial_record.config.recursion_output_mode = "all"
 local strict_partial_all = Mode.calculate(strict_partial_record)
-assert(strict_partial_all["item:circuit:normal"].count == 100)
-assert(strict_partial_all["item:wire:normal"].count == 300)
-assert(strict_partial_all["item:plate:normal"].count == 89)
-assert(strict_partial_all["item:copper-plate:normal"] == nil)
+assert(strict_partial_all["item:circuit:normal"].count == 100
+  and strict_partial_all["item:wire:normal"].count == 300
+  and strict_partial_all["item:plate:normal"] == nil)
 
 -- all 的精确目标不能污染 single 的严格大于停止边界；切换后 300 仍需输出到 301。
 local output_mode_cache_record = {entity = entity, config = {
@@ -462,7 +456,7 @@ local output_mode_cache_record = {entity = entity, config = {
 assert(Mode.calculate(output_mode_cache_record)["item:wire:normal"].count == 300)
 output_mode_cache_record.config.recursion_output_mode = "single"
 Mode.reset(output_mode_cache_record)
-assert(Mode.calculate(output_mode_cache_record)["item:plate:normal"].count == 89)
+assert(Mode.calculate(output_mode_cache_record)["item:plate:normal"] == nil)
 
 -- 小订单的整单扩展目标可能低于父级材料启动线：电路板 3 需要铜丝 9，而单份启动线
 -- 是 3 × 10 = 30，因此只按单份用量兜底，铜丝保持到严格大于 3 × (1 + 10) = 33。
@@ -523,7 +517,7 @@ assert(strict_large_ingredient_record.supermarket_order_diagnostics["item:factor
 game.tick = 149
 assert(Mode.calculate(strict_large_ingredient_record)["item:remote-tower:normal"].count == 114)
 game.tick = 150
-assert(Mode.calculate(strict_large_ingredient_record)["item:iron:normal"].count == 500)
+assert(Mode.calculate(strict_large_ingredient_record)["item:iron:normal"] == nil)
 assert(strict_large_ingredient_record.recursion_material_wait_tick == nil)
 
 -- 严格校验遵守生产机器的地表限制；例如只允许高磁场的机器不能在低磁场地表接单。
@@ -558,7 +552,7 @@ local strict_toggle_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
   recursion_strict_validation = false, recurise_depth = 10, recursion_additional_production_rate = 0
 }}
-assert(Mode.calculate(strict_toggle_record)["item:stone-brick:normal"].count == 10)
+assert(Mode.calculate(strict_toggle_record)["item:stone-brick:normal"] == nil)
 strict_toggle_record.config.recursion_strict_validation = true
 Mode.reset(strict_toggle_record)
 assert(Mode.calculate(strict_toggle_record)["item:stone-brick:normal"] == nil)
@@ -645,5 +639,36 @@ assert(Mode.calculate(linked_record)["item:a:normal"].count == 10)
 assert(linked_record.supermarket_order_diagnostics["item:a:normal"].kind == "active_output")
 InventoryQuery.is_available = original_available
 InventoryQuery.get_shared_inventory = original_shared
+
+-- 终端标记只保留物品订单和配方策略，不展开或生产该物品的配方。
+orders = {{signal = {type = "item", name = "a", quality = "normal"}, count = 10}}
+inventory = {}
+local terminal_record = {entity = entity, config = {
+  production_machine = "assembler", inventory_validation = "none",
+  recursion_output_mode = "single", sequential_production = true,
+  recurise_depth = 10, recursion_timeout = 0, recursion_additional_production_rate = 0,
+  recursion_terminal_nodes = {['item:a:normal'] = true}
+}}
+local terminal_output = Mode.calculate(terminal_record)
+local terminal_root = terminal_record.supermarket_order_plan.roots[1]
+assert(terminal_root.terminal and #terminal_root.children == 0,
+  "terminal node must stop recursive plan expansion")
+assert(next(terminal_output) == nil,
+  "terminal node must not enter local production output")
+
+-- 配方从已解锁变为未解锁时，即使没有收到科技事件，也不能复用旧递归计划。
+local stale_plan_record = {entity = entity, config = {
+  production_machine = "assembler", inventory_validation = "none",
+  recursion_output_mode = "single", sequential_production = true,
+  recurise_depth = 10, recursion_timeout = 0, recursion_additional_production_rate = 0
+}}
+Mode.calculate(stale_plan_record)
+assert(stale_plan_record.supermarket_order_plan.roots[1].recipe_name == "make-a")
+force.recipes["make-a"].enabled = false
+local locked_plan_output = Mode.calculate(stale_plan_record)
+assert(stale_plan_record.supermarket_order_plan.roots[1].recipe_name == nil
+  and locked_plan_output["item:iron:normal"] == nil,
+  "a locked automatic recipe must invalidate the cached recursive plan")
+force.recipes["make-a"].enabled = true
 
 print("supermarket sequential progress: ok")

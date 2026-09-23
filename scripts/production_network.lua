@@ -240,6 +240,8 @@ local function publish(record, execution, parent, destination)
       local missing = math.max(0, math.ceil(required - stock))
       if missing == 0 then return end
       if not node.recipe_name or node.cyclic then
+        if execution.config.recursion_network_publish_nodes
+          and execution.config.recursion_network_publish_nodes[key] == false then return end
         local blocked = node.cyclic and "cycle" or nil
         for _, ancestor in ipairs(path) do if ancestor == key then blocked = "cycle" end end
         if #path >= MAX_HOPS then blocked = "depth_limit" end

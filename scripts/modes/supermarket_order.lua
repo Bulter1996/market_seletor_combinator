@@ -8,7 +8,7 @@ local Config = require("scripts.config")
 local InventoryQuery = require("scripts.modes.inventory_query")
 local Policy = require("scripts.recipe_policy")
 local Network = require("scripts.production_network")
-local PLAN_REVISION = 20
+local PLAN_REVISION = 21
 local Mode = {
   name = "supermarket_order",                        -- 模式注册名，必须与 config.lua 的值一致。
   -- 原生 select/max 即使关闭 output_networks，仍会计算输入并把结果显示在实体信息的
@@ -283,6 +283,12 @@ local function calculate_local(record)
         .. ":" .. tostring(entry and entry.demand) .. ":" .. tostring(entry and entry.retention)
     end
   end
+  local terminal_parts = {}
+  for key, enabled in pairs(config.recursion_terminal_nodes or {}) do
+    if enabled then terminal_parts[#terminal_parts + 1] = key end
+  end
+  table.sort(terminal_parts)
+  signature_parts[#signature_parts + 1] = "terminal=" .. table.concat(terminal_parts, ",")
   table.sort(policy_parts)
   signature_parts[#signature_parts + 1] = table.concat(policy_parts, "|")
   local resolved_targets = {}
@@ -340,6 +346,11 @@ local function calculate_local(record)
     if choice and choice.entry then
       node.demand_rate, node.retention_rate = choice.entry.demand, choice.entry.retention
     end
+    if (config.recursion_terminal_nodes or {})[key] then
+      node.terminal = true
+      remember_terminal_node(node)
+      return node
+    end
     local machine = prototypes.entity[config.production_machine]
     if recipe and config.network_publish and config.network_export
       and (not surface_conditions_met(record.entity.surface, machine and machine.surface_conditions)
@@ -374,12 +385,35 @@ local function calculate_local(record)
     return node
   end
 
+  -- 研究状态也可能在热加载、旧存档恢复或外部脚本修改后变化；不能只依赖科技事件
+  -- 失效缓存，否则计划会继续输出已经锁定的旧配方。
+  local function plan_recipe_state_current(node)
+    if not node then return true end
+    if node.terminal then return true end
+    local key = Util.signal_key(node.signal)
+    local policies = config.recipe_policies and config.recipe_policies[key]
+    if node.recipe_name then
+      local force_recipe = record.entity.force.recipes and record.entity.force.recipes[node.recipe_name]
+      if not (force_recipe and force_recipe.enabled and prototypes.recipe[node.recipe_name]
+        and Util.machine_supports(config.production_machine, prototypes.recipe[node.recipe_name])) then
+        return false
+      end
+    elseif not (policies and policies[1])
+      and Util.find_recipe(record.entity.force, node.signal, config.production_machine) then
+      return false
+    end
+    for _, child in ipairs(node.children or {}) do
+      if not plan_recipe_state_current(child) then return false end
+    end
+    return true
+  end
+
   -- 这份 plan 只属于当前运算器。机器、势力或订单任一变化都会重建；单纯改变递归深度
   -- 不重建树，只从 outputs_by_depth 中选择对应快照，因此参数能在下一刷新周期立即生效。
   local plan = record.supermarket_order_plan
   local plan_is_current = type(plan) == "table" and plan.revision == PLAN_REVISION
     and type(plan.roots) == "table" and type(plan.outputs_by_depth) == "table"
-    and type(plan.maximum_level) == "number"
+    and type(plan.maximum_level) == "number" and plan_recipe_state_current(plan.roots[1])
   if not plan_is_current or plan.machine ~= config.production_machine
     or plan.force_index ~= record.entity.force.index
     or plan.order_signature ~= order_signature then
@@ -905,6 +939,8 @@ local function calculate_local(record)
       if expanded_shortage <= 0 then return end
       local output_count = math.ceil(expanded_shortage)
       local delegated = validates_inventory and node.network_delegable
+      -- 无配方、未解锁配方和主动叶子都只由生产网络 publish 处理，不能进入本机输出。
+      if not node.recipe_name then return end
       if not delegated then
         add_depth_output(all_shortages, output_signal, output_count, node.level)
         add_depth_output(current_root_detail.outputs, output_signal, output_count, node.level)
@@ -929,15 +965,7 @@ local function calculate_local(record)
       local selected = output_key == selected_key
       local should_run = selected or force_active or base_shortage > 0
       local reaches_limit = node.level > depth_limit
-      if node.cyclic or not node.recipe_name then
-        if should_run and not suppress_stage_output and not delegated then
-          local terminal_outputs = terminal_by_level[node.level]
-          if not terminal_outputs then terminal_outputs = {}; terminal_by_level[node.level] = terminal_outputs end
-          add_depth_output(terminal_outputs, output_signal, output_count, node.level)
-          remember_stage(node, output_signal, output_count, nil)
-        end
-        return
-      end
+      if node.cyclic then return end
       if reaches_limit then
         if should_run and not suppress_stage_output then
           add_depth_output(boundary_outputs, output_signal, output_count, node.level)

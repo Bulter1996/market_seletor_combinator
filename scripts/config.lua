@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 18
+Config.schema_revision = 19
 
 Config.mode = {
   production_order = "production_order",
@@ -90,6 +90,8 @@ function Config.default()
     production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
     order_targets = {},                          -- 参数：输入信号共享配方，以及订单模式的库存校验产物。
     recipe_policies = {},                        -- 同一组合器按材料键共享候选配方与迟滞参数。
+    recursion_terminal_nodes = {},               -- 超市递归中标记为终端的物品键；仍保留其配方策略。
+    recursion_network_publish_nodes = {},        -- 节点缺口是否发布到订单网络；缺省为允许。
     network_publish = false,
     network_accept = false,
     network_export = false,
@@ -193,6 +195,16 @@ function Config.normalize(source)
         end
       end
       if normalized[1] then config.recipe_policies[key] = normalized end
+    end
+  end
+  for key, enabled in pairs(type(source.recursion_terminal_nodes) == "table"
+      and source.recursion_terminal_nodes or {}) do
+    if type(key) == "string" and enabled == true then config.recursion_terminal_nodes[key] = true end
+  end
+  for key, enabled in pairs(type(source.recursion_network_publish_nodes) == "table"
+      and source.recursion_network_publish_nodes or {}) do
+    if type(key) == "string" and type(enabled) == "boolean" then
+      config.recursion_network_publish_nodes[key] = enabled
     end
   end
   if type(source.multiple_recipe_support) == "boolean" then

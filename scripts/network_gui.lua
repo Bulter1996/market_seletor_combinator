@@ -434,6 +434,10 @@ local function tree_tooltip(record, node, required, inventory)
     "\n", {"bmsc-net.tree-total-required", math.ceil(required)},
     "\n", {"bmsc-net.tree-current-candidates"}, tree_candidates(record, node),
     "\n", {"bmsc-net.tree-node-help"}}
+  if node.terminal then
+    tooltip[#tooltip + 1] = "\n"
+    tooltip[#tooltip + 1] = {"bmsc-net.tree-terminal-help"}
+  end
   if inventory then
     tooltip[#tooltip + 1] = "\n"
     tooltip[#tooltip + 1] = inventory.sufficient and {"bmsc-net.tree-stock-surplus", inventory.stock,
@@ -480,8 +484,16 @@ function UI.open_tree(player, record, signal, count, network_task)
         local key = Util.signal_key(node.signal)
         local required = totals[key] or 0
         local inventory = inventory_for_tree(plan_record, key, required)
-        local style = inventory and (inventory.sufficient and "green_circuit_network_content_slot"
-          or "red_circuit_network_content_slot") or "slot_button"
+        local style
+        if node.terminal then
+          style = "bmsc_signal_diagnostic_invalid"
+        elseif inventory and inventory.sufficient then
+          style = "green_circuit_network_content_slot"
+        elseif node.recipe_name then
+          style = "red_circuit_network_content_slot"
+        else
+          style = "slot_button"
+        end
         add_large_slot(cell, {type = "sprite-button", sprite = node.signal.type .. "/" .. node.signal.name,
           number = math.ceil(required), style = style, tooltip = tree_tooltip(plan_record, node, required, inventory),
           tags = {bmsc_net_action = "select", key = key, type = node.signal.type, name = node.signal.name,
@@ -557,6 +569,16 @@ function UI.open_policy(player, record, selected, cursor)
   local prototype = prototypes[selected.type] and prototypes[selected.type][selected.name]
   header.add{type = "label", caption = prototype and prototype.localised_name or selected.name, style = "heading_2_label"}
   header.add{type = "empty-widget"}.style.horizontally_stretchable = true
+  local terminal = (record.config.recursion_terminal_nodes or {})[view.selected] == true
+  local publish = (record.config.recursion_network_publish_nodes or {})[view.selected] ~= false
+  header.add{type = "sprite-button", sprite = "utility/enter",
+    style = publish and "bmsc_signal_diagnostic_filtered" or "frame_action_button",
+    toggled = publish, tooltip = {"bmsc-net.network-publish-node-help"},
+    tags = {bmsc_net_action = "recursion-network-publish-toggle", unit = view.unit, key = view.selected}}
+  header.add{type = "sprite-button", sprite = "utility/close",
+    style = terminal and "bmsc_signal_diagnostic_filtered" or "frame_action_button",
+    toggled = terminal, tooltip = {"bmsc-net.terminal-node-help"},
+    tags = {bmsc_net_action = "recursion-terminal-toggle", unit = view.unit, key = view.selected}}
   header.add{type = "sprite-button", sprite = "utility/refresh", style = "frame_action_button",
     tooltip = {"bmsc-net.automatic"}, tags = {bmsc_net_action = "automatic"}}
   local entries = record.config.recipe_policies[view.selected] or {}
@@ -745,6 +767,33 @@ function UI.on_click(event, records)
     if action == "tree-pin" then
       view.pinned = not view.pinned
       UI.open_tree(player, r, view.signal, view.count, view.network_task)
+      return true
+    end
+    if action == "recursion-terminal-toggle" then
+      r.config.recursion_terminal_nodes = r.config.recursion_terminal_nodes or {}
+      local publish_nodes = r.config.recursion_network_publish_nodes or {}
+      r.config.recursion_network_publish_nodes = publish_nodes
+      if publish_nodes[tags.key] ~= false then
+        r.config.recursion_terminal_nodes[tags.key] = true
+      else
+        r.config.recursion_terminal_nodes[tags.key] = not r.config.recursion_terminal_nodes[tags.key]
+      end
+      refresh_tree(player, records, true)
+      UI.open_policy(player, r, signal_key_parse(tags.key))
+      return true
+    end
+    if action == "recursion-network-publish-toggle" then
+      r.config.recursion_network_publish_nodes = r.config.recursion_network_publish_nodes or {}
+      local publish_nodes = r.config.recursion_network_publish_nodes
+      if publish_nodes[tags.key] == false then
+        publish_nodes[tags.key] = nil
+        r.config.recursion_terminal_nodes = r.config.recursion_terminal_nodes or {}
+        r.config.recursion_terminal_nodes[tags.key] = true
+      else
+        publish_nodes[tags.key] = false
+      end
+      refresh_tree(player, records, true)
+      UI.open_policy(player, r, signal_key_parse(tags.key))
       return true
     end
     if action == "tree-expand-all" then

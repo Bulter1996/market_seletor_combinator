@@ -112,6 +112,22 @@ local function textfields(parent, result)
   return result
 end
 
+local function find_sprite_button(parent, sprite)
+  if parent.type == "sprite-button" and parent.sprite == sprite then return parent end
+  for _, child in ipairs(parent.children or {}) do
+    local found = find_sprite_button(child, sprite)
+    if found then return found end
+  end
+end
+
+local function find_action_button(parent, action)
+  if parent.type == "sprite-button" and parent.tags.bmsc_net_action == action then return parent end
+  for _, child in ipairs(parent.children or {}) do
+    local found = find_action_button(child, action)
+    if found then return found end
+  end
+end
+
 local location_element = {valid = true, name = UI.tree_name, location = {x = 720, y = 80}}
 assert(UI.on_location_changed({player_index = 1, element = location_element}))
 assert(storage.bmsc_network_views[1].tree_location.x == 720 and storage.bmsc_network_views[1].tree_location.y == 80,
@@ -154,9 +170,19 @@ local numbered = {}
 for _, slot in ipairs(tree_slots) do if slot.number ~= nil then numbered[#numbered + 1] = slot end end
 assert(numbered[#numbered - 1].number == 1 and numbered[#numbered].number == 4,
   "tree requirements must round probability crafts up before counting ingredients")
-assert(numbered[#numbered].style_name == "red_circuit_network_content_slot",
-  "an empty red inventory input is a valid zero stock and must be shown as insufficient")
+assert(numbered[#numbered - 1].style_name == "red_circuit_network_content_slot"
+  and numbered[#numbered].style_name == "slot_button",
+  "a recipe shortage is red while a no-recipe shortage keeps the default slot border")
 assert(has_connector(player.gui.screen[UI.tree_name]), "tree must draw connectors between recipe products and ingredients")
+
+record.supermarket_order_plan.roots[1].children[1].terminal = true
+UI.open_tree(player, record, {type = "item", name = "plate"}, 1)
+numbered = {}
+for _, slot in ipairs(sprites(player.gui.screen[UI.tree_name])) do
+  if slot.number ~= nil then numbered[#numbered + 1] = slot end
+end
+assert(numbered[#numbered].style_name == "bmsc_signal_diagnostic_invalid",
+  "an actively marked terminal node must use the blue border")
 -- 网络订单的计划保存在任务执行上下文，树窗口不能回退读取本地订单计划。
 record.network_assignments = {{key = "network-1", execution = {entity = record.entity, config = record.config,
   network_observed_inventory = {}, supermarket_order_plan = {roots = {{source_key = "item:ore:normal",
@@ -230,6 +256,14 @@ assert(policy.style_name == "bmsc_policy_frame_60", "policy popup must use the c
 assert(policy.children[1].drag_target == policy, "policy title bar must drag its own popup frame")
 assert(find_sprite(policy, "item/plate").style.width == 42,
   "policy header signal icon must use a compact 1.3x size")
+local publish_button = find_action_button(policy, "recursion-network-publish-toggle")
+local terminal_button = find_action_button(policy, "recursion-terminal-toggle")
+assert(publish_button and publish_button.tags.bmsc_net_action == "recursion-network-publish-toggle"
+  and publish_button.style_name == "bmsc_signal_diagnostic_filtered",
+  "policy header must place a selected network-publish flag before the leaf button")
+assert(terminal_button and terminal_button.tags.bmsc_net_action == "recursion-terminal-toggle"
+  and terminal_button.style_name == "frame_action_button",
+  "policy header must place an unselected unlock button before the automatic recipe reset")
 for index, input in ipairs(textfields(policy)) do
   local expected = (index - 1) % 3 == 2 and 30 or 56
   assert(input.style.width == expected, "policy priority fields must be last and narrower than rate fields")

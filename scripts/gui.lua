@@ -466,21 +466,23 @@ local function apply_diagnostic_signal_style(slot, color, diagnostic)
   end
 end
 
----把输入/输出两侧的红绿网络信号合并成稳定排序的槽位数组。
----同一信号在两条线路上只显示一次，数量为两侧相加，避免无意义的重复图标。
+---把红绿网络信号整理成稳定排序的槽位数组。
+---输入区合并同一信号；输出区保留线路颜色，避免把写入两色的同一结果显示成双倍。
 ---@param networks table `get_side_networks` 返回的网络数组。
 ---@param diagnostics table|nil 以 Util.signal_key 为键的输入诊断。
+---@param separate_colors boolean 是否按线路颜色保留独立槽位。
 ---@return table entries 每项包含展示线路、signal、count、sprite 和稳定 key。
-local function collect_signal_entries(networks, diagnostics)
+local function collect_signal_entries(networks, diagnostics, separate_colors)
   local by_key = {}
   for _, network in ipairs(networks) do
     for _, value in pairs(network.signals) do
       if value.signal and value.signal.name then
-        local key = Util.signal_key(value.signal)
+        local signal_key = Util.signal_key(value.signal)
+        local key = separate_colors and (network.color .. "|" .. signal_key) or signal_key
         local entry = by_key[key]
         if not entry then
           entry = {signal = value.signal, count = 0, sort_priority = tonumber(value.sort_priority) or 0,
-            diagnostic = diagnostics and diagnostics[key] or nil, key = key,
+            diagnostic = diagnostics and diagnostics[signal_key] or nil, key = key,
             has_green = false, has_red = false}
           by_key[key] = entry
         end
@@ -520,7 +522,7 @@ local function refresh_signal_section(section, networks, diagnostics, source)
   -- 热更新不会重建已打开的旧窗口；旧布局没有新增的来源子框时跳过本轮刷新，
   -- 玩家关闭并重新打开组合器后会按新结构创建，不能因此让 on_nth_tick 中断。
   if not section or section.valid == false then return end
-  local entries = collect_signal_entries(networks, diagnostics)
+  local entries = collect_signal_entries(networks, diagnostics, source == "output")
   local signature_parts = {}
   for _, entry in ipairs(entries) do
     -- 优先级也属于布局签名；同一组信号的顺序改变时需要重排槽位，而不只是更新数字。

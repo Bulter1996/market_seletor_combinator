@@ -146,7 +146,8 @@ local function current_work_summary(record)
     for _, ingredient in ipairs(stage.ingredients) do
       if ingredient.signal then requested[Util.signal_key(ingredient.signal)] = ingredient.signal end
     end
-    local shared = MODES[MODE_INVENTORY_QUERY].get_shared_inventory(record.entity.force, requested)
+    local shared = MODES[MODE_INVENTORY_QUERY].get_shared_inventory(
+      record.entity.force, record.entity.surface, requested)
     if shared then
       for _, ingredient in ipairs(stage.ingredients) do
         local signal = ingredient.signal

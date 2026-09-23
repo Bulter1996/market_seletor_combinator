@@ -324,7 +324,10 @@ local signal_panel = Gui.add_signal_panel(element(), player)
 Gui.refresh_signal_panel(signal_panel, {
   {color = "red", signals = {{signal = {type = "item", name = "plate"}, count = 3}}},
   {color = "green", signals = {{signal = {type = "item", name = "plate"}, count = 7}}}
-}, {}, {}, {
+}, {
+  {color = "red", signals = {{signal = {type = "item", name = "plate"}, count = 400}}},
+  {color = "green", signals = {{signal = {type = "item", name = "plate"}, count = 400}}}
+}, {}, {
   network_orders = {{signal = {type = "item", name = "gear"}, count = 10}},
   linked_inventory = {{signal = {type = "item", name = "ore"}, count = 80}}
 })
@@ -332,6 +335,7 @@ local green_slots = signal_panel["bmsc-local-green-signals"]["bmsc-signal-scroll
 local red_slots = signal_panel["bmsc-local-red-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
 local network_slots = signal_panel["bmsc-network-order-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
 local linked_slots = signal_panel["bmsc-linked-inventory-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
+local output_slots = signal_panel["bmsc-output-signals"]["bmsc-signal-scroll"]["bmsc-signal-slots"]
 assert(#green_slots.children == 1 and green_slots.children[1].number == 7
   and green_slots.children[1].tags.bmsc_signal_source == "local-order"
   and #red_slots.children == 1 and red_slots.children[1].number == 3
@@ -339,6 +343,10 @@ assert(#green_slots.children == 1 and green_slots.children[1].number == 7
   and #network_slots.children == 1 and network_slots.children[1].tags.bmsc_signal_source == "network-order"
   and #linked_slots.children == 1 and linked_slots.children[1].tags.bmsc_signal_source == "linked-inventory",
   "each input source must have its own slots and interaction source")
+assert(#output_slots.children == 2
+  and output_slots.children[1].number == 400 and output_slots.children[1].tags.bmsc_signal_color == "green"
+  and output_slots.children[2].number == 400 and output_slots.children[2].tags.bmsc_signal_color == "red",
+  "output signals must keep red and green values separate instead of displaying their sum")
 assert(not content["bmsc-production-details"], "configuration details must not remain direct content children")
 local closed, config_open = Gui.show_page(main["bmsc-page-switcher"]["bmsc-page-config"], "config")
 assert(not closed and config_open,

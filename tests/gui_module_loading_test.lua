@@ -357,6 +357,12 @@ assert(Gui.mode_from_selected_index(1) == Config.mode.supermarket_order
   and Gui.mode_from_selected_index(4) == Config.mode.swap_order
   and Gui.mode_from_selected_index(5) == nil,
   "mode event mapping must use the same production-free index list as the GUI")
+Gui.show_mode_details(mode_select, Config.mode.inventory_query)
+assert(not runtime_page["bmsc-work-panel"].visible,
+  "current production, order, and next order must be hidden outside supermarket mode")
+Gui.show_mode_details(mode_select, Config.mode.supermarket_order)
+assert(runtime_page["bmsc-work-panel"].visible,
+  "the three-row work summary must remain visible in supermarket mode")
 assert(config_page["bmsc-network-settings"] and config_page["bmsc-network-settings"].type == "frame",
   "network settings must remain an independent configuration component")
 local order_settings = config_page["bmsc-recursion-details"]["bmsc-recursion-settings"]

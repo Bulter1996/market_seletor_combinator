@@ -1216,6 +1216,8 @@ function Gui.show_mode_details(source_element, mode)
     runtime["bmsc-runtime-mode"].caption = {"bmsc.runtime-mode", mode_caption(mode)}
     runtime["bmsc-runtime-mode"].tooltip = mode_tooltip(mode)
   end
+  local work_panel = runtime and runtime["bmsc-work-panel"]
+  if work_panel then work_panel.visible = mode == Gui.supermarket_order end
   local mode_select = find_descendant(content, "bmsc-mode")
   if mode_select then mode_select.tooltip = mode_tooltip(mode) end
 end
@@ -1632,7 +1634,8 @@ function Gui.open(player, entity, config, current_output_networks, input_diagnos
   running.add{type = "sprite", sprite = "utility/status_working"}
   running.add{type = "label", name = "bmsc-runtime-mode",
     caption = {"bmsc.runtime-mode", mode_caption(config.mode)}, tooltip = mode_tooltip(config.mode)}
-  add_work_panel(runtime_page)
+  local work_panel = add_work_panel(runtime_page)
+  work_panel.visible = config.mode == Gui.supermarket_order
   Gui.add_signal_panel(runtime_page, player)
 
   local mode_area = config_page.add{type = "flow", direction = "vertical"}

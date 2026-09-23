@@ -421,7 +421,8 @@ local function calculate_local(record)
 
   if validation_mode == Config.inventory_validation.linked then
     local requested = InventoryQuery.supermarket_signals(plan)
-    local shared_inventory, generation = InventoryQuery.get_shared_inventory(record.entity.force, requested)
+    local shared_inventory, generation = InventoryQuery.get_shared_inventory(
+      record.entity.force, record.entity.surface, requested)
     if not shared_inventory then
       record.recursion_inventory_pending_tick = record.recursion_inventory_pending_tick or game.tick
       local diagnostics = {}

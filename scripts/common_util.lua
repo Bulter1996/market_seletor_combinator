@@ -335,6 +335,28 @@ function Util.find_recipe_ignoring_research(target_signal, machine_name, specifi
   return candidates and candidates[1] and candidates[1].recipe or nil
 end
 
+---判断当前势力是否存在已解锁、确实以目标信号为产物的制造配方，不限制生产机器。
+---用于区分“当前机器不支持，可交给订单网络”与“本来就没有制造配方”的终端材料。
+---@param force LuaForce 实体所属势力。
+---@param target_signal SignalID 目标物品或流体。
+---@return boolean available 存在可制造配方时为 true。
+function Util.has_unlocked_recipe(force, target_signal)
+  if not (Util.is_recipe_signal(target_signal) and force and force.recipes) then return false end
+  for recipe_name, recipe in pairs((prototypes and prototypes.recipe) or {}) do
+    local force_recipe = force.recipes[recipe_name]
+    local products = type(recipe.products) == "table" and recipe.products or {}
+    local main = recipe.main_product
+    local primary = main and main.type == target_signal.type and main.name == target_signal.name
+    if force_recipe and force_recipe.enabled and type(recipe.ingredients) == "table" and #recipe.ingredients > 0
+      and not string.find(recipe_name, "recycling", 1, true)
+      and Util.recipe_product_amount(recipe, target_signal) > 0
+      and (primary or recipe.name == target_signal.name or #products == 1) then
+      return true
+    end
+  end
+  return false
+end
+
 ---取得配方一次制造对目标信号的平均产量。
 ---@param recipe LuaRecipePrototype 配方原型。
 ---@param target_signal SignalID 目标物品或流体信号。

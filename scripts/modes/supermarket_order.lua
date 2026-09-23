@@ -8,7 +8,7 @@ local Config = require("scripts.config")
 local InventoryQuery = require("scripts.modes.inventory_query")
 local Policy = require("scripts.recipe_policy")
 local Network = require("scripts.production_network")
-local PLAN_REVISION = 19
+local PLAN_REVISION = 20
 local Mode = {
   name = "supermarket_order",                        -- 模式注册名，必须与 config.lua 的值一致。
   -- 原生 select/max 即使关闭 output_networks，仍会计算输入并把结果显示在实体信息的
@@ -340,8 +340,18 @@ local function calculate_local(record)
     if choice and choice.entry then
       node.demand_rate, node.retention_rate = choice.entry.demand, choice.entry.retention
     end
+    local machine = prototypes.entity[config.production_machine]
+    if recipe and config.network_publish and config.network_export
+      and (not surface_conditions_met(record.entity.surface, machine and machine.surface_conditions)
+        or not surface_conditions_met(record.entity.surface, recipe.surface_conditions)) then
+      -- 跨地表发布开启时，当前地表不可执行的配方也作为可委派节点交给其他地表。
+      node.network_delegable, node.surface_unsupported, recipe = true, true, nil
+    end
     local product_amount = recipe and Util.recipe_product_amount(recipe, normalized) or 0
     if not recipe or product_amount <= 0 then
+      -- 当前机器没有该产品的制造路径，但势力存在已解锁配方时，交由订单网络的其他机器补料。
+      node.network_delegable = node.network_delegable or not node.machine_craftable
+        and Util.has_unlocked_recipe(record.entity.force, normalized)
       remember_terminal_node(node)
       return node
     end
@@ -475,7 +485,9 @@ local function calculate_local(record)
   local function strict_order_diagnostic(root)
     if not validates_inventory then return nil end
     -- 订单物品本身无法由所选机器制造时也必须跳过，不能把它当作终端原料输出。
-    if not root.recipe_name then return {kind = "no_recipe"} end
+    if not root.recipe_name then
+      return root.network_delegable and nil or {kind = "no_recipe"}
+    end
     local machine = prototypes.entity[config.production_machine]
     local root_recipe = prototypes.recipe[root.recipe_name]
     if not surface_conditions_met(record.entity.surface, machine and machine.surface_conditions)
@@ -509,6 +521,52 @@ local function calculate_local(record)
       status = extended
     }
   end
+  ---找出当前阶段因本机不支持且未达到启动/保持门槛而必须委派的材料。
+  local function network_material_wait(root, required)
+    if not validates_inventory or wanted_depth == 0 then return nil end
+    local waiting, by_key = {}, {}
+    local function add_wait(node, shortage)
+      local key = Util.signal_key(node.signal)
+      local entry = by_key[key]
+      if not entry then
+        entry = {signal = Util.make_signal(node.signal.type, node.signal.name, node.signal.quality), count = 0}
+        by_key[key], waiting[#waiting + 1] = entry, entry
+      end
+      entry.count = entry.count + math.max(0, math.ceil(shortage))
+    end
+    local function visit(node, node_required, force_active)
+      if (node.level or 1) > wanted_depth then return end
+      local stock = math.max(0, observed_inventory[Util.signal_key(node.signal)] or 0)
+      local missing = math.max(0, node_required - stock)
+      if missing <= 0 then return end
+      if node.network_delegable then
+        if force_active then add_wait(node, missing) end
+        return
+      end
+      if not node.recipe_name or node.cyclic or not node.product_amount or node.product_amount <= 0 then return end
+      local selected = Util.signal_key(node.output_signal or node.signal) == record.selected_recursion_output
+      local rate = selected and (node.retention_rate or material_retention_rate)
+        or (node.demand_rate or material_demand_rate)
+      local crafts = math.ceil(node_required / node.product_amount)
+      for _, child in ipairs(node.children or {}) do
+        local child_stock = math.max(0, observed_inventory[Util.signal_key(child.signal)] or 0)
+        local insufficient = child_stock <= child.amount * rate
+        if insufficient then visit(child, child.amount * crafts, true) end
+      end
+    end
+    visit(root, required, true)
+    table.sort(waiting, function(a, b) return Util.signal_key(a.signal) < Util.signal_key(b.signal) end)
+    if not waiting[1] then return nil end
+    for _, entry in ipairs(waiting) do
+      entry.published = config.network_publish == true
+      if entry.published then
+        entry.status, entry.owner = Network.request_status(
+          record.entity.unit_number, root.source_key, entry.signal)
+        entry.status = entry.status or "pending"
+      end
+    end
+    return waiting
+  end
   local function blocks_order(diagnostic)
     return diagnostic ~= nil
   end
@@ -541,8 +599,13 @@ local function calculate_local(record)
       local target = (record.network_force_active or active_orders[root.source_key]) and extended_target or root.amount
       if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostics[root.source_key]
+        local requirements = root_requirements[root.source_key]
+        local waiting = not diagnostic and network_material_wait(root,
+          requirements and requirements.extended or extended_target)
+        if waiting then diagnostic = {kind = "network_material_wait", materials = waiting} end
         if blocks_order(diagnostic) then
-          active_orders[root.source_key] = nil
+          -- 网络补料期间保留订单的扩展目标，但不占用本地顺序游标；材料越过门槛后可立即续产。
+          active_orders[root.source_key] = diagnostic.kind == "network_material_wait" or nil
           strict_order_diagnostics[root.source_key] = diagnostic
         else
           active_orders = {[root.source_key] = true}
@@ -569,7 +632,13 @@ local function calculate_local(record)
       local target = (record.network_force_active or active_orders[root.source_key]) and extended_target or root.amount
       if not root_status(root, target).satisfied then
         local diagnostic = strict_order_diagnostic(root)
+        local status = root_status(root, target)
+        local stock = math.max(0, observed_inventory[Util.signal_key(root.signal)] or 0)
+        local required = stock + status.remaining
+        local waiting = not diagnostic and network_material_wait(root, required)
+        if waiting then diagnostic = {kind = "network_material_wait", materials = waiting} end
         if blocks_order(diagnostic) then
+          active_orders[root.source_key] = diagnostic.kind == "network_material_wait" or nil
           strict_order_diagnostics[root.source_key] = diagnostic
         else
           active_orders[root.source_key] = true
@@ -835,8 +904,11 @@ local function calculate_local(record)
       local expanded_shortage = consume_inventory(node.signal, output_required)
       if expanded_shortage <= 0 then return end
       local output_count = math.ceil(expanded_shortage)
-      add_depth_output(all_shortages, output_signal, output_count, node.level)
-      add_depth_output(current_root_detail.outputs, output_signal, output_count, node.level)
+      local delegated = validates_inventory and node.network_delegable
+      if not delegated then
+        add_depth_output(all_shortages, output_signal, output_count, node.level)
+        add_depth_output(current_root_detail.outputs, output_signal, output_count, node.level)
+      end
 
       -- “不校验”只关心订单产品库存：所有原料视为满足，直接请求根产品或指定配方。
       if validation_mode == Config.inventory_validation.none and node.level == 1 then
@@ -858,7 +930,7 @@ local function calculate_local(record)
       local should_run = selected or force_active or base_shortage > 0
       local reaches_limit = node.level > depth_limit
       if node.cyclic or not node.recipe_name then
-        if should_run and not suppress_stage_output then
+        if should_run and not suppress_stage_output and not delegated then
           local terminal_outputs = terminal_by_level[node.level]
           if not terminal_outputs then terminal_outputs = {}; terminal_by_level[node.level] = terminal_outputs end
           add_depth_output(terminal_outputs, output_signal, output_count, node.level)

@@ -358,6 +358,20 @@ function Network.tasks(force_index)
   return result
 end
 
+---取得某个请求方根订单中特定材料的当前网络状态，供本地订单诊断复用。
+function Network.request_status(source_unit, root_key, signal)
+  local wanted = Util.signal_key(signal)
+  local best_status, owner
+  local priorities = {pending = 1, assigned = 2, waiting_materials = 3, producing = 4, waiting_transport = 5}
+  for _, task in pairs(state().tasks) do
+    if task.source == source_unit and task.root == root_key and Util.signal_key(task.signal) == wanted
+      and (not best_status or (priorities[task.status] or 0) > (priorities[best_status] or 0)) then
+      best_status, owner = task.status, task.owner
+    end
+  end
+  return best_status, owner
+end
+
 function Network.release(key, force_index)
   for _, task in ipairs(Network.tasks(force_index)) do
     if task.key == key then

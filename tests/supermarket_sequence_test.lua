@@ -29,12 +29,20 @@ local recipe_factory_2 = {name = "make-factory-2", categories = {"crafting"}, ma
     {type = "item", name = "remote-tower", amount = 50},
     {type = "item", name = "stone-brick", amount = 1000}
   }}
+local board = {type = "item", name = "board", amount = 1}
+local recipe_board = {name = "make-board", categories = {"crafting"}, main_product = board,
+  products = {board}, ingredients = {{type = "item", name = "copper-plate", amount = 1}}}
+local copper_plate = {type = "item", name = "copper-plate", amount = 1}
+local recipe_copper_plate = {name = "smelt-copper-plate", categories = {"smelting"}, main_product = copper_plate,
+  products = {copper_plate}, ingredients = {{type = "item", name = "copper-ore", amount = 1}}}
 prototypes = {
-  entity = {assembler = {crafting_categories = {crafting = true}}},
+  entity = {assembler = {crafting_categories = {crafting = true}},
+    furnace = {crafting_categories = {smelting = true}}},
   recipe = {[recipe_a.name] = recipe_a, [recipe_b.name] = recipe_b,
     [recipe_z.name] = recipe_z, [recipe_circuit.name] = recipe_circuit,
     [recipe_wire.name] = recipe_wire, [recipe_remote_tower.name] = recipe_remote_tower,
-    [recipe_factory_2.name] = recipe_factory_2}
+    [recipe_factory_2.name] = recipe_factory_2, [recipe_board.name] = recipe_board,
+    [recipe_copper_plate.name] = recipe_copper_plate}
 }
 defines = {wire_connector_id = {combinator_input_red = 1, combinator_input_green = 2}}
 game = {tick = 0}
@@ -47,7 +55,8 @@ local orders = {
 local force = {index = 1, recipes = {['make-a'] = {enabled = true}, ['make-b'] = {enabled = true},
   ['make-z'] = {enabled = true}, ['make-circuit'] = {enabled = true},
   ['make-wire'] = {enabled = true}, ['make-remote-tower'] = {enabled = true},
-  ['make-factory-2'] = {enabled = true}}}
+  ['make-factory-2'] = {enabled = true}, ['make-board'] = {enabled = true},
+  ['smelt-copper-plate'] = {enabled = true}}}
 local entity = {force = force, get_signals = function(connector_id)
   return connector_id == defines.wire_connector_id.combinator_input_green and orders or inventory
 end}
@@ -367,8 +376,8 @@ game.tick = 331
 assert(next(Mode.calculate(material_wait_record)) == nil)
 assert(material_wait_record.recursion_material_wait_tick == nil)
 
--- 原料不足不能跳过有缺口的订单：顺序模式立即进入当前订单的最深原料，
--- 非顺序模式则汇总全部订单并从最深层开始输出。
+-- 当前机器无法生产且低于门槛的原料会委派到订单网络；顺序模式继续扫描下一订单，
+-- 非顺序模式也只保留其他可执行根订单。
 orders = {
   {signal = {type = "item", name = "circuit", quality = "normal"}, count = 10},
   {signal = {type = "item", name = "stone-brick", quality = "normal"}, count = 10},
@@ -383,22 +392,21 @@ local strict_record = {entity = entity, config = {
   recursion_material_retention_rate = 1
 }}
 local skipped = Mode.calculate(strict_record)
-assert(skipped["item:copper-plate:normal"].count == 30)
-assert(skipped["item:z:normal"] == nil)
+assert(skipped["item:copper-plate:normal"] == nil)
+assert(skipped["item:z:normal"].count == 10)
 assert(skipped["item:stone-brick:normal"] == nil)
-assert(strict_record.detail_outputs["item:copper-plate:normal"].count == 30)
+assert(strict_record.detail_outputs["item:z:normal"].count == 10)
 local strict_diagnostic = strict_record.supermarket_order_diagnostics["item:circuit:normal"]
-assert(strict_diagnostic.kind == "supermarket_expanding")
+assert(strict_diagnostic.kind == "network_material_wait"
+  and strict_diagnostic.materials[1].signal.name == "copper-plate")
 
 local strict_all_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "all", sequential_production = false,
   recursion_strict_validation = true, recurise_depth = 10, recursion_additional_production_rate = 0
 }}
 local strict_all = Mode.calculate(strict_all_record)
-assert(strict_all["item:circuit:normal"].count == 10)
-assert(strict_all["item:wire:normal"].count == 30)
-assert(strict_all["item:copper-plate:normal"].count == 30)
-assert(strict_all["item:plate:normal"].count == 10)
+assert(strict_all["item:circuit:normal"] == nil and strict_all["item:wire:normal"] == nil)
+assert(strict_all["item:copper-plate:normal"] == nil and strict_all["item:plate:normal"] == nil)
 assert(strict_all["item:stone-brick:normal"] == nil)
 assert(strict_all["item:z:normal"].count == 10)
 assert(strict_all_record.detail_outputs == nil)
@@ -409,10 +417,12 @@ local strict_plate = {signal = {type = "item", name = "plate", quality = "normal
 inventory[#inventory + 1] = strict_copper
 inventory[#inventory + 1] = strict_plate
 game.tick = 15
-assert(Mode.calculate(strict_record)["item:copper-plate:normal"].count == 20)
+local still_waiting = Mode.calculate(strict_record)
+assert(still_waiting["item:copper-plate:normal"] == nil and still_waiting["item:z:normal"].count == 10)
 
 strict_copper.count = 11
 strict_plate.count = 11
+inventory[#inventory + 1] = {signal = {type = "item", name = "z", quality = "normal"}, count = 10}
 game.tick = 30
 local recovered = Mode.calculate(strict_record)
 assert(recovered["item:wire:normal"].count == 31)
@@ -440,7 +450,7 @@ local strict_partial_all = Mode.calculate(strict_partial_record)
 assert(strict_partial_all["item:circuit:normal"].count == 100)
 assert(strict_partial_all["item:wire:normal"].count == 300)
 assert(strict_partial_all["item:plate:normal"].count == 89)
-assert(strict_partial_all["item:copper-plate:normal"].count == 289)
+assert(strict_partial_all["item:copper-plate:normal"] == nil)
 
 -- all 的精确目标不能污染 single 的严格大于停止边界；切换后 300 仍需输出到 301。
 local output_mode_cache_record = {entity = entity, config = {
@@ -553,6 +563,28 @@ strict_toggle_record.config.recursion_strict_validation = true
 Mode.reset(strict_toggle_record)
 assert(Mode.calculate(strict_toggle_record)["item:stone-brick:normal"] == nil)
 assert(strict_toggle_record.supermarket_order_diagnostics["item:stone-brick:normal"].kind == "no_recipe")
+
+-- 本机不支持的中间材料只在低于启动门槛时阻断；总量不足但能够开工时边生产边补料。
+orders = {{signal = {type = "item", name = "board", quality = "normal"}, count = 1000}}
+inventory = {{signal = {type = "item", name = "copper-plate", quality = "normal"}, count = 100}}
+local delegated_material_record = {entity = entity, config = {
+  production_machine = "assembler", inventory_validation = "inventory", network_publish = false,
+  recursion_output_mode = "single", sequential_production = true, recurise_depth = 10,
+  recursion_timeout = 0, recursion_additional_production_rate = 0,
+  recursion_material_demand_rate = 10, recursion_material_retention_rate = 1
+}}
+assert(Mode.calculate(delegated_material_record)["item:board:normal"].count == 1000,
+  "stock above the start threshold must keep producing even when it cannot finish the whole order")
+inventory[1].count = 10
+local delegated_wait_record = {entity = entity, config = delegated_material_record.config}
+local delegated_wait = Mode.calculate(delegated_wait_record)
+assert(next(delegated_wait) == nil, "unsupported material at the threshold must not become a local output")
+local delegated_diagnostic = delegated_wait_record.supermarket_order_diagnostics["item:board:normal"]
+assert(delegated_diagnostic.kind == "network_material_wait"
+  and delegated_diagnostic.materials[1].signal.name == "copper-plate"
+  and delegated_diagnostic.materials[1].count == 990
+  and not delegated_diagnostic.materials[1].published,
+  "blocked roots must expose the delegated shortage and disabled publishing state")
 
 -- “不校验”只读取产品完成量，原料默认满足并直接输出根订单；超时后顺序切到下一单。
 orders = {

@@ -65,6 +65,15 @@ assert(task and task.signal.name == "plate" and task.owner == 2, "machine-capabl
 assert(b.output["recipe:plate"], "assigned demand executes real recipe")
 assert(#Network.tasks(1) == 1, "one request per source/material")
 
+-- 总原料不足但高于启动门槛时，本地父产品继续生产，网络同时补齐剩余材料。
+storage.bmsc_production_network = nil; storage.combinators = {}
+a = record(1, "assembler", {plate = 2}, {gear = 10})
+b = record(2, "furnace", {ore = 100}, {})
+tick(); tick()
+task = Network.tasks(1)[1]
+assert(a.output["recipe:gear"] and task and task.signal.name == "plate" and task.quantity == 18,
+  "a runnable parent order must produce locally while the network replenishes its remaining material")
+
 -- 网络根订单可以直接使用配方信号；承接资格仍须按承接方机器解析出的产品判断。
 storage.bmsc_production_network = nil; storage.combinators = {}
 local recipe_signal = {type = "recipe", name = "plate"}

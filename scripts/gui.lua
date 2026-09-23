@@ -399,6 +399,18 @@ function Gui.production_diagnostic_tooltip(diagnostic)
     reason = {"bmsc.supermarket-reason-surface-conditions"}
   elseif diagnostic.kind == "inventory_query_pending" then
     reason = {"bmsc.supermarket-reason-inventory-query-pending"}
+  elseif diagnostic.kind == "network_material_wait" then
+    local entries = {}
+    for _, material in ipairs(diagnostic.materials or {}) do
+      local status = material.published and {"bmsc-net." .. (material.status or "pending")}
+        or {"bmsc-net.publish-disabled"}
+      entries[#entries + 1] = material.owner
+        and {"bmsc.supermarket-network-material-owner", signal_localised_label(material.signal),
+          material.count, status, material.owner}
+        or {"bmsc.supermarket-network-material", signal_localised_label(material.signal), material.count, status}
+    end
+    local materials = join_localised(entries, "\n")
+    reason = materials and {"bmsc.supermarket-reason-network-material-wait", materials} or nil
   elseif diagnostic.kind == "unsupported_signal" then
     reason = {"bmsc.production-reason-unsupported-signal"}
   elseif diagnostic.kind == "non_positive_order" then
@@ -425,7 +437,7 @@ local function diagnostic_signal_style(color, diagnostic)
   if kind == "active_output" or kind == "supermarket_expanding" then
     return "green_circuit_network_content_slot" -- 标准绿色：当前正在输出或展开。
   end
-  if kind == "waiting_for_order" or kind == "active_fallback"
+  if kind == "waiting_for_order" or kind == "active_fallback" or kind == "network_material_wait"
     or kind == "inventory_query_pending" then
     return "bmsc_signal_diagnostic_filtered"  -- 黄色：有效订单，等待轮到它。
   end
@@ -440,7 +452,8 @@ local function diagnostic_signal_priority(diagnostic)
   local kind = diagnostic and diagnostic.kind
   if kind == "swap_discarded" then return -1 end
   if kind == "active_output" or kind == "active_fallback" or kind == "supermarket_expanding" then return 4 end
-  if kind == "waiting_for_order" or kind == "inventory_query_pending" then return 3 end
+  if kind == "waiting_for_order" or kind == "inventory_query_pending"
+    or kind == "network_material_wait" then return 3 end
   if kind == "stock_sufficient" or kind == "supermarket_completed" then return 1 end
   return 2
 end

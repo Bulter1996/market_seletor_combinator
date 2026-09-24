@@ -11,9 +11,10 @@ local UI = {
 local LOCATE_ZOOM = 1 -- 远程定位需保留周边参照，不能以最近视角贴满目标组合器。
 local LARGE_ICON = 56
 local POLICY_ICON = 42 -- 原版 32px 槽位的约 1.3 倍，和树节点图标区分但不喧宾夺主。
+local POLICY_ACTION_ICON = math.floor(POLICY_ICON * 2 / 3) -- 策略操作按钮比物品/配方槽位紧凑。
 local POLICY_FIELD_WIDTH = 56
 local POLICY_PRIORITY_WIDTH = 30
-local POLICY_WINDOW_WIDTH = 250 -- 固定紧凑宽度，使右边框能精确锚定鼠标位置。
+local POLICY_WINDOW_MIN_WIDTH = 250 -- 内容自动撑开，但保留紧凑面板的最小宽度。
 local POLICY_CURSOR_VERTICAL_OFFSET = 24
 local POLICY_OPACITY_SETTING = "bmsc-policy-gui-opacity"
 local POLICY_OPACITY_STYLES = {
@@ -532,13 +533,16 @@ function UI.open_policy(player, record, selected, cursor)
   view.selected = Util.signal_key(selected)
   local frame = player.gui.screen.add{type = "frame", name = UI.policy_name, direction = "vertical",
     style = policy_frame_style(player)}
-  frame.style.width = POLICY_WINDOW_WIDTH
+  local screen_width = math.floor(player.display_resolution.width / player.display_scale)
+  frame.style.minimal_width = POLICY_WINDOW_MIN_WIDTH
+  frame.style.maximal_width = math.max(POLICY_WINDOW_MIN_WIDTH, screen_width - 16)
   frame.style.maximal_height = math.max(240, math.floor(player.display_resolution.height / player.display_scale * 0.8))
   local location
   if cursor then
     local screen = player.display_resolution
     local scale = player.display_scale
-    location = {x = math.max(0, math.min(cursor.x - POLICY_WINDOW_WIDTH, math.floor(screen.width / scale) - POLICY_WINDOW_WIDTH)),
+    local available_width = math.floor(screen.width / scale)
+    location = {x = math.max(0, math.min(cursor.x - POLICY_WINDOW_MIN_WIDTH, available_width - POLICY_WINDOW_MIN_WIDTH)),
       y = math.max(0, math.min(cursor.y + POLICY_CURSOR_VERTICAL_OFFSET, math.floor(screen.height / scale) - 288))}
   elseif old_location then
     location = old_location
@@ -571,16 +575,17 @@ function UI.open_policy(player, record, selected, cursor)
   header.add{type = "empty-widget"}.style.horizontally_stretchable = true
   local terminal = (record.config.recursion_terminal_nodes or {})[view.selected] == true
   local publish = (record.config.recursion_network_publish_nodes or {})[view.selected] ~= false
-  header.add{type = "sprite-button", sprite = "utility/enter",
+  add_large_slot(header, {type = "sprite-button", sprite = "virtual-signal/signal-white-flag",
     style = publish and "bmsc_signal_diagnostic_filtered" or "frame_action_button",
     toggled = publish, tooltip = {"bmsc-net.network-publish-node-help"},
-    tags = {bmsc_net_action = "recursion-network-publish-toggle", unit = view.unit, key = view.selected}}
-  header.add{type = "sprite-button", sprite = "utility/close",
+    tags = {bmsc_net_action = "recursion-network-publish-toggle", unit = view.unit, key = view.selected}}, POLICY_ACTION_ICON)
+  add_large_slot(header, {type = "sprite-button", sprite = terminal and "virtual-signal/signal-lock"
+      or "virtual-signal/signal-unlock",
     style = terminal and "bmsc_signal_diagnostic_filtered" or "frame_action_button",
     toggled = terminal, tooltip = {"bmsc-net.terminal-node-help"},
-    tags = {bmsc_net_action = "recursion-terminal-toggle", unit = view.unit, key = view.selected}}
-  header.add{type = "sprite-button", sprite = "utility/refresh", style = "frame_action_button",
-    tooltip = {"bmsc-net.automatic"}, tags = {bmsc_net_action = "automatic"}}
+    tags = {bmsc_net_action = "recursion-terminal-toggle", unit = view.unit, key = view.selected}}, POLICY_ACTION_ICON)
+  add_large_slot(header, {type = "sprite-button", sprite = "utility/refresh", style = "frame_action_button",
+    tooltip = {"bmsc-net.automatic"}, tags = {bmsc_net_action = "automatic"}}, POLICY_ACTION_ICON)
   local entries = record.config.recipe_policies[view.selected] or {}
   local default_recipe = not entries[1] and Util.find_recipe(record.entity.force, selected, record.config.production_machine) or nil
   -- 等价配方会被候选列表去重；把自动解析结果作为偏好传入，保证默认绿色项始终可见。

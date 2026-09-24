@@ -283,9 +283,28 @@ local function executable(outputs)
   return false
 end
 
+local function active_order(diagnostics, source_key)
+  local diagnostic = diagnostics and diagnostics[source_key]
+  return diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+    or diagnostic.kind == "supermarket_expanding")
+end
+
+---取得合并网络槽位代表的最高调度顺位等待任务。
+function Network.waiting_task(record, signal_key)
+  local best
+  for _, task in ipairs(record.network_assignments or {}) do
+    if task.key == record.network_active and Util.signal_key(task.signal) == signal_key then return nil end
+    if task.key ~= record.network_active and task.status == "assigned" and task.execution
+      and Util.signal_key(task.signal) == signal_key
+      and (not best or task.priority > best.priority
+        or task.priority == best.priority and task.id < best.id) then best = task end
+  end
+  return best
+end
+
 function Network.calculate(record, calculate)
   if not record.config.network_publish and not record.config.network_accept then
-    record.network_requests, record.network_active = nil, nil
+    record.network_requests, record.network_active, record.network_manual_target = nil, nil, nil
     return calculate(record)
   end
   local requests, previous = {}, record.network_active
@@ -297,7 +316,7 @@ function Network.calculate(record, calculate)
   record.network_inputs = nil
   record.network_inventory_deductions = nil
   publish(record, record, nil, requests)
-  local selected, selected_task
+  local selected, selected_task, previous_selected, previous_task
   local candidates = {}
   for _, task in ipairs(record.network_assignments or {}) do
     if task.status ~= "waiting_transport" then
@@ -323,7 +342,9 @@ function Network.calculate(record, calculate)
       task.status = executable(outputs) and "producing" or "waiting_materials"
       if executable(outputs) then
         candidates[#candidates + 1] = {task = task, outputs = outputs}
-        if previous == task.key and old_key and outputs[old_key] then selected, selected_task = outputs, task end
+        if previous == task.key and old_key and outputs[old_key] then
+          previous_selected, previous_task = outputs, task
+        end
       end
     end
   end
@@ -331,6 +352,24 @@ function Network.calculate(record, calculate)
     if a.task.priority ~= b.task.priority then return a.task.priority > b.task.priority end
     return a.task.id < b.task.id
   end)
+
+  -- 手动双击只覆盖跨来源仲裁，不合并本地与网络各自的队列。根订单完成、消失或
+  -- 失去可执行输出时清除锁定，然后立即回到原有自动优先级。
+  local manual = record.network_manual_target
+  if manual and manual.source == "local" and executable(local_output)
+    and active_order(record.supermarket_order_diagnostics, manual.source_key) then
+    selected = local_output
+  elseif manual and manual.source == "network" then
+    for _, candidate in ipairs(candidates) do
+      if candidate.task.key == manual.task_key
+        and active_order(candidate.task.execution.supermarket_order_diagnostics, manual.source_key) then
+        selected, selected_task = candidate.outputs, candidate.task
+        break
+      end
+    end
+  end
+  if manual and not selected then record.network_manual_target = nil end
+  if not selected and previous_selected then selected, selected_task = previous_selected, previous_task end
   if not selected then
     if executable(local_output) and (old_local_key and local_output[old_local_key]
       or not candidates[1] or candidates[1].task.priority <= (record.config.network_accept_priority or 5)) then selected = local_output

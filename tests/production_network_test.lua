@@ -113,6 +113,36 @@ a.red.plate = 20
 tick(); tick()
 assert(#Network.tasks(1) == 0, "requester physical stock releases commitment")
 
+-- 双击建立的手动仲裁在整个根订单期间覆盖自动优先级，并能在本地/网络间双向切换。
+storage.bmsc_production_network = nil; storage.combinators = {}
+a = record(1, "assembler", {}, {gear = 10})
+b = record(2, "furnace", {ore = 100}, {})
+tick(); tick()
+task = Network.tasks(1)[1]
+b.green = {widget = 5}; b.red.fuel = 50
+tick()
+assert(b.network_active == task.key and b.output["recipe:plate"], "network task starts before manual override")
+assert(Mode.prioritize_order(b, key("widget")))
+b.network_manual_target = {source = "local", source_key = key("widget")}
+tick(); tick()
+assert(not b.network_active and b.output["recipe:widget"]
+  and b.network_manual_target and b.network_manual_target.source == "local",
+  "manual local root must preempt and remain ahead of a network task")
+assert(task.status == "assigned" and Mode.prioritize_order(task.execution, key("plate")))
+b.network_manual_target = {source = "network", task_key = task.key, source_key = key("plate")}
+tick()
+assert(b.network_active == task.key and b.output["recipe:plate"],
+  "manual network root must preempt the local current order")
+local saved_manual = Mode.save_state(b)
+local restored_manual = {}
+Mode.restore_state(restored_manual, saved_manual)
+assert(restored_manual.network_manual_target.task_key == task.key,
+  "manual arbitration must survive a runtime rebuild and save reload")
+b.red.plate = 60
+tick()
+assert(task.status == "waiting_transport" and not b.network_manual_target and b.output["recipe:widget"],
+  "completing a manually selected root must clear the override and resume automatic scheduling")
+
 -- 同池库存不能重复交付；本地目标受保护。
 storage.bmsc_production_network = nil
 storage.combinators = {}

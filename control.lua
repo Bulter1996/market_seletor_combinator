@@ -97,7 +97,37 @@ end
 ---@return table|nil diagnostics 当前模式诊断。
 local function current_input_diagnostics(record)
   if record.config.mode == MODE_PRODUCTION_ORDER then return record.production_order_diagnostics end
-  if record.config.mode == MODE_SUPERMARKET_ORDER then return record.supermarket_order_diagnostics end
+  if record.config.mode == MODE_SUPERMARKET_ORDER then
+    local diagnostics = record.supermarket_order_diagnostics
+    if not record.network_active then return diagnostics end
+    local active_signal
+    for _, task in ipairs(record.network_assignments or {}) do
+      if task.key == record.network_active and task.execution then
+        for _, diagnostic in pairs(task.execution.supermarket_order_diagnostics or {}) do
+          if diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+            or diagnostic.kind == "supermarket_expanding" then
+            active_signal = diagnostic.order and diagnostic.order.signal or task.signal
+            break
+          end
+        end
+        active_signal = active_signal or task.signal
+        break
+      end
+    end
+    local display = {}
+    for key, diagnostic in pairs(diagnostics or {}) do
+      if diagnostic and (diagnostic.order or diagnostic.kind == "active_output"
+        or diagnostic.kind == "active_fallback" or diagnostic.kind == "supermarket_expanding") then
+        local copy = {}
+        for field, value in pairs(diagnostic) do copy[field] = value end
+        copy.scheduled_waiting, copy.signal = true, active_signal
+        display[key] = copy
+      else
+        display[key] = diagnostic
+      end
+    end
+    return display
+  end
   if record.config.mode == MODE_SWAP_ORDER then return record.swap_order_diagnostics end
   return nil
 end
@@ -136,7 +166,19 @@ local function current_work_summary(record)
       network_orders[#network_orders + 1] = {signal = Util.make_signal(
         task.signal.type, task.signal.name, task.signal.quality), count = task.quantity}
       local diagnostic = task.execution and task.execution.supermarket_order_diagnostics
-      if diagnostic then network_diagnostics[Util.signal_key(task.signal)] = diagnostic[Util.signal_key(task.signal)] end
+      local key = Util.signal_key(task.signal)
+      diagnostic = diagnostic and diagnostic[key]
+      if diagnostic and task.key ~= record.network_active then
+        local copy = {}
+        for field, value in pairs(diagnostic) do copy[field] = value end
+        copy.scheduled_waiting = true
+        copy.signal = current and current.order and current.order.signal or nil
+        diagnostic = copy
+      end
+      -- 同信号多个任务合并为一个槽位；当前任务优先，否则保留调度顺序最高的第一项。
+      if diagnostic and (not network_diagnostics[key] or task.key == record.network_active) then
+        network_diagnostics[key] = diagnostic
+      end
     end
   end
   local linked_inventory = {}
@@ -722,16 +764,71 @@ end
 ---按玩家记录上次普通左键点击，避免多人同时查看同一运算器时互相触发双击。
 ---@param player_index uint 玩家索引。
 ---@param record table 组合器记录。
+---@param source string 本地或网络订单面板来源。
 ---@param signal_key string 被点击的订单信号键。
 ---@return boolean double_clicked 同一玩家在时限内再次点击同一订单时返回 true。
-local function signal_double_clicked(player_index, record, signal_key)
+local function signal_double_clicked(player_index, record, source, signal_key)
   local clicks = state().signal_clicks
   local previous = clicks[player_index]
   local double_clicked = previous and previous.unit_number == record.entity.unit_number
-    and previous.signal_key == signal_key and game.tick - previous.tick <= DOUBLE_CLICK_TICKS
+    and previous.source == source and previous.signal_key == signal_key
+    and game.tick - previous.tick <= DOUBLE_CLICK_TICKS
   clicks[player_index] = double_clicked and nil
-    or {unit_number = record.entity.unit_number, signal_key = signal_key, tick = game.tick}
+    or {unit_number = record.entity.unit_number, source = source, signal_key = signal_key, tick = game.tick}
   return double_clicked == true
+end
+
+local function active_order_diagnostic(diagnostics, source_key)
+  local diagnostic = diagnostics and diagnostics[source_key]
+  if diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+    or diagnostic.kind == "supermarket_expanding") then return diagnostic end
+end
+
+---把本地或网络等待订单设为跨来源手动当前项，并向操作玩家返回一次结果。
+local function prioritize_waiting_order(player, record, source, source_key, order_signal)
+  if not order_signal then return false end
+  local mode = MODES[MODE_SUPERMARKET_ORDER]
+  local execution, task
+  if source == "local-order" then
+    local diagnostic = record.supermarket_order_diagnostics and record.supermarket_order_diagnostics[source_key]
+    if not record.network_active and (not diagnostic or diagnostic.kind ~= "waiting_for_order") then return false end
+    execution = record
+  elseif source == "network-order" then
+    task = ProductionNetwork.waiting_task(record, source_key)
+    execution = task and task.execution or nil
+  end
+  local diagnostic = execution and execution.supermarket_order_diagnostics
+    and execution.supermarket_order_diagnostics[source_key] or nil
+  local label = Gui.signal_localised_label(order_signal)
+  if not (execution and mode.prioritize_order(execution, source_key)) then
+    player.print({"bmsc.supermarket-priority-failed", label,
+      Gui.production_diagnostic_tooltip(diagnostic) or {"bmsc.supermarket-priority-unavailable"}})
+    return false
+  end
+
+  record.network_manual_target = task
+    and {source = "network", task_key = task.key, source_key = source_key}
+    or {source = "local", source_key = source_key}
+  local outputs = mode.calculate(record)
+  write_outputs(record, outputs)
+  local selected = record.network_manual_target
+    and ((task and record.network_active == task.key)
+      or (not task and not record.network_active))
+  local active = selected and active_order_diagnostic(
+    task and task.execution.supermarket_order_diagnostics or record.supermarket_order_diagnostics, source_key) or nil
+  if not active then
+    player.print({"bmsc.supermarket-priority-failed", label,
+      Gui.production_diagnostic_tooltip(diagnostic) or {"bmsc.supermarket-priority-unavailable"}})
+    return false
+  end
+  local stage = active.stage
+  if stage and stage.signal and (stage.level or 1) > 1 then
+    player.print({"bmsc.supermarket-priority-material", label,
+      Gui.signal_localised_label(stage.signal), stage.output_count or 0})
+  else
+    player.print({"bmsc.supermarket-priority-started", label})
+  end
+  return true
 end
 
 local function order_target_entry(record, source_key)
@@ -1256,20 +1353,19 @@ script.on_event(defines.events.on_gui_click, function(event)
       end
     elseif event.button == defines.mouse_button_type.right and tags.bmsc_signal_side == "input"
       and tags.bmsc_signal_source == "local-order"
-      and record and record.config.mode == MODE_SUPERMARKET_ORDER
+      and record and not record.network_active and record.config.mode == MODE_SUPERMARKET_ORDER
       and MODES[MODE_SUPERMARKET_ORDER].defer_current_order(record, tags.bmsc_signal_key) then
       -- defer_current_order 已先清除旧输出选择，因此这次重算不会进入原料等待门。
+      record.network_manual_target = nil
       write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
       Gui.refresh_connection_status(
         player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
     elseif event.button == defines.mouse_button_type.left and not event.alt
       and not event.control and not event.shift and tags.bmsc_signal_side == "input"
-      and tags.bmsc_signal_source == "local-order"
+      and (tags.bmsc_signal_source == "local-order" or tags.bmsc_signal_source == "network-order")
       and record and record.config.mode == MODE_SUPERMARKET_ORDER
-      and signal_double_clicked(event.player_index, record, tags.bmsc_signal_key)
-      and MODES[MODE_SUPERMARKET_ORDER].prioritize_waiting_order(record, tags.bmsc_signal_key) then
-      -- 与右键后移一样立即重算，双击选中的等待订单不继承旧输出的原料等待。
-      write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
+      and signal_double_clicked(event.player_index, record, tags.bmsc_signal_source, tags.bmsc_signal_key) then
+      prioritize_waiting_order(player, record, tags.bmsc_signal_source, tags.bmsc_signal_key, signal_from_tags(tags))
       Gui.refresh_connection_status(
         player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
     elseif event.alt and event.button == defines.mouse_button_type.left then

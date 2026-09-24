@@ -250,8 +250,9 @@ record.config.recurise_depth = 0
 record.config.inventory_validation = nil
 UI.open_policy(player, record, {type = "item", name = "plate"}, {x = 400, y = 160})
 local policy = player.gui.screen[UI.policy_name]
-assert(policy.location.x == 150 and policy.location.y == 184, "policy popup must align its right edge to the cursor")
-assert(policy.style.width == 250, "policy popup must use a fixed compact width for exact cursor alignment")
+assert(policy.location.x == 150 and policy.location.y == 184, "policy popup must align its minimum right edge to the cursor")
+assert(policy.style.width == nil and policy.style.minimal_width == 250 and policy.style.maximal_width == 1904,
+  "policy popup must use adaptive width bounded by the available screen")
 assert(policy.style_name == "bmsc_policy_frame_60", "policy popup must use the configured transparent frame style")
 assert(policy.children[1].drag_target == policy, "policy title bar must drag its own popup frame")
 assert(find_sprite(policy, "item/plate").style.width == 42,
@@ -259,11 +260,18 @@ assert(find_sprite(policy, "item/plate").style.width == 42,
 local publish_button = find_action_button(policy, "recursion-network-publish-toggle")
 local terminal_button = find_action_button(policy, "recursion-terminal-toggle")
 assert(publish_button and publish_button.tags.bmsc_net_action == "recursion-network-publish-toggle"
-  and publish_button.style_name == "bmsc_signal_diagnostic_filtered",
+  and publish_button.style_name == "bmsc_signal_diagnostic_filtered"
+  and publish_button.sprite == "virtual-signal/signal-white-flag"
+  and publish_button.style.width == 28 and publish_button.style.height == 28,
   "policy header must place a selected network-publish flag before the leaf button")
 assert(terminal_button and terminal_button.tags.bmsc_net_action == "recursion-terminal-toggle"
-  and terminal_button.style_name == "frame_action_button",
+  and terminal_button.style_name == "frame_action_button"
+  and terminal_button.sprite == "virtual-signal/signal-unlock"
+  and terminal_button.style.width == 28 and terminal_button.style.height == 28,
   "policy header must place an unselected unlock button before the automatic recipe reset")
+local automatic_button = find_action_button(policy, "automatic")
+assert(automatic_button and automatic_button.style.width == 28 and automatic_button.style.height == 28,
+  "policy header automatic button must use the same fixed size")
 for index, input in ipairs(textfields(policy)) do
   local expected = (index - 1) % 3 == 2 and 30 or 56
   assert(input.style.width == expected, "policy priority fields must be last and narrower than rate fields")
@@ -381,6 +389,14 @@ assert(#output_slots.children == 2
   and output_slots.children[1].number == 400 and output_slots.children[1].tags.bmsc_signal_color == "green"
   and output_slots.children[2].number == 400 and output_slots.children[2].tags.bmsc_signal_color == "red",
   "output signals must keep red and green values separate instead of displaying their sum")
+local waiting_tooltip = Gui.production_diagnostic_tooltip({
+  kind = "no_recipe", scheduled_waiting = true,
+  signal = {type = "item", name = "plate"},
+  order = {signal = {type = "item", name = "ore"}, count = 10}
+})
+assert(waiting_tooltip[2][1] == "bmsc.production-no-output-reason"
+  and waiting_tooltip[4][1] == "bmsc.production-no-output-reason",
+  "an unselected order must show waiting state without discarding its blocking reason")
 assert(not content["bmsc-production-details"], "configuration details must not remain direct content children")
 local closed, config_open = Gui.show_page(main["bmsc-page-switcher"]["bmsc-page-config"], "config")
 assert(not closed and config_open,

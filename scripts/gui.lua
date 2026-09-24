@@ -195,6 +195,8 @@ local function signal_localised_label(signal)
   return {"", "[img=" .. signal_sprite_path(signal) .. "] ", prototype and prototype.localised_name or signal.name}
 end
 
+Gui.signal_localised_label = signal_localised_label
+
 local function signal_localised_name(signal)
   local group = signal.type == "fluid" and prototypes.fluid
     or signal.type == "virtual" and prototypes.virtual_signal or prototypes.item
@@ -372,6 +374,19 @@ end
 ---@return LocalisedString|nil tooltip 没有诊断时不追加提示。
 function Gui.production_diagnostic_tooltip(diagnostic)
   if not diagnostic then return nil end
+  if diagnostic.scheduled_waiting then
+    local signal = diagnostic.signal or diagnostic.order and diagnostic.order.signal
+    local waiting = signal and {"bmsc.production-no-output-reason",
+      {"bmsc.production-reason-waiting", signal_localised_label(signal)}} or nil
+    if diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+      or diagnostic.kind == "supermarket_expanding" or diagnostic.kind == "waiting_for_order" then
+      return waiting
+    end
+    local underlying = {}
+    for key, value in pairs(diagnostic) do if key ~= "scheduled_waiting" then underlying[key] = value end end
+    local detail = Gui.production_diagnostic_tooltip(underlying)
+    return waiting and detail and {"", waiting, "\n", detail} or waiting or detail
+  end
   if diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
     or diagnostic.kind == "supermarket_expanding" then
     return active_order_tooltip(diagnostic)
@@ -434,6 +449,7 @@ local function diagnostic_signal_style(color, diagnostic)
   local kind = diagnostic and diagnostic.kind
   if kind == "swap_discarded" then return "bmsc_signal_diagnostic_filtered" end
   if color ~= "green" then return color .. "_circuit_network_content_slot" end
+  if diagnostic.scheduled_waiting then return "bmsc_signal_diagnostic_filtered" end
   if kind == "active_output" or kind == "supermarket_expanding" then
     return "green_circuit_network_content_slot" -- 标准绿色：当前正在输出或展开。
   end
@@ -451,6 +467,7 @@ end
 local function diagnostic_signal_priority(diagnostic)
   local kind = diagnostic and diagnostic.kind
   if kind == "swap_discarded" then return -1 end
+  if diagnostic and diagnostic.scheduled_waiting then return 3 end
   if kind == "active_output" or kind == "active_fallback" or kind == "supermarket_expanding" then return 4 end
   if kind == "waiting_for_order" or kind == "inventory_query_pending"
     or kind == "network_material_wait" then return 3 end

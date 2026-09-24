@@ -47,6 +47,7 @@ end
 ---@return nil
 function Mode.reset(record)
   reset_output_state(record)
+  record.network_manual_target = nil
   record.recursion_order_key = nil
   record.supermarket_active_orders = nil
   record.supermarket_order_candidates = nil
@@ -58,6 +59,45 @@ function Mode.reset(record)
   record.recursion_inventory_protection_tick = nil
   record.recursion_inventory_shortages = nil
   record.recursion_linked_last_outputs = nil
+end
+
+local prioritizable_diagnostics = {
+  active_output = true,
+  active_fallback = true,
+  supermarket_expanding = true,
+  waiting_for_order = true
+}
+
+---把指定根订单提升为 single 当前项；调用方负责最终跨来源仲裁。
+---@param record table 本地组合器记录或网络任务执行上下文。
+---@param source_key string 订单输入信号键。
+---@return boolean prioritized 目标存在、可执行且已完成队内提升时返回 true。
+function Mode.prioritize_order(record, source_key)
+  local config = type(record.config) == "table" and record.config or {}
+  local diagnostic = type(record.supermarket_order_diagnostics) == "table"
+    and record.supermarket_order_diagnostics[source_key] or nil
+  if config.recursion_output_mode ~= "single"
+    or not (diagnostic and prioritizable_diagnostics[diagnostic.kind]) then return false end
+  if config.sequential_production == false then
+    local candidates = type(record.supermarket_order_candidates) == "table"
+      and record.supermarket_order_candidates[source_key] or nil
+    if not (candidates and candidates[1]) then return false end
+    reset_output_state(record)
+    record.selected_recursion_output = candidates[1]
+    record.recursion_order_key = source_key
+    return true
+  end
+  local roots = record.supermarket_order_plan and record.supermarket_order_plan.roots or {}
+  for index, root in ipairs(roots) do
+    if root.source_key == source_key then
+      record.supermarket_sequence_index = index
+      record.supermarket_active_orders = {}
+      reset_output_state(record)
+      record.recursion_order_key = nil
+      return true
+    end
+  end
+  return false
 end
 
 ---后移 single 当前订单；顺序模式推进游标，非顺序模式选择下一个有候选输出的订单。
@@ -102,31 +142,10 @@ end
 ---@param source_key string 被双击的绿色订单信号键。
 ---@return boolean prioritized 目标确实是等待订单时返回 true。
 function Mode.prioritize_waiting_order(record, source_key)
-  local config = type(record.config) == "table" and record.config or {}
   local diagnostic = type(record.supermarket_order_diagnostics) == "table"
     and record.supermarket_order_diagnostics[source_key] or nil
-  if config.recursion_output_mode ~= "single"
-    or not diagnostic or diagnostic.kind ~= "waiting_for_order" then return false end
-  if config.sequential_production == false then
-    local candidates = type(record.supermarket_order_candidates) == "table"
-      and record.supermarket_order_candidates[source_key] or nil
-    if not (candidates and candidates[1]) then return false end
-    reset_output_state(record)
-    record.selected_recursion_output = candidates[1]
-    record.recursion_order_key = source_key
-    return true
-  end
-  local roots = record.supermarket_order_plan and record.supermarket_order_plan.roots or {}
-  for index, root in ipairs(roots) do
-    if root.source_key == source_key then
-      record.supermarket_sequence_index = index
-      record.supermarket_active_orders = {}
-      reset_output_state(record)
-      record.recursion_order_key = nil
-      return true
-    end
-  end
-  return false
+  return diagnostic and diagnostic.kind == "waiting_for_order"
+    and Mode.prioritize_order(record, source_key) or false
 end
 
 ---清除只属于当前机器和订单输入的配方树；机器或科技变化时调用。
@@ -147,6 +166,7 @@ function Mode.save_state(record)
   return {
     network_requests = record.network_requests,
     network_active = record.network_active,
+    network_manual_target = record.network_manual_target,
     selected_output = record.selected_recursion_output,
     output_count = record.recursion_output_count,
     changed_tick = record.recursion_output_changed_tick,
@@ -172,6 +192,7 @@ function Mode.restore_state(record, saved)
   saved = saved or {}
   record.network_requests = saved.network_requests
   record.network_active = saved.network_active
+  record.network_manual_target = saved.network_manual_target
   record.selected_recursion_output = saved.selected_output
   record.recursion_output_signal = nil
   record.recursion_output_target = nil

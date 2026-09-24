@@ -6,12 +6,14 @@ local PROXY = "b-market-selector-output-proxy"         -- 参数：向线路发�
 local DETAIL_PROXY = "b-market-selector-detail-proxy" -- 参数：只在 Alt 模式显示当前订单产品的隐藏实体。
 local OUTPUT_PROXY_REVISION = 2                       -- 修改代理连接/写入策略时递增，强制旧存档重建。
 local TICK_INTERVAL = settings.startup["bmsc-update-interval"].value
-                                                          -- 参数：玩家配置的刷新间隔，默认 30 tick。
+                                                          -- 参数：玩家配置的刷新间隔，默认 120 tick。
 local Gui = require("scripts.gui")                     -- GUI 模块：只负责界面，不参与生产计算。
 local SignalPicker = require("scripts.signal_picker") -- 条件信号与常量共用的原版风格选择器。
 local Config = require("scripts.config")               -- 配置模块：默认值、模式常量和外部数据校验。
 local Util = require("scripts.common_util")            -- 通用工具：输出排序等无状态功能。
 local OrderTarget = require("scripts.order_target")    -- 两种订单模式共用的配方覆盖与多产物库存目标。
+local ProductionNetwork = require("scripts.production_network")
+local NetworkGui = require("scripts.network_gui")
 local MODES = require("scripts.mode_registry")          -- 模式注册表：统一调度彼此独立的算法模块。
 local MODE_PRODUCTION_ORDER = Config.mode.production_order
 local MODE_SUPERMARKET_ORDER = Config.mode.supermarket_order
@@ -22,16 +24,58 @@ local MAX_PROXY_SIGNALS = 65535                    -- Factorio 常量运算器�
 local DOUBLE_CLICK_TICKS = 30                      -- 0.5 秒：等待订单左键双击判定窗口。
 local refresh_open_order_targets                    -- 研究事件发生时刷新仍打开的配方选择窗口。
 
+-- 把一次完整刷新周期拆成多个小桶；默认 120 tick 对应 10 个桶、每 12 tick 一个桶。
+-- 桶数取不超过 10 且能整除周期的最大值，避免修改自定义刷新间隔后的周期漂移。
+local function calculate_update_bucket_count(interval)
+  for count = math.min(10, interval), 1, -1 do
+    if interval % count == 0 then return count end
+  end
+  return 1
+end
+
+local UPDATE_BUCKET_COUNT = calculate_update_bucket_count(TICK_INTERVAL)
+local UPDATE_BUCKET_INTERVAL = TICK_INTERVAL / UPDATE_BUCKET_COUNT
+
 
 ---取得并初始化本模组的持久状态。
 ---为什么需要：`storage` 会随存档保存，但首次运行时字段不存在，所有入口都通过此函数安全访问。
----@return table state 包含 combinators（实体记录）和 player_gui（玩家正在编辑的实体）。
+---@return table state 包含实体记录、当前窗口及玩家级 GUI 偏好。
 local function state()
   -- 防御开发期脚本曾写入错误类型的半旧 storage；只依赖 `or {}` 无法修复 truthy 字符串。
   if type(storage.combinators) ~= "table" then storage.combinators = {} end
   if type(storage.player_gui) ~= "table" then storage.player_gui = {} end
+  if type(storage.gui_config_open) ~= "table" then storage.gui_config_open = {} end
   if type(storage.signal_clicks) ~= "table" then storage.signal_clicks = {} end
   return storage
+end
+
+---确保更新桶存在，并兼容启用桶调度前创建的旧存档。
+---@return table buckets 以 0-based 桶编号保存 unit_number 集合。
+local function ensure_update_buckets()
+  local current = state()
+  if type(current.update_buckets) == "table"
+    and current.update_bucket_count == UPDATE_BUCKET_COUNT then
+    return current.update_buckets
+  end
+  local buckets = {}
+  for bucket = 0, UPDATE_BUCKET_COUNT - 1 do buckets[bucket] = {} end
+  for unit, record in pairs(current.combinators) do
+    if record.entity and record.entity.valid then
+      buckets[unit % UPDATE_BUCKET_COUNT][unit] = true
+    end
+  end
+  current.update_buckets = buckets
+  current.update_bucket_count = UPDATE_BUCKET_COUNT
+  return buckets
+end
+
+local function add_update_bucket(unit_number)
+  ensure_update_buckets()[unit_number % UPDATE_BUCKET_COUNT][unit_number] = true
+end
+
+local function remove_update_bucket(unit_number)
+  local bucket = ensure_update_buckets()[unit_number % UPDATE_BUCKET_COUNT]
+  if bucket then bucket[unit_number] = nil end
 end
 
 ---配置校验函数的本地别名，让实体生命周期代码保持简洁。
@@ -94,9 +138,110 @@ end
 ---@return table|nil diagnostics 当前模式诊断。
 local function current_input_diagnostics(record)
   if record.config.mode == MODE_PRODUCTION_ORDER then return record.production_order_diagnostics end
-  if record.config.mode == MODE_SUPERMARKET_ORDER then return record.supermarket_order_diagnostics end
+  if record.config.mode == MODE_SUPERMARKET_ORDER then
+    local diagnostics = record.supermarket_order_diagnostics
+    if not record.network_active then return diagnostics end
+    local active_signal
+    for _, task in ipairs(record.network_assignments or {}) do
+      if task.key == record.network_active and task.execution then
+        for _, diagnostic in pairs(task.execution.supermarket_order_diagnostics or {}) do
+          if diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+            or diagnostic.kind == "supermarket_expanding" then
+            active_signal = diagnostic.order and diagnostic.order.signal or task.signal
+            break
+          end
+        end
+        active_signal = active_signal or task.signal
+        break
+      end
+    end
+    local display = {}
+    for key, diagnostic in pairs(diagnostics or {}) do
+      if diagnostic and (diagnostic.order or diagnostic.kind == "active_output"
+        or diagnostic.kind == "active_fallback" or diagnostic.kind == "supermarket_expanding") then
+        local copy = {}
+        for field, value in pairs(diagnostic) do copy[field] = value end
+        copy.scheduled_waiting, copy.signal = true, active_signal
+        display[key] = copy
+      else
+        display[key] = diagnostic
+      end
+    end
+    return display
+  end
   if record.config.mode == MODE_SWAP_ORDER then return record.swap_order_diagnostics end
   return nil
+end
+
+---把模式诊断收敛为运行面板需要的三行快照；GUI 只显示，不重新推导订单或库存。
+local function current_work_summary(record)
+  local diagnostics = current_input_diagnostics(record) or {}
+  local source, next_key = "local", nil
+  if record.config.mode == MODE_SUPERMARKET_ORDER and record.network_active then
+    for _, task in ipairs(record.network_assignments or {}) do
+      if task.key == record.network_active and task.execution then
+        diagnostics = task.execution.supermarket_order_diagnostics or {}
+        source, next_key = "network", task.execution.supermarket_next_order_key
+        break
+      end
+    end
+  elseif record.config.mode == MODE_PRODUCTION_ORDER then
+    next_key = record.production_order_next_key
+  elseif record.config.mode == MODE_SUPERMARKET_ORDER then
+    next_key = record.supermarket_next_order_key
+  end
+  local current, active_count = nil, 0
+  for _, diagnostic in pairs(diagnostics) do
+    if diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+      or diagnostic.kind == "supermarket_expanding" then
+      active_count = active_count + 1
+      current = diagnostic
+    end
+  end
+  -- “当前订单”只承载单一工作项；全量输出同时处理多个订单时，避免 pairs 的偶然顺序制造误导。
+  if active_count ~= 1 then current = nil end
+  local network_orders = {}
+  local network_diagnostics = {}
+  for _, task in ipairs(record.network_assignments or {}) do
+    if task.signal and task.quantity and task.quantity > 0 then
+      network_orders[#network_orders + 1] = {signal = Util.make_signal(
+        task.signal.type, task.signal.name, task.signal.quality), count = task.quantity}
+      local diagnostic = task.execution and task.execution.supermarket_order_diagnostics
+      local key = Util.signal_key(task.signal)
+      diagnostic = diagnostic and diagnostic[key]
+      if diagnostic and task.key ~= record.network_active then
+        local copy = {}
+        for field, value in pairs(diagnostic) do copy[field] = value end
+        copy.scheduled_waiting = true
+        copy.signal = current and current.order and current.order.signal or nil
+        diagnostic = copy
+      end
+      -- 同信号多个任务合并为一个槽位；当前任务优先，否则保留调度顺序最高的第一项。
+      if diagnostic and (not network_diagnostics[key] or task.key == record.network_active) then
+        network_diagnostics[key] = diagnostic
+      end
+    end
+  end
+  local linked_inventory = {}
+  local stage = current and current.stage
+  if record.config.inventory_validation == Config.inventory_validation.linked and stage and stage.ingredients then
+    local requested = {}
+    for _, ingredient in ipairs(stage.ingredients) do
+      if ingredient.signal then requested[Util.signal_key(ingredient.signal)] = ingredient.signal end
+    end
+    local shared = MODES[MODE_INVENTORY_QUERY].get_shared_inventory(
+      record.entity.force, record.entity.surface, requested)
+    if shared then
+      for _, ingredient in ipairs(stage.ingredients) do
+        local signal = ingredient.signal
+        if signal then linked_inventory[#linked_inventory + 1] = {
+          signal = Util.make_signal(signal.type, signal.name, signal.quality),
+          count = math.max(0, shared[Util.signal_key(signal)] or 0)} end
+      end
+    end
+  end
+  return {current = current, next = next_key and diagnostics[next_key] or nil, source = source,
+    network_orders = network_orders, network_diagnostics = network_diagnostics, linked_inventory = linked_inventory}
 end
 
 ---销毁某条记录的全部隐藏输出代理。
@@ -222,6 +367,7 @@ local function register(entity, tags)
   }
   reset_all_modes(record)
   state().combinators[entity.unit_number] = record
+  add_update_bucket(entity.unit_number)
   sync_mode_visual(record)
 end
 
@@ -237,6 +383,7 @@ local function remove(entity)
       state().player_gui[player_index] = nil
     end
   end
+  remove_update_bucket(entity.unit_number)
   destroy_proxies(state().combinators[entity.unit_number])
   state().combinators[entity.unit_number] = nil
 end
@@ -466,38 +613,69 @@ local function refresh_open_timeout_displays()
   end
 end
 
----定时更新所有市场选择运算器，并清除已经失效的实体记录。
+---在一个完整刷新周期开始时准备跨实体共享状态。
 ---@return nil
-local function update_all()
+local function prepare_update_cycle()
   -- 需要跨实体协作的模式可在 calculate 前统一准备势力级状态；普通模式没有此钩子。
   -- 查询模式借此合并同一势力的查询信号，只维护一个 LinkedChestAndPipe 探针。
   for _, mode in pairs(MODES) do
     if mode.prepare then mode.prepare(state().combinators) end
   end
-  for unit, record in pairs(state().combinators) do
-    if record.entity and record.entity.valid then
+  for _, record in pairs(state().combinators) do
+    if record.config and record.config.schema_revision ~= Config.schema_revision then
+      record.config = normalize_runtime_config(record.config)
+    end
+  end
+  ProductionNetwork.prepare(state().combinators)
+end
+
+---刷新当前桶中打开的组合器 GUI；玩家列表很小，不参与组合器全量扫描。
+---@param bucket_index integer 当前 0-based 桶编号。
+---@return nil
+local function refresh_bucket_gui(bucket_index)
+  for player_index, unit in pairs(state().player_gui) do
+    if unit % UPDATE_BUCKET_COUNT == bucket_index then
+      local player = game.get_player(player_index)
+      local record = state().combinators[unit]
+      if player and record then
+        Gui.refresh_connection_status(
+          player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
+        Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
+          record.production_timeout_condition_results)
+        Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
+          record.recursion_timeout_condition_results)
+        Gui.refresh_condition_states(player.gui.screen[Gui.name], "swap",
+          record.swap_condition_results)
+      end
+    end
+  end
+end
+
+---定时更新当前市场选择运算器桶，并清除其中已经失效的实体记录。
+---@param bucket_index integer 当前 0-based 桶编号。
+---@return nil
+local function update_bucket(bucket_index)
+  local buckets = ensure_update_buckets()
+  local bucket = buckets[bucket_index] or {}
+  for unit in pairs(bucket) do
+    local record = state().combinators[unit]
+    if record and record.entity and record.entity.valid then
       -- 原生 select/max 在超市订单模式下本身会产生一个最大值信号；必须先重新屏蔽，
       -- 再写代理结果，避免它与脚本计算值在同一输出网络中相加。
       suppress_native_networks(record)
       write_outputs(record, calculate(record))
     else
       destroy_proxies(record)
+      bucket[unit] = nil
       state().combinators[unit] = nil
     end
   end
-  for player_index, unit in pairs(state().player_gui) do
-    local player = game.get_player(player_index)
-    local record = state().combinators[unit]
-    if player and record then
-      Gui.refresh_connection_status(
-        player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
-      Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
-        record.production_timeout_condition_results)
-      Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
-        record.recursion_timeout_condition_results)
-      Gui.refresh_condition_states(player.gui.screen[Gui.name], "swap", record.swap_condition_results)
+  for _, player in pairs(game.connected_players) do
+    if player.gui.screen[NetworkGui.name] and game.tick % 60 == 0 then
+      NetworkGui.refresh_network(player, state().combinators)
     end
   end
+  refresh_bucket_gui(bucket_index)
 end
 
 ---配置迁移时重建所有代理，同时保留玩家配置和当前锁定产品。
@@ -520,6 +698,8 @@ local function rebuild_all()
     for _, proxy in pairs(surface.find_entities_filtered{name = proxy_names}) do proxy.destroy() end
   end
   storage.combinators = {}
+  storage.update_buckets = nil
+  storage.update_bucket_count = nil
   for _, surface in pairs(game.surfaces) do
     for _, entity in pairs(surface.find_entities_filtered{name = ENTITY}) do
       local old = saved[entity.unit_number]
@@ -575,7 +755,8 @@ script.on_event(defines.events.on_gui_opened, function(event)
     record.config = normalize_runtime_config(record.config)
     Gui.open(
       player, event.entity, record.config, record.gui_output_networks, current_input_diagnostics(record),
-      MODES[MODE_INVENTORY_QUERY].is_available())
+      current_work_summary(record), MODES[MODE_INVENTORY_QUERY].is_available(),
+      state().gui_config_open[player.index] == true)
     Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
       record.production_timeout_condition_results)
     Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
@@ -586,6 +767,11 @@ script.on_event(defines.events.on_gui_opened, function(event)
   end
 end)
 script.on_event(defines.events.on_gui_closed, function(event)
+  if NetworkGui.on_closed(event, state().combinators) then return end
+  if event.element and event.element.valid and event.element.name == NetworkGui.name then
+    event.element.destroy()
+    return
+  end
   if SignalPicker.on_closed(event) then return end
   if event.element and event.element.valid and event.element.name == Gui.order_target_name then
     local player = game.get_player(event.player_index)
@@ -610,6 +796,22 @@ script.on_event(defines.events.on_gui_closed, function(event)
   Gui.hide_network_popup(player)
   event.element.destroy()
 end)
+script.on_event(defines.events.on_gui_location_changed, function(event)
+  NetworkGui.on_location_changed(event)
+  Gui.sync_config_overlay_location(event.element)
+end)
+-- custom-input 属于数据阶段。热重载 control.lua 而未完整重启游戏时原型尚不存在，
+-- 此处跳过注册以避免 Unknown event；完整重启后会按 event_id 正常启用滚轮缩放。
+local function register_tree_zoom_input(name, delta)
+  local input = prototypes.custom_input and prototypes.custom_input[name]
+  if input then
+    script.on_event(input.event_id, function(event)
+      NetworkGui.on_zoom(event, state().combinators, delta)
+    end)
+  end
+end
+register_tree_zoom_input("bmsc-tree-zoom-in", 0.25)
+register_tree_zoom_input("bmsc-tree-zoom-out", -0.25)
 
 ---根据玩家索引取得其当前正在编辑的组合器记录。
 ---@param player_index uint 玩家索引。
@@ -627,16 +829,69 @@ end
 ---按玩家记录上次普通左键点击，避免多人同时查看同一运算器时互相触发双击。
 ---@param player_index uint 玩家索引。
 ---@param record table 组合器记录。
+---@param source string 本地或网络订单面板来源。
 ---@param signal_key string 被点击的订单信号键。
 ---@return boolean double_clicked 同一玩家在时限内再次点击同一订单时返回 true。
-local function signal_double_clicked(player_index, record, signal_key)
+local function signal_double_clicked(player_index, record, source, signal_key)
   local clicks = state().signal_clicks
   local previous = clicks[player_index]
   local double_clicked = previous and previous.unit_number == record.entity.unit_number
-    and previous.signal_key == signal_key and game.tick - previous.tick <= DOUBLE_CLICK_TICKS
+    and previous.source == source and previous.signal_key == signal_key
+    and game.tick - previous.tick <= DOUBLE_CLICK_TICKS
   clicks[player_index] = double_clicked and nil
-    or {unit_number = record.entity.unit_number, signal_key = signal_key, tick = game.tick}
+    or {unit_number = record.entity.unit_number, source = source, signal_key = signal_key, tick = game.tick}
   return double_clicked == true
+end
+
+local function active_order_diagnostic(diagnostics, source_key)
+  local diagnostic = diagnostics and diagnostics[source_key]
+  if diagnostic and (diagnostic.kind == "active_output" or diagnostic.kind == "active_fallback"
+    or diagnostic.kind == "supermarket_expanding") then return diagnostic end
+end
+
+---把本地或网络等待订单设为跨来源手动当前项，并向操作玩家返回一次结果。
+local function prioritize_waiting_order(player, record, source, source_key, order_signal)
+  if not order_signal then return false end
+  local mode = MODES[MODE_SUPERMARKET_ORDER]
+  local execution, task
+  if source == "local-order" then
+    execution = record
+  elseif source == "network-order" then
+    task = ProductionNetwork.waiting_task(record, source_key)
+    execution = task and task.execution or nil
+  end
+  local diagnostic = execution and execution.supermarket_order_diagnostics
+    and execution.supermarket_order_diagnostics[source_key] or nil
+  local label = Gui.signal_localised_label(order_signal)
+  if not (execution and mode.prioritize_order(execution, source_key)) then
+    player.print({"bmsc.supermarket-priority-failed", label,
+      Gui.production_diagnostic_tooltip(diagnostic) or {"bmsc.supermarket-priority-unavailable"}})
+    return false
+  end
+
+  record.network_manual_target = task
+    and {source = "network", task_key = task.key, source_key = source_key}
+    or {source = "local", source_key = source_key}
+  local outputs = mode.calculate(record)
+  write_outputs(record, outputs)
+  local selected = record.network_manual_target
+    and ((task and record.network_active == task.key)
+      or (not task and not record.network_active))
+  local active = selected and active_order_diagnostic(
+    task and task.execution.supermarket_order_diagnostics or record.supermarket_order_diagnostics, source_key) or nil
+  if not active then
+    player.print({"bmsc.supermarket-priority-failed", label,
+      Gui.production_diagnostic_tooltip(diagnostic) or {"bmsc.supermarket-priority-unavailable"}})
+    return false
+  end
+  local stage = active.stage
+  if stage and stage.signal and (stage.level or 1) > 1 then
+    player.print({"bmsc.supermarket-priority-material", label,
+      Gui.signal_localised_label(stage.signal), stage.output_count or 0})
+  else
+    player.print({"bmsc.supermarket-priority-started", label})
+  end
+  return true
 end
 
 local function order_target_entry(record, source_key)
@@ -655,7 +910,12 @@ local function copy_products(products)
   return result
 end
 
-local function open_order_target(player, record, order_signal, order_count)
+local function open_order_target(player, record, order_signal, order_count, network_task)
+  if record.config.mode == MODE_SUPERMARKET_ORDER then
+    if not network_task then MODES[MODE_SUPERMARKET_ORDER].calculate(record) end
+    NetworkGui.open_tree(player, record, order_signal, order_count, network_task)
+    return
+  end
   local recipe_query = record.config.mode == MODE_RECIPE_QUERY
   local target = OrderTarget.resolve(
     record.entity.force, record.config.production_machine, order_signal, record.config,
@@ -694,7 +954,7 @@ local function apply_order_target_change(player, record, order_signal, order_cou
   local mode = MODES[record.config.mode]
   if mode then write_outputs(record, mode.calculate(record)) end
   Gui.refresh_connection_status(
-    player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+    player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
   open_order_target(player, record, order_signal, order_count)
 end
 
@@ -756,9 +1016,7 @@ local condition_config_fields = {
 
 local timeout_monitor_fields = {
   ["bmsc-production-timeout-monitor-item-changes"] = {
-    config = "production_timeout_monitor_item_changes", condition_set = "production-timeout"},
-  ["bmsc-recursion-timeout-monitor-item-changes"] = {
-    config = "recursion_timeout_monitor_item_changes", condition_set = "recursion-timeout"}
+    config = "production_timeout_monitor_item_changes", condition_set = "production-timeout"}
 }
 
 local function conditions_for(record, set_name)
@@ -797,6 +1055,7 @@ local function update_numeric_config(record, element_name, value)
     return true
   end
   if element_name == "bmsc-recursion-additional" then
+    if value <= 1 then return false end
     record.config.recursion_additional_production_rate = value
     return true
   end
@@ -855,6 +1114,7 @@ local function invalidate_numeric_runtime_state(record, element_name)
 end
 
 script.on_event(defines.events.on_gui_text_changed, function(event)
+  if NetworkGui.on_text(event, state().combinators) then return end
   if SignalPicker.on_text_changed(event) then return end
   local record = current_record(event.player_index)
   local value = tonumber(event.element.text)
@@ -914,6 +1174,7 @@ script.on_event(defines.events.on_gui_value_changed, function(event)
   if accepted then invalidate_numeric_runtime_state(record, textfield.name) end
 end)
 script.on_event(defines.events.on_gui_selection_state_changed, function(event)
+  if NetworkGui.on_selection(event, state().combinators) then return end
   local event_tags = event.element.tags or {}
   if event_tags.bmsc_swap_comparator and event_tags.bmsc_condition_set then
     local record = current_record(event.player_index)
@@ -937,9 +1198,9 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   if event.element.name == "bmsc-mode" then
     local record = current_record(event.player_index)
     if not record then return end
-    record.config.mode = ({MODE_PRODUCTION_ORDER, MODE_SUPERMARKET_ORDER, MODE_RECIPE_QUERY,
-      MODE_INVENTORY_QUERY, MODE_SWAP_ORDER})
-      [event.element.selected_index] or MODE_PRODUCTION_ORDER
+    local selected_mode = Gui.mode_from_selected_index(event.element.selected_index)
+    if not selected_mode then return end
+    record.config.mode = selected_mode
     reset_all_modes(record)
     sync_mode_visual(record)
     Gui.close_order_target(game.get_player(event.player_index), true)
@@ -981,7 +1242,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
       MODES[MODE_SWAP_ORDER].clear(record)
       write_outputs(record, MODES[MODE_SWAP_ORDER].calculate(record))
       Gui.refresh_connection_status(game.get_player(event.player_index), record.entity,
-        record.gui_output_networks, current_input_diagnostics(record))
+        record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
     end
     return
   end
@@ -1017,16 +1278,6 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
     write_outputs(record, {})
     return
   end
-  if event.element.name == "bmsc-sequential-production" then
-    local record = current_record(event.player_index)
-    if not record then return end
-    record.config.sequential_production = event.element.selected_index == 1
-    -- 订单筛选方式变化后，旧的单信号锁定可能属于已经被忽略的另一个订单。
-    MODES[MODE_SUPERMARKET_ORDER].reset(record)
-    MODES[MODE_SUPERMARKET_ORDER].invalidate_plan(record)
-    Gui.set_sequence_restart_visible(event.element, record.config.sequential_production)
-    return
-  end
   if event.element.name ~= "bmsc-output" then return end
   local record = current_record(event.player_index)
   if record then
@@ -1035,6 +1286,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   end
 end)
 script.on_event(defines.events.on_gui_click, function(event)
+  if NetworkGui.on_click(event, state().combinators) then return end
   local player = game.get_player(event.player_index)
   local record = current_record(event.player_index)
 
@@ -1062,6 +1314,16 @@ script.on_event(defines.events.on_gui_click, function(event)
   -- 仅处理主 GUI 输入/输出面板中的信号图标；不改变槽位控件和数字角标布局。
   -- 普通 sprite-button 不会自动执行工厂百科快捷操作，因此显式补上原版 Alt+左键行为。
   local tags = event.element.tags or {}
+  if tags.bmsc_page then
+    local switched, config_open = Gui.show_page(event.element, tags.bmsc_page)
+    if config_open ~= nil then state().gui_config_open[event.player_index] = config_open end
+    if switched and record then
+      -- 收起参数栏时立刻显示本轮已有的输出快照。
+      Gui.refresh_connection_status(
+        player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
+    end
+    return
+  end
   if event.element.name == "bmsc-order-target-close" then
     Gui.close_order_target(player, true)
     return
@@ -1130,31 +1392,45 @@ script.on_event(defines.events.on_gui_click, function(event)
   if tags.bmsc_signal_panel_icon then
     if event.shift and event.button == defines.mouse_button_type.left
       and tags.bmsc_signal_side == "input" and record
-      and ((tags.bmsc_signal_color == "green" and (record.config.mode == MODE_PRODUCTION_ORDER
-        or record.config.mode == MODE_SUPERMARKET_ORDER))
-        or record.config.mode == MODE_RECIPE_QUERY) then
+      and (((tags.bmsc_signal_source == "local-order" or tags.bmsc_signal_source == "network-order")
+        and (record.config.mode == MODE_PRODUCTION_ORDER or record.config.mode == MODE_SUPERMARKET_ORDER))
+        or (tags.bmsc_signal_source == "local-order" or tags.bmsc_signal_source == "local-stock")
+          and record.config.mode == MODE_RECIPE_QUERY) then
       local order_signal = signal_from_tags(tags)
       if order_signal and Util.is_recipe_input(order_signal) then
-        open_order_target(player, record, order_signal, event.element.number or 0)
+        local network_task
+        if tags.bmsc_signal_source == "network-order" then
+          for _, task in ipairs(record.network_assignments or {}) do
+            if task.key == record.network_active and Util.signal_key(task.signal) == tags.bmsc_signal_key then
+              network_task = task.key
+              break
+            end
+          end
+          if not network_task then
+            for _, task in ipairs(record.network_assignments or {}) do
+              if Util.signal_key(task.signal) == tags.bmsc_signal_key then network_task = task.key; break end
+            end
+          end
+        end
+        open_order_target(player, record, order_signal, event.element.number or 0, network_task)
       end
     elseif event.button == defines.mouse_button_type.right and tags.bmsc_signal_side == "input"
-      and tags.bmsc_signal_color == "green"
-      and record and record.config.mode == MODE_SUPERMARKET_ORDER
+      and tags.bmsc_signal_source == "local-order"
+      and record and not record.network_active and record.config.mode == MODE_SUPERMARKET_ORDER
       and MODES[MODE_SUPERMARKET_ORDER].defer_current_order(record, tags.bmsc_signal_key) then
       -- defer_current_order 已先清除旧输出选择，因此这次重算不会进入原料等待门。
+      record.network_manual_target = nil
       write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
       Gui.refresh_connection_status(
-        player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+        player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
     elseif event.button == defines.mouse_button_type.left and not event.alt
       and not event.control and not event.shift and tags.bmsc_signal_side == "input"
-      and tags.bmsc_signal_color == "green"
+      and (tags.bmsc_signal_source == "local-order" or tags.bmsc_signal_source == "network-order")
       and record and record.config.mode == MODE_SUPERMARKET_ORDER
-      and signal_double_clicked(event.player_index, record, tags.bmsc_signal_key)
-      and MODES[MODE_SUPERMARKET_ORDER].prioritize_waiting_order(record, tags.bmsc_signal_key) then
-      -- 与右键后移一样立即重算，双击选中的等待订单不继承旧输出的原料等待。
-      write_outputs(record, MODES[MODE_SUPERMARKET_ORDER].calculate(record))
+      and signal_double_clicked(event.player_index, record, tags.bmsc_signal_source, tags.bmsc_signal_key) then
+      prioritize_waiting_order(player, record, tags.bmsc_signal_source, tags.bmsc_signal_key, signal_from_tags(tags))
       Gui.refresh_connection_status(
-        player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+        player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
     elseif event.alt and event.button == defines.mouse_button_type.left then
       local prototype_group = tags.bmsc_signal_type == "fluid" and prototypes.fluid
         or tags.bmsc_signal_type == "virtual" and prototypes.virtual_signal
@@ -1172,13 +1448,6 @@ script.on_event(defines.events.on_gui_click, function(event)
     end
     return
   end
-  if event.element.name == "bmsc-restart-sequence" then
-    if record then
-      MODES[MODE_SUPERMARKET_ORDER].restart_sequence(record)
-      write_outputs(record, {})
-    end
-    return
-  end
   if tags.bmsc_add_condition and tags.bmsc_condition_set and record then
     local conditions = conditions_for(record, tags.bmsc_condition_set)
     conditions[#conditions + 1] = {
@@ -1192,7 +1461,7 @@ script.on_event(defines.events.on_gui_click, function(event)
     MODES[MODE_SWAP_ORDER].clear(record)
     write_outputs(record, MODES[MODE_SWAP_ORDER].calculate(record))
     Gui.refresh_connection_status(
-      player, record.entity, record.gui_output_networks, current_input_diagnostics(record))
+      player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
     return
   end
   if event.element.name == "bmsc-description-toggle" then
@@ -1221,6 +1490,23 @@ script.on_event(defines.events.on_gui_click, function(event)
 end)
 
 script.on_event(defines.events.on_gui_checked_state_changed, function(event)
+  if NetworkGui.on_checked(event, state().combinators) then return end
+  if event.element.name == "bmsc-sequential-production" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    record.config.sequential_production = event.element.state == true
+    -- 顺序策略改变后，旧的单信号锁定可能属于已经被忽略的另一个订单。
+    MODES[MODE_SUPERMARKET_ORDER].reset(record)
+    MODES[MODE_SUPERMARKET_ORDER].invalidate_plan(record)
+    return
+  end
+  if event.element.name == "bmsc-recursion-timeout-monitor-item-changes" then
+    local record = current_record(event.player_index)
+    if not record then return end
+    record.config.recursion_timeout_monitor_item_changes = event.element.state == true
+    reset_condition_timer(record, "recursion-timeout")
+    return
+  end
   if event.element.name == "bmsc-swap-loop" then
     local record = current_record(event.player_index)
     if record then
@@ -1281,7 +1567,8 @@ local function apply_pasted_config(destination, source_config)
       local player = game.get_player(player_index)
       if player then
         Gui.open(player, destination.entity, destination.config, {}, nil,
-          MODES[MODE_INVENTORY_QUERY].is_available())
+          current_work_summary(destination), MODES[MODE_INVENTORY_QUERY].is_available(),
+          state().gui_config_open[player.index] == true)
         state().player_gui[player_index] = unit
       end
     end
@@ -1310,12 +1597,34 @@ if defines.events.on_blueprint_settings_pasted then
 end
 
 -- 运算间隔也是 30 时用同一个处理器顺序刷新，避免为同一周期重复注册。
-if TICK_INTERVAL == 30 then
-  script.on_nth_tick(30, function()
-    update_all()
-    refresh_open_timeout_displays()
+script.on_event(defines.events.on_lua_shortcut, function(event)
+  if event.prototype_name == "bmsc-production-network" then
+    local player = game.get_player(event.player_index)
+    local frame = player.gui.screen[NetworkGui.name]
+    if frame then frame.destroy() else NetworkGui.open_network(player, state().combinators) end
+  end
+end)
+
+-- `/c game.reload_mods()` 只会重载 control 阶段；若 data 阶段的新快捷键尚未载入，
+-- 注册不存在的事件会中止热重载。完整重启后原型存在，Y 即正常生效。
+if prototypes.custom_input["bmsc-toggle-production-network"] then
+  script.on_event("bmsc-toggle-production-network", function(event)
+    local player = game.get_player(event.player_index)
+    local frame = player.gui.screen[NetworkGui.name]
+    if frame then frame.destroy() else NetworkGui.open_network(player, state().combinators) end
   end)
-else
-  script.on_nth_tick(TICK_INTERVAL, update_all)
+end
+
+-- 按 unit_number 分桶，把一个完整刷新周期分摊到多个 tick；桶 0 同时开始下一轮
+-- 跨实体准备，避免每个桶都重复扫描全部组合器和网络任务。
+script.on_nth_tick(UPDATE_BUCKET_INTERVAL, function(event)
+  local bucket_index = math.floor((event.tick - UPDATE_BUCKET_INTERVAL) / UPDATE_BUCKET_INTERVAL)
+    % UPDATE_BUCKET_COUNT
+  if bucket_index == 0 then prepare_update_cycle() end
+  update_bucket(bucket_index)
+  if UPDATE_BUCKET_INTERVAL == 30 then refresh_open_timeout_displays() end
+end)
+
+if UPDATE_BUCKET_INTERVAL ~= 30 then
   script.on_nth_tick(30, refresh_open_timeout_displays)
 end

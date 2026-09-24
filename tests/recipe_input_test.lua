@@ -227,6 +227,12 @@ local supermarket_recipe = SupermarketOrder.calculate(supermarket_record)
 assert(supermarket_recipe["recipe:widget-b"].count == 3)
 assert(supermarket_recipe["item:widget:normal"] == nil)
 assert(supermarket_record.detail_outputs["recipe:widget-b"].count == 3)
+local non_recursive_strict = SupermarketOrder.calculate({entity = entity, config = {
+  production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
+  recurise_depth = 0, recursion_timeout = 0, inventory_validation = "inventory"
+}})
+assert(non_recursive_strict["recipe:widget-b"].count == 3)
+assert(non_recursive_strict["item:copper:normal"] == nil and non_recursive_strict["item:iron:normal"] == nil)
 local recipe_diagnostic = supermarket_record.supermarket_order_diagnostics["recipe:widget-b"]
 assert(recipe_diagnostic.kind == "active_output")
 assert(recipe_diagnostic.order.signal.type == "recipe"

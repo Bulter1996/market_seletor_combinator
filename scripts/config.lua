@@ -2,7 +2,7 @@
 -- 所有模式共用同一份配置入口，新增模式时只需在这里补充默认值和合法值校验。
 
 local Config = {}
-Config.schema_revision = 15
+Config.schema_revision = 19
 
 Config.mode = {
   production_order = "production_order",
@@ -89,6 +89,15 @@ function Config.default()
     mode = Config.mode.supermarket_order,          -- 参数：当前操作模式。
     production_machine = "assembling-machine-1", -- 参数：各模式查询配方时使用的制造机。
     order_targets = {},                          -- 参数：输入信号共享配方，以及订单模式的库存校验产物。
+    recipe_policies = {},                        -- 同一组合器按材料键共享候选配方与迟滞参数。
+    recursion_terminal_nodes = {},               -- 超市递归中标记为终端的物品键；仍保留其配方策略。
+    recursion_network_publish_nodes = {},        -- 节点缺口是否发布到订单网络；缺省为允许。
+    network_publish = false,
+    network_accept = false,
+    network_export = false,
+    network_import = false,
+    network_publish_priority = 5,
+    network_accept_priority = 5,
     multiple_recipe_support = false,              -- 参数：配方查询是否统计全部输入信号及其数量。
     recipe_query_cache_grid_number = 0,           -- 参数：多配方查询可占用的原料缓存格数。
     query_type = Config.query_type.all,            -- 参数：共享库存查询包含流体、物品或两者。
@@ -102,8 +111,8 @@ function Config.default()
     production_timeout_conditions = default_conditions(), -- 参数：满足时重置生产订单超时。
     output_mode = "all",                         -- 参数：生产订单输出产品、原料或两者。
     cache_grid_number = 0,                      -- 参数：分离模式可占用的固体原料格数；0 表示不限制。
-    recurise_depth = 0,                          -- 参数：超市订单最大递归深度；0 表示不限制。
-    recursion_additional_production_rate = 1,    -- 参数：超市订单成品目标的额外生产倍率。
+    recurise_depth = 0,                          -- 参数：超市订单最大递归深度；0 表示不递归。
+    recursion_additional_production_rate = 2,    -- 参数：超市订单成品目标的生产倍率（字段名为旧版兼容保留）。
     recursion_material_demand_rate = 10,         -- 参数：超市订单切入上层配方的原料启动倍率。
     recursion_material_retention_rate = 1,       -- 参数：超市订单当前配方的原料保留倍率。
     recursion_output_mode = "single",            -- 参数：超市订单输出单项或全部结果。
@@ -111,7 +120,7 @@ function Config.default()
     sequential_production = true,                -- 参数：single 模式是否按订单顺序逐个完成。
     recursion_material_wait_time = 0,            -- 参数：single 当前输出被撤销或切换前的保持秒数。
     recursion_timeout = 0,                       -- 参数：single 无变化轮换秒数；0 表示禁用。
-    recursion_timeout_monitor_item_changes = true, -- 参数：当前输出数量变化时是否重置超市超时。
+    recursion_timeout_monitor_item_changes = false, -- 参数：当前输出数量变化时是否重置超市超时。
     recursion_timeout_conditions = default_conditions(),  -- 参数：满足时重置超市订单超时。
     swap_output_mode = "fluid",                 -- 参数：切换订单输出的信号类型。
     swap_timeout = 0,                            -- 参数：重置条件不满足多久后交换红绿输出；0 表示禁用。
@@ -165,6 +174,39 @@ function Config.normalize(source)
   end
   if type(source.production_machine) == "string" then config.production_machine = source.production_machine end
   config.order_targets = normalize_order_targets(source.order_targets)
+  for _, field in ipairs({"network_publish", "network_accept", "network_export", "network_import"}) do
+    config[field] = source[field] == true
+  end
+  -- 旧版只有一个优先级；升级时把它分别保留为发布和接受优先级。
+  local legacy_priority = tonumber(source.network_priority)
+  for _, field in ipairs({"network_publish_priority", "network_accept_priority"}) do
+    config[field] = math.max(-2147483648, math.min(2147483647,
+      tonumber(source[field]) or legacy_priority or config[field]))
+  end
+  for key, entries in pairs(type(source.recipe_policies) == "table" and source.recipe_policies or {}) do
+    if type(key) == "string" and type(entries) == "table" then
+      local normalized, seen = {}, {}
+      for _, entry in ipairs(entries) do
+        if type(entry) == "table" and type(entry.recipe) == "string" and not seen[entry.recipe] then
+          local retention = math.max(0, tonumber(entry.retention) or 1)
+          normalized[#normalized + 1] = {recipe = entry.recipe, priority = tonumber(entry.priority) or 0,
+            demand = math.max(retention + 0.001, tonumber(entry.demand) or 10), retention = retention}
+          seen[entry.recipe] = true
+        end
+      end
+      if normalized[1] then config.recipe_policies[key] = normalized end
+    end
+  end
+  for key, enabled in pairs(type(source.recursion_terminal_nodes) == "table"
+      and source.recursion_terminal_nodes or {}) do
+    if type(key) == "string" and enabled == true then config.recursion_terminal_nodes[key] = true end
+  end
+  for key, enabled in pairs(type(source.recursion_network_publish_nodes) == "table"
+      and source.recursion_network_publish_nodes or {}) do
+    if type(key) == "string" and type(enabled) == "boolean" then
+      config.recursion_network_publish_nodes[key] = enabled
+    end
+  end
   if type(source.multiple_recipe_support) == "boolean" then
     config.multiple_recipe_support = source.multiple_recipe_support
   end
@@ -210,7 +252,10 @@ function Config.normalize(source)
     config.recurise_depth = math.max(0, math.floor(source.recurise_depth))
   end
   if type(source.recursion_additional_production_rate) == "number" then
-    config.recursion_additional_production_rate = math.max(0, source.recursion_additional_production_rate)
+    local production_rate = source.recursion_additional_production_rate
+    -- revision 17 及更早版本保存的是“额外倍率”，加 1 后迁移为当前的直接生产倍率。
+    if (tonumber(source.schema_revision) or 0) < 18 then production_rate = production_rate + 1 end
+    config.recursion_additional_production_rate = math.max(2, production_rate)
   end
   if type(source.recursion_material_demand_rate) == "number" then
     config.recursion_material_demand_rate = math.max(0, source.recursion_material_demand_rate)

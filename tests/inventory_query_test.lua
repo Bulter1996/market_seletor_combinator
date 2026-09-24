@@ -5,6 +5,7 @@ script = {active_mods = {LinkedChestAndPipe = "1.2.96"}}
 defines = {wire_connector_id = {combinator_input_red = 1, combinator_input_green = 2}}
 prototypes = {
   entity = {["share-network-output"] = {}}, recipe = {},
+  virtual_signal = {["signal-linked-storage-surface"] = {}},
   item = {product = {}, iron = {}, byproduct = {}}, fluid = {}, quality = {normal = {}}
 }
 
@@ -20,15 +21,19 @@ local probe = {
   valid = true, name = "share-network-output", force = force, unit_number = 1,
   get_or_create_control_behavior = function() return behavior end
 }
-local surface = {
+local probe_surface = {
   find_entities_filtered = function() return {} end,
   create_entity = function() return probe end
 }
-local created_surface
+local target_surface = {index = 7, name = "nauvis", valid = true}
+local created_probe_surface
 game = {
   tick = 0,
-  get_surface = function() return created_surface end,
-  create_surface = function() created_surface = surface; return surface end
+  get_surface = function(value)
+    if value == 7 then return target_surface end
+    if value == "__market-selector-combinator-query__" then return created_probe_surface end
+  end,
+  create_surface = function() created_probe_surface = probe_surface; return probe_surface end
 }
 
 local Mode = require("scripts.modes.inventory_query")
@@ -41,32 +46,38 @@ local requested = Mode.supermarket_signals(plan)
 assert(requested["item:product:normal"] and requested["item:iron:normal"]
   and requested["item:byproduct:normal"])
 
-local record = {entity = {valid = true, force = force}, config = {
+local record = {entity = {valid = true, force = force, surface = target_surface}, config = {
   mode = "supermarket_order", inventory_validation = "linked"
 }, supermarket_order_plan = plan}
 Mode.prepare({record})
-assert(Mode.get_shared_inventory(force, requested) == nil)
-assert(#section.filters == 3)
+assert(Mode.get_shared_inventory(force, target_surface, requested) == nil)
+assert(#section.filters == 4)
+assert(section.filters[1].value.name == "signal-linked-storage-surface"
+  and section.filters[1].min == target_surface.index)
 
 for _, filter in pairs(section.filters) do
-  filter.min = filter.value.name == "iron" and 42 or 7
+  if filter.value.type ~= "virtual" then
+    filter.min = filter.value.name == "iron" and 42 or 7
+  end
 end
 game.tick = 13
 Mode.prepare({record})
-local first, first_generation = Mode.get_shared_inventory(force, requested)
+local first, first_generation = Mode.get_shared_inventory(force, target_surface, requested)
 assert(first_generation == 1 and first["item:iron:normal"] == 42
   and first["item:product:normal"] == 7)
 
 -- 同一探针缓存被多次读取不能伪装成新的独立快照。
 game.tick = 50
 Mode.prepare({record})
-local _, repeated_generation = Mode.get_shared_inventory(force, requested)
+local _, repeated_generation = Mode.get_shared_inventory(force, target_surface, requested)
 assert(repeated_generation == first_generation)
 
-for _, filter in pairs(section.filters) do filter.min = 3 end
+for _, filter in pairs(section.filters) do
+  if filter.value.type ~= "virtual" then filter.min = 3 end
+end
 game.tick = 133
 Mode.prepare({record})
-local second, second_generation = Mode.get_shared_inventory(force, requested)
+local second, second_generation = Mode.get_shared_inventory(force, target_surface, requested)
 assert(second_generation == 2 and second["item:iron:normal"] == 3)
 
 print("linked inventory query snapshots: ok")

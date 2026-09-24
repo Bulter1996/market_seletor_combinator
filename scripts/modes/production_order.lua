@@ -24,6 +24,7 @@ function Mode.reset(record)
   clear_current_order(record)
   record.production_order_queue = nil
   record.production_order_diagnostics = nil
+  record.production_order_next_key = nil
   record.production_timeout_condition_results = nil
 end
 
@@ -323,6 +324,7 @@ function Mode.calculate(record)
         stock = stock,
         shortage = shortage,
         start_threshold = threshold,
+        demand_ready = stock > ingredient.amount * config.material_demand_rate,
         threshold_comparator = selected_was_locked and ">=" or ">",
         start_ready = ready,
         production = next_level_production(signal, shortage)
@@ -364,6 +366,8 @@ function Mode.calculate(record)
         ingredients = ingredients,
         gate_kind = selected_was_locked and "retention" or "start",
         start_ready = gate_ready,
+        -- 工作表只在真正单项输出时显示“当前生产”；多信号输出由下方信号区承载。
+        single_output = config.output_mode == "only_item",
         product_output = config.output_mode ~= "only_material",
         material_output = config.output_mode ~= "only_item"
       }
@@ -381,15 +385,39 @@ function Mode.calculate(record)
     elseif config.output_mode == "only_material" then
       diagnostics[key] = {kind = "only_material"}
     else
-      local _, diagnostic = eligible(demand, false)
-      diagnostics[key] = diagnostic or {
+      local _, diagnostic, target = eligible(demand, false)
+      diagnostic = diagnostic or {
         kind = "waiting_for_order",
         signal = selected_demand and Util.make_signal(
           selected_demand.signal.type, selected_demand.signal.name, selected_demand.signal.quality) or nil
       }
+      if target then
+        local status = OrderTarget.inventory_status(target.products, inventory, demand.count)
+        local product = status.products[1]
+        diagnostic.order = {signal = Util.make_signal(demand.signal.type, demand.signal.name, demand.signal.quality),
+          count = demand.count}
+        diagnostic.product = product and {signal = Util.make_signal(
+          product.signal.type, product.signal.name, product.signal.quality),
+          target = product.target, stock = product.stock, remaining = product.remaining} or nil
+      end
+      diagnostics[key] = diagnostic
     end
   end
   record.production_order_diagnostics = diagnostics
+  record.production_order_next_key = nil
+  if selected_key then
+    local selected_index
+    for index, key in ipairs(order_queue) do if key == selected_key then selected_index = index; break end end
+    if selected_index then
+      for offset = 1, #order_queue - 1 do
+        local key = order_queue[(selected_index - 1 + offset) % #order_queue + 1]
+        if diagnostics[key] and diagnostics[key].kind == "waiting_for_order" then
+          record.production_order_next_key = key
+          break
+        end
+      end
+    end
+  end
 
   if config.output_mode == "all_separate_signal" then
     -- 分离模式约定：红线只发送配方原料，绿线只发送当前订单商品。

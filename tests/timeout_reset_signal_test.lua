@@ -36,7 +36,10 @@ assert(normalized.production_timeout_conditions[1].first.signal.name == "signal-
 assert(normalized.production_timeout_conditions[1].first.green == true)
 assert(normalized.recursion_timeout_conditions[1].first.signal.type == "item")
 assert(normalized.production_timeout_monitor_item_changes == true)
-assert(normalized.recursion_timeout_monitor_item_changes == true)
+assert(normalized.recursion_timeout_monitor_item_changes == false)
+assert(normalized.recursion_additional_production_rate == 2)
+assert((Config.normalize{schema_revision = 17, recursion_additional_production_rate = 1})
+  .recursion_additional_production_rate == 2)
 assert(normalized.recursion_material_wait_time == 0)
 assert(normalized.inventory_validation == Config.inventory_validation.none)
 assert(normalized.swap_loop == false)
@@ -52,7 +55,8 @@ assert(normalized_targets['item:product:normal'].recipe == 'make-product')
 assert(#normalized_targets['item:product:normal'].products == 1)
 target_source['item:product:normal'].products[1].name = 'changed'
 assert(normalized_targets['item:product:normal'].products[1].name == 'product')
-local copied = Config.normalize{mode = Config.mode.swap_order, swap_timeout = 12, swap_loop = true,
+local copied = Config.normalize{schema_revision = normalized.schema_revision,
+  mode = Config.mode.swap_order, swap_timeout = 12, swap_loop = true,
   recipe_query_cache_grid_number = 7,
   recursion_material_wait_time = 7,
   recursion_strict_validation = true,
@@ -143,7 +147,7 @@ game.tick = 0
 local SupermarketOrder = require("scripts.modes.supermarket_order")
 local supermarket_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 1, recursion_timeout_conditions = reset_conditions
+  recurise_depth = 10, recursion_timeout = 1, recursion_timeout_conditions = reset_conditions
 }}
 SupermarketOrder.calculate(supermarket_record)
 game.tick = 120
@@ -157,7 +161,7 @@ assert(supermarket_record.recursion_output_changed_tick == 181)
 
 supermarket_record = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 0, recursion_timeout_conditions = reset_conditions
+  recurise_depth = 10, recursion_timeout = 0, recursion_timeout_conditions = reset_conditions
 }}
 green[2].count = 1
 game.tick = 0
@@ -246,7 +250,7 @@ red = {}
 game.tick = 0
 local unmonitored_supermarket = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 1, recursion_timeout_monitor_item_changes = false,
+  recurise_depth = 10, recursion_timeout = 1, recursion_timeout_monitor_item_changes = false,
   recursion_timeout_conditions = reset_conditions
 }}
 SupermarketOrder.calculate(unmonitored_supermarket)
@@ -260,7 +264,7 @@ red = {}
 game.tick = 0
 local monitored_supermarket = {entity = entity, config = {
   production_machine = "assembler", recursion_output_mode = "single", sequential_production = false,
-  recurise_depth = 0, recursion_timeout = 1, recursion_timeout_monitor_item_changes = true,
+  recurise_depth = 10, recursion_timeout = 1, recursion_timeout_monitor_item_changes = true,
   recursion_timeout_conditions = reset_conditions
 }}
 SupermarketOrder.calculate(monitored_supermarket)

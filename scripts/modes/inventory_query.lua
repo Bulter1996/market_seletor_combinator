@@ -13,6 +13,7 @@ local Mode = {
 local REQUIRED_MOD = "LinkedChestAndPipe"
 local PROBE_NAME = "share-network-output"
 local PROBE_SURFACE = "__market-selector-combinator-query__"
+local SURFACE_SIGNAL = "signal-linked-storage-surface"
 local MAX_FILTERS = 65535                          -- Factorio LogisticFilterIndex 的 uint16 上限。
 local all_query_signals = {}                      -- 原型在一次运行中不变，物品和流体列表分别只构建一次。
 
@@ -32,20 +33,33 @@ local function is_available()
   return script.active_mods[REQUIRED_MOD] ~= nil and prototypes.entity[PROBE_NAME] ~= nil
 end
 
+---判断关联箱是否支持按目标地表查询；旧版本自动退回势力级协议。
+local function supports_surface_query()
+  return prototypes.virtual_signal and prototypes.virtual_signal[SURFACE_SIGNAL] ~= nil
+end
+
 ---供超市订单和 GUI 判断关联库存能力是否可用。
 ---@return boolean available 可用时为 true。
 function Mode.is_available()
   return is_available()
 end
 
----取得查询模式的全局持久状态；每个势力永久复用一个探针。
----@return table state 包含 forces 映射。
+---取得查询模式的全局持久状态；新版按势力和地表复用探针，旧协议按势力复用。
+---@return table state 包含 scopes 映射。
 local function state()
   if type(storage.bmsc_inventory_query) ~= "table" then storage.bmsc_inventory_query = {} end
-  if type(storage.bmsc_inventory_query.forces) ~= "table" then
-    storage.bmsc_inventory_query.forces = {}
+  local root = storage.bmsc_inventory_query
+  if root.schema_version ~= 2 then
+    -- 旧状态没有地表语义，不能安全继承其结果缓存；实体下次查询时重新创建。
+    for _, force_state in pairs(type(root.forces) == "table" and root.forces or {}) do
+      if force_state.probe and force_state.probe.valid then force_state.probe.destroy() end
+    end
+    root.forces = nil
+    root.scopes = {}
+    root.schema_version = 2
   end
-  return storage.bmsc_inventory_query
+  if type(root.scopes) ~= "table" then root.scopes = {} end
+  return root
 end
 
 ---把信号加入按 SignalID 去重的集合。
@@ -120,7 +134,7 @@ local function get_all_query_signals(query_type)
   table.sort(keys)
   local signals = {}
   for index, key in ipairs(keys) do
-    if index > MAX_FILTERS then break end
+    if index > MAX_FILTERS - (supports_surface_query() and 1 or 0) then break end
     signals[index] = by_key[key]
   end
   all_query_signals[query_type] = signals
@@ -145,42 +159,57 @@ local function sorted_query_signals(by_key)
   table.sort(keys)
   local signals = {}
   for index, key in ipairs(keys) do
-    if index > MAX_FILTERS then break end
+    if index > MAX_FILTERS - (supports_surface_query() and 1 or 0) then break end
     signals[index] = by_key[key]
   end
   return signals, table.concat(keys, "|")
 end
 
----取得或修复某势力的查询状态。
+---生成查询作用域键；旧协议没有地表能力，因此仍按势力合并。
 ---@param force LuaForce 查询所属势力。
----@return table force_state 势力级探针、签名和结果缓存。
-local function get_force_state(force)
-  local forces = state().forces
-  local force_state = forces[force.index]
-  if type(force_state) ~= "table" or force_state.force_name ~= force.name then
-    force_state = {force_name = force.name, results = {}}
-    forces[force.index] = force_state
+---@param surface LuaSurface 查询目标地表。
+local function scope_key(force, surface)
+  if supports_surface_query() then return force.index .. ":" .. surface.index end
+  return tostring(force.index)
+end
+
+---取得或修复一个查询作用域的状态。
+---@param force LuaForce 查询所属势力。
+---@param surface LuaSurface 查询目标地表。
+local function get_scope_state(force, surface)
+  local scopes = state().scopes
+  local key = scope_key(force, surface)
+  local scope_state = scopes[key]
+  local surface_index = supports_surface_query() and surface.index or nil
+  if type(scope_state) ~= "table" or scope_state.force_name ~= force.name
+    or scope_state.surface_index ~= surface_index then
+    scope_state = {force_name = force.name, surface_index = surface_index, results = {}}
+    scopes[key] = scope_state
   end
-  return force_state
+  return scope_state
 end
 
 ---创建或恢复某势力永久复用的 share-network-output 探针。
 ---使用独立表面避免可见实体占用玩家地块；raise_built 负责让 LinkedChestAndPipe 登记脚本创建的实体。
 ---@param force LuaForce 探针所属势力。
----@param force_state table get_force_state 返回的状态。
+---@param surface LuaSurface 查询目标地表。
+---@param scope_state table get_scope_state 返回的状态。
 ---@return LuaEntity|nil probe 创建失败时返回 nil。
-local function get_probe(force, force_state)
-  local probe = force_state.probe
+local function get_probe(force, surface, scope_state)
+  local probe = scope_state.probe
   if probe and probe.valid and probe.name == PROBE_NAME and probe.force == force then return probe end
 
-  local surface = game.get_surface(PROBE_SURFACE) or game.create_surface(PROBE_SURFACE)
-  for _, existing in pairs(surface.find_entities_filtered{name = PROBE_NAME, force = force}) do
+  local probe_surface = game.get_surface(PROBE_SURFACE) or game.create_surface(PROBE_SURFACE)
+  local position = {force.index * 2, supports_surface_query() and surface.index * 2 or 0}
+  for _, existing in pairs(probe_surface.find_entities_filtered{
+    name = PROBE_NAME, force = force, position = position
+  }) do
     if existing.valid then probe = existing; break end
   end
   if not probe then
-    probe = surface.create_entity{
+    probe = probe_surface.create_entity{
       name = PROBE_NAME,
-      position = {force.index * 2, 0},
+      position = position,
       force = force,
       create_build_effect_smoke = false,
       raise_built = true
@@ -190,9 +219,9 @@ local function get_probe(force, force_state)
   probe.destructible = false
   probe.minable_flag = false
   probe.operable = false
-  force_state.probe = probe
+  scope_state.probe = probe
   -- 新建或重新发现探针时必须重新写筛选条件，不能信任旧 storage 的签名。
-  force_state.signature = nil
+  scope_state.signature = nil
   return probe
 end
 
@@ -208,41 +237,47 @@ local function next_refresh_tick(probe)
 end
 
 ---把新的查询集合写入探针；变更后先清空结果，避免输出上一批信号对应的旧库存。
----@param force_state table 势力查询状态。
+---@param scope_state table 查询作用域状态。
+---@param surface LuaSurface 查询目标地表。
 ---@param signals table 待查询信号数组。
 ---@param signature string 查询集合签名。
 ---@return nil
-local function configure_probe(force_state, signals, signature)
-  local probe = force_state.probe
+local function configure_probe(scope_state, surface, signals, signature)
+  local probe = scope_state.probe
   local behavior = probe and probe.valid and probe.get_or_create_control_behavior()
   if not behavior then return end
   for section_index = behavior.sections_count, 2, -1 do behavior.remove_section(section_index) end
   local section = behavior.get_section(1) or behavior.add_section("")
   local filters = {}
+  local offset = 0
+  if #signals > 0 and supports_surface_query() then
+    filters[1] = {value = {type = "virtual", name = SURFACE_SIGNAL, comparator = "="}, min = surface.index}
+    offset = 1
+  end
   for index, signal in ipairs(signals) do
     local value = Util.make_signal(signal.type, signal.name, signal.quality)
     value.quality = Util.quality_name(signal.quality)
     value.comparator = "="
-    filters[index] = {value = value, min = 0}
+    filters[index + offset] = {value = value, min = 0}
   end
   section.group = ""
   section.active = #filters > 0
   section.filters = filters
   behavior.enabled = #filters > 0
-  force_state.signature = signature
-  force_state.results = {}
-  force_state.requested = {}
-  for _, signal in ipairs(signals) do force_state.requested[Util.signal_key(signal)] = true end
-  force_state.has_results = false
-  force_state.ready_tick = #filters > 0 and next_refresh_tick(probe) or nil
+  scope_state.signature = signature
+  scope_state.results = {}
+  scope_state.requested = {}
+  for _, signal in ipairs(signals) do scope_state.requested[Util.signal_key(signal)] = true end
+  scope_state.has_results = false
+  scope_state.ready_tick = #filters > 0 and next_refresh_tick(probe) or nil
 end
 
 ---禁用暂时没有查询运算器使用的探针，但保留实体供以后复用。
 ---@param force_state table 势力查询状态。
 ---@return nil
-local function deactivate_probe(force_state)
-  if force_state.signature == nil then return end
-  configure_probe(force_state, {}, nil)
+local function deactivate_probe(scope_state)
+  if scope_state.signature == nil then return end
+  configure_probe(scope_state, nil, {}, nil)
 end
 
 ---读取 LinkedChestAndPipe 已写回 filter.min 的库存值。
@@ -279,14 +314,16 @@ function Mode.prepare(records)
     if record.entity and record.entity.valid and type(record.config) == "table" then
       local query_type = record.config.query_type or Config.query_type.all
       local force = record.entity.force
+      local surface = record.entity.surface
       local query_record = record.config.mode == Mode.name
       local linked_supermarket = record.config.mode == Config.mode.supermarket_order
         and record.config.inventory_validation == Config.inventory_validation.linked
       if query_record or linked_supermarket then
-        local request = requests[force.index]
+        local key = scope_key(force, surface)
+        local request = requests[key]
         if not request then
-          request = {force = force, signals = {}}
-          requests[force.index] = request
+          request = {force = force, surface = surface, signals = {}}
+          requests[key] = request
         end
         if query_record and record.config.query_all then
           if query_type ~= Config.query_type.fluid then request.query_all_items = true end
@@ -298,12 +335,25 @@ function Mode.prepare(records)
             request.signals[key] = signal
           end
         end
+        if linked_supermarket then
+          for _, task in ipairs(record.network_assignments or {}) do
+            local plan = task.execution and task.execution.supermarket_order_plan
+            if plan then
+              for key, signal in pairs(Mode.supermarket_signals(plan)) do request.signals[key] = signal end
+            end
+          end
+        end
       end
     end
   end
 
-  for force_index, force_state in pairs(state().forces) do
-    if not requests[force_index] then deactivate_probe(force_state) end
+  for key, scope_state in pairs(state().scopes) do
+    if scope_state.surface_index and not game.get_surface(scope_state.surface_index) then
+      if scope_state.probe and scope_state.probe.valid then scope_state.probe.destroy() end
+      state().scopes[key] = nil
+    elseif not requests[key] then
+      deactivate_probe(scope_state)
+    end
   end
 
   for _, request in pairs(requests) do
@@ -315,16 +365,16 @@ function Mode.prepare(records)
       merge_signals(request.signals, get_all_query_signals(Config.query_type.fluid))
     end
     local signals, signature = sorted_query_signals(request.signals)
-    local force_state = get_force_state(request.force)
+    local scope_state = get_scope_state(request.force, request.surface)
     if #signals == 0 then
-      deactivate_probe(force_state)
+      deactivate_probe(scope_state)
     else
-      local probe = get_probe(request.force, force_state)
+      local probe = get_probe(request.force, request.surface, scope_state)
       if probe then
-        if force_state.signature ~= signature or type(force_state.requested) ~= "table" then
-          configure_probe(force_state, signals, signature)
+        if scope_state.signature ~= signature or type(scope_state.requested) ~= "table" then
+          configure_probe(scope_state, request.surface, signals, signature)
         end
-        refresh_results(force_state)
+        refresh_results(scope_state)
       end
     end
   end
@@ -353,22 +403,23 @@ end
 ---读取一张超市订单配方树对应的共享库存快照。
 ---查询集合尚未包含全部信号或首份结果未返回时返回 nil，调用方据此保持/暂停输出。
 ---@param force LuaForce 查询所属势力。
+---@param surface LuaSurface 查询目标地表。
 ---@param requested table supermarket_signals 返回的信号集合。
 ---@return table|nil inventory 以 signal_key 为键的数量表。
 ---@return uint|nil generation 独立探针快照编号。
-function Mode.get_shared_inventory(force, requested)
+function Mode.get_shared_inventory(force, surface, requested)
   if not is_available() then return nil end
-  local force_state = state().forces[force.index]
-  if not (force_state and force_state.has_results) then return nil end
+  local scope_state = state().scopes[scope_key(force, surface)]
+  if not (scope_state and scope_state.has_results) then return nil end
   for key in pairs(requested or {}) do
-    if not (force_state.requested and force_state.requested[key]) then return nil end
+    if not (scope_state.requested and scope_state.requested[key]) then return nil end
   end
   local inventory = {}
   for key in pairs(requested or {}) do
-    local result = force_state.results and force_state.results[key]
+    local result = scope_state.results and scope_state.results[key]
     inventory[key] = result and result.count or 0
   end
-  return inventory, force_state.generation
+  return inventory, scope_state.generation
 end
 
 ---输出共享区库存；query_all=false 时只保留符合查询类型且出现在输入中的信号。
@@ -376,13 +427,13 @@ end
 ---@return table outputs 标准输出集合，由 control.lua 统一写入线路。
 function Mode.calculate(record)
   if not is_available() then return {} end
-  local force_state = state().forces[record.entity.force.index]
-  if not (force_state and force_state.has_results) then return {} end
+  local scope_state = state().scopes[scope_key(record.entity.force, record.entity.surface)]
+  if not (scope_state and scope_state.has_results) then return {} end
 
   local query_type = record.config.query_type or Config.query_type.all
   local outputs = {}
   if record.config.query_all then
-    for key, entry in pairs(force_state.results or {}) do
+    for key, entry in pairs(scope_state.results or {}) do
       if entry.count ~= 0 and matches_query_type(entry.signal, query_type) then
         outputs[key] = {signal = Util.make_signal(entry.signal.type, entry.signal.name, entry.signal.quality),
           count = entry.count}
@@ -394,7 +445,7 @@ function Mode.calculate(record)
   local requested = {}
   add_record_inputs(requested, record, query_type)
   for key, signal in pairs(requested) do
-    local result = force_state.results and force_state.results[key]
+    local result = scope_state.results and scope_state.results[key]
     if result and result.count ~= 0 then
       outputs[key] = {signal = Util.make_signal(signal.type, signal.name, signal.quality), count = result.count}
     end

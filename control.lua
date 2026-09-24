@@ -6,7 +6,7 @@ local PROXY = "b-market-selector-output-proxy"         -- 参数：向线路发�
 local DETAIL_PROXY = "b-market-selector-detail-proxy" -- 参数：只在 Alt 模式显示当前订单产品的隐藏实体。
 local OUTPUT_PROXY_REVISION = 2                       -- 修改代理连接/写入策略时递增，强制旧存档重建。
 local TICK_INTERVAL = settings.startup["bmsc-update-interval"].value
-                                                          -- 参数：玩家配置的刷新间隔，默认 30 tick。
+                                                          -- 参数：玩家配置的刷新间隔，默认 120 tick。
 local Gui = require("scripts.gui")                     -- GUI 模块：只负责界面，不参与生产计算。
 local SignalPicker = require("scripts.signal_picker") -- 条件信号与常量共用的原版风格选择器。
 local Config = require("scripts.config")               -- 配置模块：默认值、模式常量和外部数据校验。
@@ -24,6 +24,18 @@ local MAX_PROXY_SIGNALS = 65535                    -- Factorio 常量运算器�
 local DOUBLE_CLICK_TICKS = 30                      -- 0.5 秒：等待订单左键双击判定窗口。
 local refresh_open_order_targets                    -- 研究事件发生时刷新仍打开的配方选择窗口。
 
+-- 把一次完整刷新周期拆成多个小桶；默认 120 tick 对应 10 个桶、每 12 tick 一个桶。
+-- 桶数取不超过 10 且能整除周期的最大值，避免修改自定义刷新间隔后的周期漂移。
+local function calculate_update_bucket_count(interval)
+  for count = math.min(10, interval), 1, -1 do
+    if interval % count == 0 then return count end
+  end
+  return 1
+end
+
+local UPDATE_BUCKET_COUNT = calculate_update_bucket_count(TICK_INTERVAL)
+local UPDATE_BUCKET_INTERVAL = TICK_INTERVAL / UPDATE_BUCKET_COUNT
+
 
 ---取得并初始化本模组的持久状态。
 ---为什么需要：`storage` 会随存档保存，但首次运行时字段不存在，所有入口都通过此函数安全访问。
@@ -35,6 +47,35 @@ local function state()
   if type(storage.gui_config_open) ~= "table" then storage.gui_config_open = {} end
   if type(storage.signal_clicks) ~= "table" then storage.signal_clicks = {} end
   return storage
+end
+
+---确保更新桶存在，并兼容启用桶调度前创建的旧存档。
+---@return table buckets 以 0-based 桶编号保存 unit_number 集合。
+local function ensure_update_buckets()
+  local current = state()
+  if type(current.update_buckets) == "table"
+    and current.update_bucket_count == UPDATE_BUCKET_COUNT then
+    return current.update_buckets
+  end
+  local buckets = {}
+  for bucket = 0, UPDATE_BUCKET_COUNT - 1 do buckets[bucket] = {} end
+  for unit, record in pairs(current.combinators) do
+    if record.entity and record.entity.valid then
+      buckets[unit % UPDATE_BUCKET_COUNT][unit] = true
+    end
+  end
+  current.update_buckets = buckets
+  current.update_bucket_count = UPDATE_BUCKET_COUNT
+  return buckets
+end
+
+local function add_update_bucket(unit_number)
+  ensure_update_buckets()[unit_number % UPDATE_BUCKET_COUNT][unit_number] = true
+end
+
+local function remove_update_bucket(unit_number)
+  local bucket = ensure_update_buckets()[unit_number % UPDATE_BUCKET_COUNT]
+  if bucket then bucket[unit_number] = nil end
 end
 
 ---配置校验函数的本地别名，让实体生命周期代码保持简洁。
@@ -326,6 +367,7 @@ local function register(entity, tags)
   }
   reset_all_modes(record)
   state().combinators[entity.unit_number] = record
+  add_update_bucket(entity.unit_number)
   sync_mode_visual(record)
 end
 
@@ -341,6 +383,7 @@ local function remove(entity)
       state().player_gui[player_index] = nil
     end
   end
+  remove_update_bucket(entity.unit_number)
   destroy_proxies(state().combinators[entity.unit_number])
   state().combinators[entity.unit_number] = nil
 end
@@ -570,9 +613,9 @@ local function refresh_open_timeout_displays()
   end
 end
 
----定时更新所有市场选择运算器，并清除已经失效的实体记录。
+---在一个完整刷新周期开始时准备跨实体共享状态。
 ---@return nil
-local function update_all()
+local function prepare_update_cycle()
   -- 需要跨实体协作的模式可在 calculate 前统一准备势力级状态；普通模式没有此钩子。
   -- 查询模式借此合并同一势力的查询信号，只维护一个 LinkedChestAndPipe 探针。
   for _, mode in pairs(MODES) do
@@ -584,14 +627,46 @@ local function update_all()
     end
   end
   ProductionNetwork.prepare(state().combinators)
-  for unit, record in pairs(state().combinators) do
-    if record.entity and record.entity.valid then
+end
+
+---刷新当前桶中打开的组合器 GUI；玩家列表很小，不参与组合器全量扫描。
+---@param bucket_index integer 当前 0-based 桶编号。
+---@return nil
+local function refresh_bucket_gui(bucket_index)
+  for player_index, unit in pairs(state().player_gui) do
+    if unit % UPDATE_BUCKET_COUNT == bucket_index then
+      local player = game.get_player(player_index)
+      local record = state().combinators[unit]
+      if player and record then
+        Gui.refresh_connection_status(
+          player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
+        Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
+          record.production_timeout_condition_results)
+        Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
+          record.recursion_timeout_condition_results)
+        Gui.refresh_condition_states(player.gui.screen[Gui.name], "swap",
+          record.swap_condition_results)
+      end
+    end
+  end
+end
+
+---定时更新当前市场选择运算器桶，并清除其中已经失效的实体记录。
+---@param bucket_index integer 当前 0-based 桶编号。
+---@return nil
+local function update_bucket(bucket_index)
+  local buckets = ensure_update_buckets()
+  local bucket = buckets[bucket_index] or {}
+  for unit in pairs(bucket) do
+    local record = state().combinators[unit]
+    if record and record.entity and record.entity.valid then
       -- 原生 select/max 在超市订单模式下本身会产生一个最大值信号；必须先重新屏蔽，
       -- 再写代理结果，避免它与脚本计算值在同一输出网络中相加。
       suppress_native_networks(record)
       write_outputs(record, calculate(record))
     else
       destroy_proxies(record)
+      bucket[unit] = nil
       state().combinators[unit] = nil
     end
   end
@@ -600,19 +675,7 @@ local function update_all()
       NetworkGui.refresh_network(player, state().combinators)
     end
   end
-  for player_index, unit in pairs(state().player_gui) do
-    local player = game.get_player(player_index)
-    local record = state().combinators[unit]
-    if player and record then
-      Gui.refresh_connection_status(
-        player, record.entity, record.gui_output_networks, current_input_diagnostics(record), current_work_summary(record))
-      Gui.refresh_condition_states(player.gui.screen[Gui.name], "production-timeout",
-        record.production_timeout_condition_results)
-      Gui.refresh_condition_states(player.gui.screen[Gui.name], "recursion-timeout",
-        record.recursion_timeout_condition_results)
-      Gui.refresh_condition_states(player.gui.screen[Gui.name], "swap", record.swap_condition_results)
-    end
-  end
+  refresh_bucket_gui(bucket_index)
 end
 
 ---配置迁移时重建所有代理，同时保留玩家配置和当前锁定产品。
@@ -635,6 +698,8 @@ local function rebuild_all()
     for _, proxy in pairs(surface.find_entities_filtered{name = proxy_names}) do proxy.destroy() end
   end
   storage.combinators = {}
+  storage.update_buckets = nil
+  storage.update_bucket_count = nil
   for _, surface in pairs(game.surfaces) do
     for _, entity in pairs(surface.find_entities_filtered{name = ENTITY}) do
       local old = saved[entity.unit_number]
@@ -790,8 +855,6 @@ local function prioritize_waiting_order(player, record, source, source_key, orde
   local mode = MODES[MODE_SUPERMARKET_ORDER]
   local execution, task
   if source == "local-order" then
-    local diagnostic = record.supermarket_order_diagnostics and record.supermarket_order_diagnostics[source_key]
-    if not record.network_active and (not diagnostic or diagnostic.kind ~= "waiting_for_order") then return false end
     execution = record
   elseif source == "network-order" then
     task = ProductionNetwork.waiting_task(record, source_key)
@@ -1552,12 +1615,16 @@ if prototypes.custom_input["bmsc-toggle-production-network"] then
   end)
 end
 
-if TICK_INTERVAL == 30 then
-  script.on_nth_tick(30, function()
-    update_all()
-    refresh_open_timeout_displays()
-  end)
-else
-  script.on_nth_tick(TICK_INTERVAL, update_all)
+-- 按 unit_number 分桶，把一个完整刷新周期分摊到多个 tick；桶 0 同时开始下一轮
+-- 跨实体准备，避免每个桶都重复扫描全部组合器和网络任务。
+script.on_nth_tick(UPDATE_BUCKET_INTERVAL, function(event)
+  local bucket_index = math.floor((event.tick - UPDATE_BUCKET_INTERVAL) / UPDATE_BUCKET_INTERVAL)
+    % UPDATE_BUCKET_COUNT
+  if bucket_index == 0 then prepare_update_cycle() end
+  update_bucket(bucket_index)
+  if UPDATE_BUCKET_INTERVAL == 30 then refresh_open_timeout_displays() end
+end)
+
+if UPDATE_BUCKET_INTERVAL ~= 30 then
   script.on_nth_tick(30, refresh_open_timeout_displays)
 end

@@ -6,7 +6,7 @@ data:extend({
     type = "int-setting",
     name = "bmsc-update-interval",
     setting_type = "startup",
-    default_value = 30, -- 参数：默认每 30 tick 刷新一次；游戏每秒运行 60 tick。
+    default_value = 120, -- 参数：默认每 120 tick 刷新一次；游戏每秒运行 60 tick。
     minimum_value = 1, -- 参数：至少每 tick 刷新一次，避免 on_nth_tick 收到无效的 0。
     maximum_value = 3600,
     order = "a[update-interval]"
